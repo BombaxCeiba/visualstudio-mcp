@@ -120,7 +120,7 @@ namespace VsMcpGateway
                         catch { /* best-effort */ }
                     }
 
-                    var router = new PipeRouter(pipe, ownsStream: true);
+                    var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged);
                     Registry.Register(new InstanceEntry(router, info, DateTime.UtcNow));
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -152,6 +152,34 @@ namespace VsMcpGateway
             }
         }
 
+        /// <summary>
+        /// PipeRouter control-frame callback: a VS pushed a
+        /// <c>solution-changed</c> notification (user opened/closed a solution).
+        /// Refresh that instance's Info in the registry so the ① Header tier
+        /// matches against the live SolutionDir without waiting for a
+        /// reconnect. Solution name/dir/path come from the push; VsVersion and
+        /// PipeName are preserved from the existing entry (the push DTO omits
+        /// them). Runs inline on the pipe read loop, so it must be fast and
+        /// never throw — InstanceRegistry.UpdateInfo is a ConcurrentDictionary
+        /// field swap and satisfies both.
+        /// </summary>
+        private static void OnSolutionChanged(PipeSolutionChanged changed)
+        {
+            if (changed == null || changed.Pid <= 0) return;
+            if (!Registry.TryGet(changed.Pid, out var existing)) return;
+
+            var merged = new PipeRegister
+            {
+                Pid = changed.Pid,
+                PipeName = existing.Info.PipeName,
+                SolutionName = changed.SolutionName,
+                SolutionDir = changed.SolutionDir,
+                SolutionPath = changed.SolutionPath,
+                VsVersion = existing.Info.VsVersion,
+            };
+            Registry.UpdateInfo(changed.Pid, merged);
+        }
+
         // ───────────────────────────── HTTP routing ──────────────────────────────
 
         private static async Task HandleRequestAsync(HttpListenerContext ctx, CancellationToken ct)
@@ -172,6 +200,10 @@ namespace VsMcpGateway
                 }
 
                 string? clientSessionId = ctx.Request.Headers["Mcp-Session-Id"];
+                // X-VS-Workspace drives the stateless ① Header tier (设计文档 §①).
+                // Empty/missing header falls through to ②③④.
+                string? workspaceHeader = ctx.Request.Headers["X-VS-Workspace"];
+                if (string.IsNullOrWhiteSpace(workspaceHeader)) workspaceHeader = null;
 
                 var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (string? key in ctx.Request.Headers.AllKeys)
@@ -192,11 +224,11 @@ namespace VsMcpGateway
 
                 if (string.Equals(method, "initialize", StringComparison.Ordinal))
                 {
-                    await HandleInitializeAsync(ctx, body, headers, ct).ConfigureAwait(false);
+                    await HandleInitializeAsync(ctx, body, headers, workspaceHeader, ct).ConfigureAwait(false);
                 }
                 else if (string.Equals(method, "tools/list", StringComparison.Ordinal))
                 {
-                    await HandleToolsListAsync(ctx, body, headers, clientSessionId, ct).ConfigureAwait(false);
+                    await HandleToolsListAsync(ctx, body, headers, clientSessionId, workspaceHeader, ct).ConfigureAwait(false);
                 }
                 else if (string.Equals(method, "tools/call", StringComparison.Ordinal) &&
                          TryGetToolName(body, out string? toolName) &&
@@ -206,7 +238,7 @@ namespace VsMcpGateway
                 }
                 else
                 {
-                    await HandleForwardAsync(ctx, body, headers, clientSessionId, ct).ConfigureAwait(false);
+                    await HandleForwardAsync(ctx, body, headers, clientSessionId, workspaceHeader, ct).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -220,32 +252,64 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// initialize: generate a client session id, resolve target VS (via
-        /// _meta.vsPid, else single-instance fallback), forward with the
-        /// client's Mcp-Session-Id stripped (so VS assigns its own), capture
-        /// VS's Mcp-Session-Id from the head, and record the binding.
+        /// initialize: resolve the target VS via the priority chain
+        /// (<c>_meta.vsPid</c> &gt; ① Header single &gt; single-instance fallback),
+        /// forward with the client's Mcp-Session-Id stripped (so VS assigns its
+        /// own), capture VS's Mcp-Session-Id from the head, and record the
+        /// binding. The VS-assigned id is mirrored onto the InstanceEntry
+        /// (per-VS authoritative — 设计文档 §Solution 信息动态更新) so the
+        /// stateless ① Header tier can recover it later. The single-instance
+        /// fallback is treated as an auto-bind (Source="auto", HintPending=true);
+        /// an explicit <c>_meta.vsPid</c> or a ① Header match is a deliberate
+        /// bind (HintPending=false).
         /// </summary>
         private static async Task HandleInitializeAsync(
-            HttpListenerContext ctx, string body, IDictionary<string, string> headers, CancellationToken ct)
+            HttpListenerContext ctx, string body, IDictionary<string, string> headers,
+            string? workspaceHeader, CancellationToken ct)
         {
             int? vsPid = TryGetMetaVsPid(body);
+            bool isAutoFallback = false;
+
+            if (!vsPid.HasValue && !string.IsNullOrWhiteSpace(workspaceHeader))
+            {
+                // ① Header tier at initialize: pick the VS whose SolutionDir the
+                // header points at. Single → pre-bind; None/Ambiguous → fail with
+                // the same agent-facing message the forward path uses.
+                var snap = Registry.Snapshot();
+                var match = WorkspaceResolver.Resolve(workspaceHeader,
+                    snap.Select(e => (e.Info.Pid, e.Info.SolutionDir)));
+                if (match.Kind == WorkspaceMatchKind.Single && match.Pid.HasValue)
+                    vsPid = match.Pid;
+                else if (match.Kind == WorkspaceMatchKind.None)
+                {
+                    await WriteToolErrorAsync(ctx, body,
+                        GatewayTools.BuildWorkspaceMissMessage(workspaceHeader!, snap)).ConfigureAwait(false);
+                    return;
+                }
+                else
+                {
+                    var matchedInstances = snap.Where(e => match.MatchedPids.Contains(e.Info.Pid)).ToArray();
+                    await WriteToolErrorAsync(ctx, body,
+                        GatewayTools.BuildAmbiguousMessage(workspaceHeader!, matchedInstances)).ConfigureAwait(false);
+                    return;
+                }
+            }
+
             if (!vsPid.HasValue)
             {
-                // Single-instance fallback (③, minus the Wave 3 hint injection).
+                // Single-instance fallback (③ at initialize time).
                 var snap = Registry.Snapshot();
                 vsPid = ResolveInitializeTarget(vsPid, snap.Count, () => snap.First().Info.Pid);
                 if (!vsPid.HasValue)
                 {
-                    // 0 or ≥2 instances and no explicit pid → can't pick. Wave 2
-                    // returns a simple error; Wave 3 will add the full intercept
-                    // message guiding the user to configure/select.
                     int count = snap.Count;
                     string msg = count == 0
-                        ? "No VS instance bound. Open a VS instance or use select_vs_instance."
-                        : $"Multiple VS instances connected ({count}). Pass _meta.vsPid in initialize or call select_vs_instance.";
-                    await WriteJsonRpcErrorAsync(ctx, body, -32001, msg).ConfigureAwait(false);
+                        ? "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry."
+                        : GatewayTools.BuildInterceptMessage(snap);
+                    await WriteToolErrorAsync(ctx, body, msg).ConfigureAwait(false);
                     return;
                 }
+                isAutoFallback = true;
             }
 
             if (!Registry.TryGet(vsPid.Value, out var entry))
@@ -264,11 +328,15 @@ namespace VsMcpGateway
             // the status line + headers on the first write to the response stream
             // (ForwardAsync's read loop flushes every data frame in real time),
             // so a header set only after the forward would already be too late
-            // and the client would never receive its session id — breaking every
-            // subsequent request. VS's own session id is unknown until the
-            // forward returns, so the binding is created with a null placeholder
-            // and patched once the head frame is observed.
-            var (clientSessionId, binding) = Sessions.CreateWithId(vsPid.Value, vsSessionId: null, "initialize");
+            // and the client would never receive its session id. VS's own session
+            // id is unknown until the forward returns, so the binding is created
+            // with a null placeholder and patched once the head frame is observed.
+            string source = isAutoFallback ? "auto" : "initialize";
+            var (clientSessionId, binding) = Sessions.CreateWithId(vsPid.Value, vsSessionId: null, source);
+            // The single-instance fallback is an auto-bind: arm the one-shot hint
+            // so the first tool result after this initialize carries it.
+            if (isAutoFallback)
+                binding.HintPending = true;
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
@@ -284,45 +352,65 @@ namespace VsMcpGateway
             // The read loop populated result.Headers from VS's head frame; record
             // the VS-assigned session id so subsequent forwards carry it back to
             // that VS's SDK, letting it resume the right server-side session.
+            // The InstanceEntry is the authoritative per-VS home for this id
+            // (stateless ① routing reads it directly).
             if (result.Headers.TryGetValue("Mcp-Session-Id", out var vsSid) && !string.IsNullOrEmpty(vsSid))
+            {
                 binding.VsSessionId = vsSid;
+                Registry.SetVsSessionId(vsPid.Value, vsSid);
+            }
 
             try { ctx.Response.Close(); } catch { /* client gone */ }
         }
 
         /// <summary>
-        /// tools/list: route to the bound VS, buffer the SSE response, inject the
-        /// gateway tools, and write the rewritten bytes.
+        /// tools/list: resolve the target via the 4-tier flow (①②③④), forward to
+        /// the bound VS, buffer the SSE response, inject the gateway tools, and
+        /// write the rewritten bytes. tools/list is not a tool CALL, so the
+        /// auto-bind hint is armed (③) but not injected here — the next
+        /// tools/call surfaces it. The auto-bound client session id is echoed so
+        /// the client adopts it before that next call.
         /// </summary>
         private static async Task HandleToolsListAsync(
             HttpListenerContext ctx, string body, IDictionary<string, string> headers,
-            string? clientSessionId, CancellationToken ct)
+            string? clientSessionId, string? workspaceHeader, CancellationToken ct)
         {
-            var (router, vsSessionId, error) = ResolveRouter(clientSessionId);
-            if (router == null)
+            var resolution = BindingResolver.ResolveTarget(workspaceHeader, clientSessionId, Sessions, Registry);
+            if (!resolution.Success)
             {
-                await WriteJsonRpcErrorAsync(ctx, body, -32003, error ?? "No VS instance bound.").ConfigureAwait(false);
+                await RespondToResolutionFailureAsync(ctx, body, clientSessionId, resolution).ConfigureAwait(false);
+                return;
+            }
+
+            if (!Registry.TryGet(resolution.Pid!.Value, out var entry))
+            {
+                await WriteJsonRpcErrorAsync(ctx, body, -32003,
+                    $"Bound VS instance PID {resolution.Pid} is no longer connected.").ConfigureAwait(false);
                 return;
             }
 
             var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(vsSessionId))
-                forwardedHeaders["Mcp-Session-Id"] = vsSessionId;
+            if (!string.IsNullOrEmpty(resolution.VsSessionId))
+                forwardedHeaders["Mcp-Session-Id"] = resolution.VsSessionId!;
             else
                 forwardedHeaders.Remove("Mcp-Session-Id");
 
             // Buffer the entire response: tools/list is a single small SSE
             // message, and we need the full JSON to splice in our tools.
             using var buffer = new MemoryStream();
-            await router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
+            await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
 
             byte[] injected = GatewayTools.InjectIntoToolsListSse(buffer.ToArray());
+
+            // Echo the session id the binding was created under (matters for the
+            // ③ auto-bind case where the client sent none and we minted one).
+            string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
-            if (!string.IsNullOrEmpty(clientSessionId))
-                ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
+            if (!string.IsNullOrEmpty(echoSessionId))
+                ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
 
             await ctx.Response.OutputStream.WriteAsync(injected, 0, injected.Length, ct).ConfigureAwait(false);
             try { ctx.Response.Close(); } catch { /* client gone */ }
@@ -381,44 +469,107 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Default path: route to the bound VS and stream the SSE response
-        /// straight through.
+        /// Default path (tools/call etc.): resolve via the 4-tier flow (①②③④),
+        /// forward to the bound VS. If the resolution armed a hint (③ auto-bind
+        /// or a leftover HintPending from a prior auto-bind), buffer the SSE
+        /// response, inject the hint text at the front of result.content, and
+        /// clear the one-shot flag. Otherwise stream the response straight
+        /// through so long tasks (build_solution) keep their real-time keep-alive
+        /// notifications unbuffered.
         /// </summary>
         private static async Task HandleForwardAsync(
             HttpListenerContext ctx, string body, IDictionary<string, string> headers,
-            string? clientSessionId, CancellationToken ct)
+            string? clientSessionId, string? workspaceHeader, CancellationToken ct)
         {
-            var (router, vsSessionId, error) = ResolveRouter(clientSessionId);
-            if (router == null)
+            var resolution = BindingResolver.ResolveTarget(workspaceHeader, clientSessionId, Sessions, Registry);
+            if (!resolution.Success)
             {
-                await WriteJsonRpcErrorAsync(ctx, body, -32003, error ?? "No VS instance bound.").ConfigureAwait(false);
+                await RespondToResolutionFailureAsync(ctx, body, clientSessionId, resolution).ConfigureAwait(false);
+                return;
+            }
+
+            if (!Registry.TryGet(resolution.Pid!.Value, out var entry))
+            {
+                await WriteJsonRpcErrorAsync(ctx, body, -32003,
+                    $"Bound VS instance PID {resolution.Pid} is no longer connected.").ConfigureAwait(false);
                 return;
             }
 
             var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(vsSessionId))
-                forwardedHeaders["Mcp-Session-Id"] = vsSessionId;
+            if (!string.IsNullOrEmpty(resolution.VsSessionId))
+                forwardedHeaders["Mcp-Session-Id"] = resolution.VsSessionId!;
             else
-            {
-                // Session exists but VsSessionId is null (select switched to a
-                // fresh VS). Wave 2's simplified contract: ask the client to
-                // re-initialize rather than fabricate an initialize ourselves.
-                await WriteJsonRpcErrorAsync(ctx, body, -32004,
-                    "VS instance switched. Call initialize again to bind the new instance.").ConfigureAwait(false);
-                return;
-            }
+                forwardedHeaders.Remove("Mcp-Session-Id");
+
+            // Echo the session id the binding was created under. For the ③
+            // auto-bind case the client sent none and we minted one — it MUST be
+            // echoed so subsequent requests carry it (otherwise every call would
+            // auto-bind again and the hint would fire forever).
+            string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
+
+            // Hint injection is gated on HintPending. The stateless ① tier never
+            // sets a binding, so it never injects (correct: header-routed calls
+            // are deliberate, not auto-bound). When injecting we must buffer the
+            // full response — but only then, to keep streaming for the common
+            // case (the design note's hint-buffering tradeoff).
+            SessionBinding? binding = resolution.Binding;
+            bool needsHint = binding != null && binding.HintPending;
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
-            if (!string.IsNullOrEmpty(clientSessionId))
-                ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
+            if (!string.IsNullOrEmpty(echoSessionId))
+                ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
 
-            using (var output = ctx.Response.OutputStream)
+            if (needsHint)
             {
-                await router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
+                string hint = GatewayTools.BuildAutoBindHint(entry);
+                using var buffer = new MemoryStream();
+                await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
+                var (rewritten, injected) = GatewayTools.InjectHintIntoToolResultSse(buffer.ToArray(), hint);
+                if (injected)
+                {
+                    // One-shot: only the first tools/call result that successfully
+                    // carried the hint clears the flag (设计文档 MI-07).
+                    binding!.HintPending = false;
+                }
+                await ctx.Response.OutputStream.WriteAsync(rewritten, 0, rewritten.Length, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                using (var output = ctx.Response.OutputStream)
+                {
+                    await entry.Router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
+                }
             }
             try { ctx.Response.Close(); } catch { /* client gone */ }
+        }
+
+        /// <summary>
+        /// Map a failed <see cref="TargetResolution"/> to the right SSE response
+        /// shape. Agent-facing guidance (① miss/ambiguous, ④ intercept) goes out
+        /// as a tool-error result so the agent treats it as a tool failure and
+        /// relays it to the user; protocol-level routing problems (instance
+        /// gone, needs re-initialize) go out as JSON-RPC errors for transport
+        /// continuity with Wave 2.
+        /// </summary>
+        private static async Task RespondToResolutionFailureAsync(
+            HttpListenerContext ctx, string body, string? clientSessionId, TargetResolution resolution)
+        {
+            switch (resolution.ErrorKind)
+            {
+                case TargetErrorKind.WorkspaceMiss:
+                case TargetErrorKind.WorkspaceAmbiguous:
+                case TargetErrorKind.Intercept:
+                    await WriteToolErrorAsync(ctx, body, resolution.ErrorText ?? "Routing failed.", clientSessionId).ConfigureAwait(false);
+                    return;
+                case TargetErrorKind.NeedsInitialize:
+                    await WriteJsonRpcErrorAsync(ctx, body, -32004, resolution.ErrorText ?? "Call initialize first.").ConfigureAwait(false);
+                    return;
+                default: // InstanceGone / None
+                    await WriteJsonRpcErrorAsync(ctx, body, -32003, resolution.ErrorText ?? "No VS instance bound.").ConfigureAwait(false);
+                    return;
+            }
         }
 
         // ─────────────────────────── Routing helpers ────────────────────────────
@@ -439,27 +590,6 @@ namespace VsMcpGateway
             if (connectedCount == 1)
                 return singlePid();
             return null;
-        }
-
-        /// <summary>
-        /// Resolve a router + VS session id for a non-initialize request via the
-        /// ② Session tier. Returns null router + error message when unbound.
-        /// </summary>
-        private static (PipeRouter? Router, string? VsSessionId, string? Error) ResolveRouter(string? clientSessionId)
-        {
-            if (string.IsNullOrEmpty(clientSessionId) ||
-                !Sessions.TryGet(clientSessionId!, out var binding))
-            {
-                return (null, null, "No VS instance bound. Call initialize first.");
-            }
-
-            if (!Registry.TryGet(binding.Pid, out var entry))
-            {
-                return (null, null, $"Bound VS instance PID {binding.Pid} is no longer connected.");
-            }
-
-            // entry.Router is non-null; tuple slot is nullable, assignment is safe.
-            return (entry.Router, binding.VsSessionId, null);
         }
 
         // ───────────────────────── JSON-RPC field extraction ────────────────────
@@ -563,6 +693,31 @@ namespace VsMcpGateway
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
+            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
+            try { ctx.Response.Close(); } catch { /* client gone */ }
+        }
+
+        /// <summary>
+        /// Write a tool-error (isError) SSE response carrying <paramref name="message"/>
+        /// as the text content. Used for the ①③④ agent-facing intercept messages
+        /// (设计文档 §①/§③/§④) — they surface to the agent as a tool failure so the
+        /// agent relays the guidance to the user. <paramref name="clientSessionId"/>,
+        /// when present, is echoed so the client keeps its session.
+        /// </summary>
+        private static async Task WriteToolErrorAsync(HttpListenerContext ctx, string body, string message, string? clientSessionId = null)
+        {
+            object? id = TryGetJsonRpcId(body) ?? (object)0;
+            string respJson = GatewayTools.BuildToolErrorResponse(id, message);
+            string sse = "event: message\ndata: " + respJson + "\n\n";
+            byte[] bytes = Encoding.UTF8.GetBytes(sse);
+
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            if (!string.IsNullOrEmpty(clientSessionId))
+                ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
+            // Headers must be set before the first OutputStream write —
+            // HttpListener flushes the status line + headers on first write.
             await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
             try { ctx.Response.Close(); } catch { /* client gone */ }
         }

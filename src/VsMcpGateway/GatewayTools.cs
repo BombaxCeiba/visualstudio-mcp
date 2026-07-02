@@ -144,6 +144,206 @@ namespace VsMcpGateway
             return JsonSerializer.Serialize(resp);
         }
 
+        // ─────────────────────── Intercept / hint messages ──────────────────────
+        //
+        // The ①③④ tiers all surface to the agent as tool-error text (设计文档
+        // §①/§③/§④) so the agent relays the guidance to the user. Message text
+        // follows the design doc verbatim where given.
+
+        /// <summary>Render one instance as a list line. Solution-only (Wave 2/3
+        /// carry no live debugger state from the register frame; Wave 4's
+        /// heartbeat may enrich this).</summary>
+        private static string FormatInstance(InstanceEntry inst)
+        {
+            var info = inst.Info;
+            string sol = !string.IsNullOrEmpty(info.SolutionPath)
+                ? info.SolutionPath!
+                : "(no solution)";
+            return $"  PID {info.Pid}: {sol}";
+        }
+
+        /// <summary>
+        /// ① Header miss intercept message (设计文档 §① "未命中时的拦截消息").
+        /// Lists every available instance so the agent can tell the user what to
+        /// open / configure against.
+        /// </summary>
+        public static string BuildWorkspaceMissMessage(string workspace, IReadOnlyCollection<InstanceEntry> instances)
+        {
+            var sb = new StringBuilder();
+            sb.Append("No VS instance found for workspace '")
+              .Append(workspace)
+              .Append("'.").Append('\n')
+              .Append("Ask the user to open the project in Visual Studio first,")
+              .Append('\n')
+              .Append("or configure X-VS-Workspace to match an existing instance.")
+              .Append('\n');
+            if (instances.Count > 0)
+            {
+                sb.Append('\n').Append("Available instances:").Append('\n');
+                foreach (var inst in instances)
+                    sb.Append(FormatInstance(inst)).Append('\n');
+            }
+            return sb.ToString().TrimEnd('\n');
+        }
+
+        /// <summary>
+        /// ① Header ambiguity message: more than one VS's SolutionDir matched the
+        /// same workspace header. The agent should ask the user for a more
+        /// specific path or use select_vs_instance.
+        /// </summary>
+        public static string BuildAmbiguousMessage(string workspace, IReadOnlyCollection<InstanceEntry> matched)
+        {
+            var sb = new StringBuilder();
+            sb.Append("Workspace '")
+              .Append(workspace)
+              .Append("' matches multiple VS instances.")
+              .Append('\n')
+              .Append("Add a more specific X-VS-Workspace path, or call select_vs_instance.")
+              .Append('\n')
+              .Append('\n')
+              .Append("Matching instances:").Append('\n');
+            foreach (var inst in matched)
+                sb.Append(FormatInstance(inst)).Append('\n');
+            return sb.ToString().TrimEnd('\n');
+        }
+
+        /// <summary>
+        /// ④ Intercept message for an unbound request with multiple instances
+        /// (设计文档 §④ "拦截未绑定请求"). Embeds a ready-to-paste <c>.mcp.json</c>
+        /// example; backslashes are doubled inside the JSON string so the agent
+        /// can quote it directly to the user.
+        /// </summary>
+        public static string BuildInterceptMessage(IReadOnlyCollection<InstanceEntry> instances)
+        {
+            var sb = new StringBuilder();
+            sb.Append("Multiple VS instances are running but none is bound to this session.")
+              .Append('\n');
+            if (instances.Count > 0)
+            {
+                sb.Append('\n').Append("Available instances:").Append('\n');
+                foreach (var inst in instances)
+                    sb.Append(FormatInstance(inst)).Append('\n');
+            }
+            sb.Append('\n')
+              .Append("To resolve this, ask the user to either:").Append('\n')
+              .Append("1. Tell you which project to work on, then call select_vs_instance").Append('\n')
+              .Append("2. Add X-VS-Workspace to the MCP server config in their project-level .mcp.json").Append('\n')
+              .Append('\n')
+              .Append("Example .mcp.json the user can create:").Append('\n')
+              .Append('{').Append('\n')
+              .Append("  \"mcpServers\": {").Append('\n')
+              .Append("    \"vs-debugger\": {").Append('\n')
+              .Append("      \"url\": \"http://127.0.0.1:43210/mcp/\",").Append('\n')
+              .Append("      \"headers\": { \"X-VS-Workspace\": \"D:\\\\projects\\\\MyApp\" }").Append('\n')
+              .Append("    }").Append('\n')
+              .Append("  }").Append('\n')
+              .Append('}');
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Hint text injected into the first tool result after an auto-bind
+        /// (设计文档 §③). One-shot — only the first tool call after ③ surfaces it.
+        /// </summary>
+        public static string BuildAutoBindHint(InstanceEntry inst)
+        {
+            var info = inst.Info;
+            string sol = !string.IsNullOrEmpty(info.SolutionPath)
+                ? info.SolutionPath!
+                : "(no solution)";
+            string dir = !string.IsNullOrEmpty(info.SolutionDir)
+                ? info.SolutionDir!
+                : "(none)";
+            return
+                "[VS MCP] Auto-bound to VS instance PID " + info.Pid + ".\n" +
+                "Solution: " + sol + "\n" +
+                "Solution dir: " + dir + "\n" +
+                "If you need to target a different VS instance, call list_vs_instances.";
+        }
+
+        /// <summary>
+        /// Inject a hint text block at the FRONT of the <c>result.content</c>
+        /// array in a buffered tools/call SSE response. Reuses the SSE
+        /// data-payload extraction pattern from
+        /// <see cref="InjectIntoToolsListSse"/>. Returns the rewritten bytes and
+        /// whether injection happened. Non-tools/call responses (notifications,
+        /// error envelopes without a <c>content</c> array) are returned
+        /// unchanged with <c>injected=false</c> so the forward path can stay
+        /// streaming for them.
+        /// </summary>
+        public static (byte[] rewritten, bool injected) InjectHintIntoToolResultSse(byte[] sseBytes, string hint)
+        {
+            if (sseBytes == null || sseBytes.Length == 0)
+                return (sseBytes ?? Array.Empty<byte>(), false);
+
+            string text = Encoding.UTF8.GetString(sseBytes);
+            string? jsonPayload = ExtractDataPayload(text);
+            if (jsonPayload == null)
+                return (sseBytes, false);
+
+            JsonElement root;
+            try
+            {
+                using var doc = JsonDocument.Parse(jsonPayload);
+                root = JsonSerializer.Deserialize<JsonElement>(doc.RootElement.GetRawText());
+            }
+            catch
+            {
+                return (sseBytes, false); // not valid JSON-RPC — pass through
+            }
+
+            // Only a result with a content array is a tools/call success we can
+            // prepend to. Errors / notifications stay untouched.
+            if (!root.TryGetProperty("result", out var result) ||
+                result.ValueKind != JsonValueKind.Object ||
+                !result.TryGetProperty("content", out var contentEl) ||
+                contentEl.ValueKind != JsonValueKind.Array)
+            {
+                return (sseBytes, false);
+            }
+
+            using var outBuf = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(outBuf))
+            {
+                writer.WriteStartObject();
+                writer.WriteString("jsonrpc", "2.0");
+                if (root.TryGetProperty("id", out var idEl))
+                {
+                    writer.WritePropertyName("id");
+                    idEl.WriteTo(writer);
+                }
+                writer.WritePropertyName("result");
+                writer.WriteStartObject();
+                foreach (var prop in result.EnumerateObject())
+                {
+                    if (prop.NameEquals("content"))
+                    {
+                        writer.WritePropertyName("content");
+                        writer.WriteStartArray();
+                        // Hint first (the design doc §③ puts it at the front so
+                        // the agent sees the binding context before the payload).
+                        writer.WriteStartObject();
+                        writer.WriteString("type", "text");
+                        writer.WriteString("text", hint);
+                        writer.WriteEndObject();
+                        foreach (var c in contentEl.EnumerateArray())
+                            c.WriteTo(writer);
+                        writer.WriteEndArray();
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
+                }
+                writer.WriteEndObject(); // result
+                writer.WriteEndObject(); // root
+            }
+
+            string newJson = Encoding.UTF8.GetString(outBuf.ToArray());
+            string newSse = "event: message\ndata: " + newJson + "\n\n";
+            return (Encoding.UTF8.GetBytes(newSse), true);
+        }
+
         /// <summary>
         /// Inject the two gateway tool descriptions into a buffered tools/list
         /// SSE response. The VS response is text/event-stream:

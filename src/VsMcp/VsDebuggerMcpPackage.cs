@@ -38,6 +38,7 @@ namespace VsMcp
         private PipeMcpServer? _pipeServer;
         private DebuggerFacade? _facade;
         private SymbolFacade? _symbolFacade;
+        private SolutionEventsSubscriber? _solutionSubscriber;
 
         protected override async Task InitializeAsync(
             CancellationToken cancellationToken,
@@ -103,6 +104,25 @@ namespace VsMcp
             {
                 pkgLogger.LogError(ex, "MCP pipe server failed to start: {Message}", ex.Message);
             }
+
+            // Subscribe to solution open/close so the Gateway's routing table
+            // (SolutionDir used by the ① Header tier + list_vs_instances) stays
+            // live as the user opens/closes solutions after VS startup. Runs on
+            // the UI thread (needs IVsSolution + DTE services); fire-and-forget
+            // so a slow service query never blocks package load.
+            _solutionSubscriber = new SolutionEventsSubscriber(
+                this, _pipeServer, this.DisposalToken, loggerFactory.CreateLogger<SolutionEventsSubscriber>());
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _solutionSubscriber.InitializeAsync(this.DisposalToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    pkgLogger.LogDebug(ex, "Solution-events subscription failed; solution-changed push disabled");
+                }
+            });
         }
 
         /// <summary>
@@ -116,6 +136,7 @@ namespace VsMcp
         {
             if (disposing)
             {
+                try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
                 try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
                 _facade?.Dispose();
                 _symbolFacade?.Dispose();
@@ -131,6 +152,7 @@ namespace VsMcp
         /// </summary>
         int Microsoft.VisualStudio.Shell.Interop.IVsPackage.Close()
         {
+            try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
             try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
             _facade?.Dispose();
             _symbolFacade?.Dispose();

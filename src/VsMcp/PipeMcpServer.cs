@@ -1,8 +1,6 @@
 using System;
 using System.IO;
 using System.IO.Pipes;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -21,6 +19,11 @@ namespace VsMcp
     /// Wave 2 反转了 Wave 1 的方向：Wave 1 里 VS 做 server（等 Gateway 连
     /// <c>vs-mcp-{pid}</c>），但多实例下 Gateway 无法枚举 PID 去反向连接每个 VS。
     /// 改为 Gateway 做固定名 server，所有 VS 主动连过来，首帧 register 自报身份。
+    ///
+    /// Wave 3 增加了 VS 主动推送 <c>solution-changed</c> 控制帧的能力（用户打开/
+    /// 关闭解决方案时通知 Gateway 刷新路由表）。该推送与请求-响应帧共用同一条
+    /// pipe，因此所有写操作经 <see cref="_sendLock"/> 串行化，防止长度前缀帧在并发
+    /// 写下字节交错而损坏协议。
     ///
     /// 连接循环：连 Gateway → 发 register → 服务请求直到断开 → 重连（Gateway
     /// 抢占式重启后 VS 自动重新拨入）。客户端用 <see cref="PipeOptions.None"/> +
@@ -42,6 +45,23 @@ namespace VsMcp
 
         private readonly SemaphoreSlim _disposeLock = new(1, 1);
         private bool _disposed;
+
+        /// <summary>
+        /// Serializes every pipe write. NamedPipe streams are full-duplex (a
+        /// read in <see cref="ServeConnectionAsync"/> never blocks a write), but
+        /// two concurrent WRITERS would interleave the bytes of two
+        /// length-prefixed frames and corrupt the protocol. The request-response
+        /// loop and the <c>solution-changed</c> push both write through this
+        /// lock so frames stay atomic.
+        /// </summary>
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+        /// <summary>
+        /// The pipe currently connected to the Gateway, or null while
+        /// disconnected/reconnecting. Captured into a local before each write so
+        /// a reconnect mid-write can't hand a disposed stream to a framing call.
+        /// </summary>
+        private volatile Stream? _activePipe;
 
         /// <param name="pid">VS 进程 ID，写入 register 帧。</param>
         /// <param name="facade">调试器 facade；非空时 register 帧携带 solution info。</param>
@@ -98,10 +118,15 @@ namespace VsMcp
 
                     logger?.LogInformation("Connected to gateway pipe {Pipe}", GatewayPipeName);
 
+                    // Publish the live stream so solution-changed pushes can find it.
+                    // Set BEFORE register so a rapid open-solution event between
+                    // register and the read loop still has a pipe to send on.
+                    _activePipe = pipe;
+
                     // Send the register frame first; if it fails, log and still
                     // enter the request loop (the Gateway can still route by PID
                     // if it recovers the connection).
-                    await SendRegisterAsync(pipe, ct).ConfigureAwait(false);
+                    await SendRegisterAsync(ct).ConfigureAwait(false);
 
                     await ServeConnectionAsync(pipe, ct).ConfigureAwait(false);
                 }
@@ -119,6 +144,8 @@ namespace VsMcp
                 }
                 finally
                 {
+                    // Tear down: a fresh stream is created on the next iteration.
+                    _activePipe = null;
                     TryDispose(pipe);
                 }
 
@@ -132,7 +159,7 @@ namespace VsMcp
         /// （facade.GetSessionInfoAsync 会自己切到 UI 线程；这里直接调用并容忍
         /// 失败 —— solution 还没打开时返回空字段，register 仍要发出去）。
         /// </summary>
-        private async Task SendRegisterAsync(Stream pipe, CancellationToken ct)
+        private async Task SendRegisterAsync(CancellationToken ct)
         {
             string? solutionName = null;
             string? solutionDir = null;
@@ -159,7 +186,7 @@ namespace VsMcp
                 {
                     // Solution not open yet / DTE not ready — leave fields null;
                     // the register still goes out so the Gateway knows we exist.
-                    // Wave 3's solution-changed notification will refresh it.
+                    // solution-changed notification will refresh it later.
                 }
             }
 
@@ -175,7 +202,7 @@ namespace VsMcp
 
             try
             {
-                await PipeFraming.WriteFrameAsync(pipe, register, ct).ConfigureAwait(false);
+                await WriteLockedAsync(register, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -187,8 +214,7 @@ namespace VsMcp
         private static string TryGetVsVersion()
         {
             // DTE.Version would require a UI-thread hop; the register frame is
-            // informational only, so a best-effort constant is acceptable. Wave 3
-            // can enrich it if a live version turns out to matter for routing.
+            // informational only, so a best-effort constant is acceptable.
             try
             {
                 return Environment.Version?.ToString() ?? "";
@@ -196,6 +222,70 @@ namespace VsMcp
             catch
             {
                 return "";
+            }
+        }
+
+        /// <summary>
+        /// Push a <c>solution-changed</c> control frame so the Gateway refreshes
+        /// this instance's SolutionDir in its routing table (设计文档 §Solution
+        /// 信息动态更新). Fire-and-forget by the caller (solution-events
+        /// subscriber); swallows IO errors so a transient Gateway disconnect
+        /// never crashes the UI thread. The next register (on reconnect) carries
+        /// fresh info, so a dropped push self-heals. No-op when not currently
+        /// connected (<see cref="_activePipe"/> == null).
+        /// </summary>
+        public async Task SendSolutionChangedAsync(
+            string? solutionPath, string? solutionDir, string? solutionName, CancellationToken ct)
+        {
+            if (_disposed) return;
+            try
+            {
+                var frame = new PipeSolutionChanged
+                {
+                    Pid = _pid,
+                    SolutionName = solutionName,
+                    SolutionDir = solutionDir,
+                    SolutionPath = solutionPath,
+                };
+                await WriteLockedAsync(frame, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _loggerFactory?.CreateLogger<PipeMcpServer>()
+                    ?.LogDebug(ex, "Failed to send solution-changed frame");
+            }
+        }
+
+        /// <summary>Write one frame under <see cref="_sendLock"/> (async path).</summary>
+        private async Task WriteLockedAsync(object payload, CancellationToken ct)
+        {
+            Stream? pipe = _activePipe;
+            if (pipe == null) return;
+            await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await PipeFraming.WriteFrameAsync(pipe, payload, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        /// <summary>Write one frame under <see cref="_sendLock"/> (sync path,
+        /// used by the SDK's synchronous Stream.Write calls via the chunk sink).</summary>
+        private void WriteLocked(object payload)
+        {
+            Stream? pipe = _activePipe;
+            if (pipe == null) return;
+            _sendLock.Wait();
+            try
+            {
+                PipeFraming.WriteFrame(pipe, payload);
+            }
+            finally
+            {
+                _sendLock.Release();
             }
         }
 
@@ -232,12 +322,12 @@ namespace VsMcp
                 string type;
                 try
                 {
-                    using (var doc = JsonDocument.Parse(json))
+                    using (var doc = System.Text.Json.JsonDocument.Parse(json))
                     {
                         type = doc.RootElement.TryGetProperty("type", out var t) ? (t.GetString() ?? "") : "";
                     }
                 }
-                catch (JsonException)
+                catch (System.Text.Json.JsonException)
                 {
                     // Malformed frame — skip it rather than tear down the connection.
                     continue;
@@ -246,8 +336,8 @@ namespace VsMcp
                 if (string.Equals(type, "request", StringComparison.Ordinal))
                 {
                     PipeRequest? req;
-                    try { req = JsonSerializer.Deserialize<PipeRequest>(json); }
-                    catch (JsonException) { continue; }
+                    try { req = System.Text.Json.JsonSerializer.Deserialize<PipeRequest>(json); }
+                    catch (System.Text.Json.JsonException) { continue; }
 
                     if (req != null)
                         await HandleRequestAsync(pipe, req, ct).ConfigureAwait(false);
@@ -261,16 +351,16 @@ namespace VsMcp
         /// 处理一条转发请求：发 head → 处理 JSON-RPC（SSE 经 chunkSink 实时封帧）→ 发 end。
         /// head 中的状态码反映 body 是否可解析。
         /// </summary>
-        private async Task HandleRequestAsync(Stream pipe, PipeRequest req, CancellationToken ct)
+        private async Task HandleRequestAsync(NamedPipeClientStream pipe, PipeRequest req, CancellationToken ct)
         {
             JsonRpcMessage? message = null;
             bool parsed = true;
             try
             {
-                message = JsonSerializer.Deserialize<JsonRpcMessage>(req.Body, McpJsonUtilities.DefaultOptions);
+                message = System.Text.Json.JsonSerializer.Deserialize<JsonRpcMessage>(req.Body, McpJsonUtilities.DefaultOptions);
                 if (message == null) parsed = false;
             }
-            catch (JsonException)
+            catch (System.Text.Json.JsonException)
             {
                 parsed = false;
             }
@@ -285,17 +375,17 @@ namespace VsMcp
                     ["Cache-Control"] = "no-cache",
                 },
             };
-            await PipeFraming.WriteFrameAsync(pipe, head, ct).ConfigureAwait(false);
+            await WriteLockedAsync(head, ct).ConfigureAwait(false);
 
             if (!parsed)
             {
-                await PipeFraming.WriteFrameAsync(pipe, new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
+                await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
                 return;
             }
 
             // chunkSink turns every SDK SSE write into a real-time data frame so
             // build_solution keep-alive notifications reach the client unbuffered.
-            var sink = new PipeChunkSink(pipe, req.Id);
+            var sink = new PipeChunkSink(this, req.Id);
             try
             {
                 await _processor.HandleAsync(message!, sink, ct).ConfigureAwait(false);
@@ -312,22 +402,24 @@ namespace VsMcp
                     ?.LogError(ex, "Unexpected error handling pipe request {Id}", req.Id);
             }
 
-            await PipeFraming.WriteFrameAsync(pipe, new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
+            await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
         }
 
         /// <summary>
         /// 把 SDK 写入的 SSE 字节流实时转成 <see cref="PipeDataChunk"/> 帧的适配 Stream。
         /// 每次写入立即封帧发出（不缓冲），保证长任务的保活通知不被吞掉。字节以 base64
         /// 承载，规避 SDK 任意写入粒度下 UTF-8 多字节字符跨块边界的解码问题。
+        /// 写入经所属 <see cref="PipeMcpServer.WriteLocked(object)"/> 串行化，与
+        /// solution-changed 推送互不交错。
         /// </summary>
         private sealed class PipeChunkSink : Stream
         {
-            private readonly Stream _pipe;
+            private readonly PipeMcpServer _owner;
             private readonly string _id;
 
-            public PipeChunkSink(Stream pipe, string id)
+            public PipeChunkSink(PipeMcpServer owner, string id)
             {
-                _pipe = pipe;
+                _owner = owner;
                 _id = id;
             }
 
@@ -345,7 +437,7 @@ namespace VsMcp
             public override void Write(byte[] buffer, int offset, int count)
             {
                 if (count <= 0) return;
-                PipeFraming.WriteFrame(_pipe, new PipeDataChunk
+                _owner.WriteLocked(new PipeDataChunk
                 {
                     Id = _id,
                     Body = Convert.ToBase64String(buffer, offset, count),
@@ -355,7 +447,7 @@ namespace VsMcp
             public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             {
                 if (count <= 0) return;
-                await PipeFraming.WriteFrameAsync(_pipe, new PipeDataChunk
+                await _owner.WriteLockedAsync(new PipeDataChunk
                 {
                     Id = _id,
                     Body = Convert.ToBase64String(buffer, offset, count),

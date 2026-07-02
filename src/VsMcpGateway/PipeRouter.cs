@@ -39,6 +39,11 @@ namespace VsMcpGateway
     /// in-flight SSE streams (one per MCP client session) over one pipe without
     /// head-of-line blocking.
     ///
+    /// The read loop also recognizes VS-pushed CONTROL frames that carry no id
+    /// (solution-changed in Wave 3; heartbeat lands in Wave 4). Each control
+    /// frame type has its own optional callback; unrecognized control frames are
+    /// ignored so an older/newer peer pairing never breaks the stream.
+    ///
     /// Two construction modes:
     /// <list type="bullet">
     /// <item>The Gateway's register-accept loop passes an ALREADY CONNECTED
@@ -60,13 +65,32 @@ namespace VsMcpGateway
         private readonly CancellationTokenSource _loopCts = new CancellationTokenSource();
         private volatile bool _disposed;
 
+        /// <summary>Optional sink for VS-pushed <c>solution-changed</c> control
+        /// frames. Invoked inline from the read loop; must be non-blocking and
+        /// swallow its own exceptions (the Gateway's handler just refreshes the
+        /// InstanceRegistry, which cannot throw). Null = ignore the frame.</summary>
+        private readonly Action<PipeSolutionChanged>? _onSolutionChanged;
+
+        /// <summary>
+        /// Control-frame payloads are written by PipeFraming in camelCase (the
+        /// shared pipe-framing policy), so deserialization here must use the same
+        /// policy or fields like <c>solutionPath</c> would silently fail to bind.
+        /// </summary>
+        private static readonly JsonSerializerOptions ControlFrameJsonOptions =
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
         /// <param name="connectedStream">An already-connected pipe stream. The
         /// router starts the read loop immediately and owns the stream's
         /// disposal (when <paramref name="ownsStream"/> is true).</param>
-        public PipeRouter(Stream connectedStream, bool ownsStream = true)
+        /// <param name="onSolutionChanged">Optional callback invoked when a
+        /// <c>solution-changed</c> control frame arrives (no id). The Gateway
+        /// uses it to refresh the InstanceRegistry's solution fields live.</param>
+        public PipeRouter(Stream connectedStream, bool ownsStream = true,
+            Action<PipeSolutionChanged>? onSolutionChanged = null)
         {
             _stream = connectedStream ?? throw new ArgumentNullException(nameof(connectedStream));
             _ownsStream = ownsStream;
+            _onSolutionChanged = onSolutionChanged;
             // Read loop runs until cancellation; it is observed in DisposeAsync.
             _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
         }
@@ -197,8 +221,32 @@ namespace VsMcpGateway
                     continue; // skip unparseable frame
                 }
 
+                // Control frames (no id) are VS-pushed notifications, not
+                // request/response pairs. Dispatch them to their callbacks
+                // before the id-based demux below. solution-changed refreshes
+                // the InstanceRegistry; heartbeat (Wave 4) is recognized and
+                // ignored for now so an older/newer VS peer doesn't break the
+                // stream.
                 if (string.IsNullOrEmpty(id))
+                {
+                    if (string.Equals(type, "solution-changed", StringComparison.Ordinal) && _onSolutionChanged != null)
+                    {
+                        try
+                        {
+                            var changed = JsonSerializer.Deserialize<PipeSolutionChanged>(json, ControlFrameJsonOptions);
+                            if (changed != null)
+                                _onSolutionChanged(changed);
+                        }
+                        catch
+                        {
+                            // A malformed control frame must never tear down the
+                            // pipe — other in-flight requests depend on it.
+                        }
+                    }
+                    // Unknown control frames (heartbeat etc.) fall through and
+                    // are silently dropped.
                     continue;
+                }
 
                 if (!_pending.TryGetValue(id, out var pending))
                     continue; // unknown id (stale / duplicate) — ignore
@@ -262,10 +310,10 @@ namespace VsMcpGateway
                     pending.CompletionTcs.TrySetResult(true);
                     _pending.TryRemove(id, out _);
                 }
-                // Other types (register/heartbeat/solution-changed) don't
-                // belong to the response stream and are ignored here; Program.cs
-                // reads the register frame off the accept stream before wrapping
-                // it in a router, so they never arrive on a router's read loop.
+                // Other id-bearing types (register echoes) don't belong to the
+                // response stream and are ignored here; Program.cs reads the
+                // register frame off the accept stream before wrapping it in a
+                // router, so it never arrives on a router's read loop.
             }
 
             // Connection lost: fail every still-pending request so its

@@ -10,13 +10,23 @@ namespace VsMcpGateway
     /// One connected VS instance: its pipe router (the demux channel back to
     /// that VS), the latest registration info (PID / solution / version), and
     /// the last time we saw activity from it. <see cref="LastSeen"/> is touched
-    /// on register and on every heartbeat; Wave 4 will use it for stale eviction.
+    /// on register, on every heartbeat, and on every solution-changed push;
+    /// Wave 4 will use it for stale eviction.
+    ///
+    /// <see cref="VsSessionId"/> is the authoritative per-VS Mcp-Session-Id the
+    /// VS's SDK assigned the first time a client initialize reached it. VS is
+    /// single-session server-side, so every route to this VS — whether the
+    /// request came in via a session binding, the ① Header tier (stateless), or
+    /// the ③ auto-bind tier — reuses this same id. Captured at initialize time
+    /// by Program.cs and mirrored into the originating SessionBinding for
+    /// convenience.
     /// </summary>
     public sealed class InstanceEntry
     {
         public PipeRouter Router { get; }
         public PipeRegister Info { get; set; }
         public DateTime LastSeen { get; set; }
+        public string? VsSessionId { get; set; }
 
         public InstanceEntry(PipeRouter router, PipeRegister info, DateTime lastSeen)
         {
@@ -47,7 +57,11 @@ namespace VsMcpGateway
             _byPid[entry.Info.Pid] = entry;
         }
 
-        /// <summary>Refresh solution/version info for a known PID (heartbeat / solution-changed).</summary>
+        /// <summary>Refresh solution/version info for a known PID (heartbeat /
+        /// solution-changed). Called with a freshly-pushed
+        /// <see cref="PipeSolutionChanged"/> (or an equivalent
+        /// <see cref="PipeRegister"/>) so the routing table's view of each VS's
+        /// open solution stays live without a reconnect.</summary>
         public void UpdateInfo(int pid, PipeRegister info)
         {
             if (_byPid.TryGetValue(pid, out var existing))
@@ -55,6 +69,16 @@ namespace VsMcpGateway
                 existing.Info = info;
                 existing.LastSeen = DateTime.UtcNow;
             }
+        }
+
+        /// <summary>Record the VS-assigned Mcp-Session-Id for this VS instance
+        /// the first time an initialize reaches it. Per-VS authoritative (VS is
+        /// single-session server-side). No-op if the PID has dropped.</summary>
+        public void SetVsSessionId(int pid, string vsSessionId)
+        {
+            if (string.IsNullOrEmpty(vsSessionId)) return;
+            if (_byPid.TryGetValue(pid, out var existing))
+                existing.VsSessionId = vsSessionId;
         }
 
         public bool TryGet(int pid, out InstanceEntry entry) =>
