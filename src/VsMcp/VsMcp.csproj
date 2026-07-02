@@ -166,6 +166,44 @@
     <ProjectReference Include="..\VsMcp.Common\VsMcp.Common.csproj" />
   </ItemGroup>
 
+  <!-- VsMcpGateway.exe is a separate WinExe process that owns :43210 and
+       multiplexes MCP clients onto per-VS-instance pipes. It must ship inside
+       this VSIX so that, after install, GatewayLauncher.ResolveGatewayPath's
+       "same directory as the package dll" branch finds it next to VsMcp.dll.
+
+       ReferenceOutputAssembly=false: VsMcp must NOT compile-link against the
+       Gateway's types (different process; they only talk over pipes) — we use
+       the ProjectReference purely to establish build ordering (Gateway must be
+       built before VsMcp so its exe output exists for the Copy step below). -->
+  <ItemGroup>
+    <ProjectReference Include="..\VsMcpGateway\VsMcpGateway.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+      <Private>false</Private>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!-- After the Gateway project builds (driven by the ProjectReference above),
+       copy its exe into VsMcp's output directory so that, post-VSIX-install, the
+       exe and VsMcp.dll land in the SAME directory. The Gateway's runtime
+       dependencies (VsMcp.Common.dll, System.Text.Json.dll, etc.) are already
+       bundled by ForceIncludeRuntimeDependencies below — VsMcp itself depends
+       on the same assemblies — so no extra packaging work is needed for them. -->
+  <Target Name="CopyGatewayExe" AfterTargets="ResolveProjectReferences"
+          BeforeTargets="GetVsixSourceItems">
+    <PropertyGroup>
+      <VsMcpGatewayExePath>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\VsMcpGateway.exe</VsMcpGatewayExePath>
+    </PropertyGroup>
+    <Copy SourceFiles="$(VsMcpGatewayExePath)"
+          DestinationFolder="$(TargetDir)"
+          Condition="Exists('$(VsMcpGatewayExePath)')"
+          SkipUnchangedFiles="true" />
+    <Message Text="Copied VsMcpGateway.exe -> $(TargetDir)" Importance="high"
+             Condition="Exists('$(VsMcpGatewayExePath)')" />
+    <Warning Text="VsMcpGateway.exe not found at $(VsMcpGatewayExePath) — Gateway will be MISSING from the VSIX"
+             Condition="!Exists('$(VsMcpGatewayExePath)')" />
+  </Target>
+
   <!-- source.extension.vsixmanifest is auto-detected by VSSDK.BuildTools; no explicit include needed -->
 
   <!--
@@ -177,6 +215,14 @@
   -->
   <Target Name="ForceIncludeRuntimeDependencies" BeforeTargets="GetVsixSourceItems">
     <ItemGroup>
+      <!-- VsMcpGateway.exe copied here by the CopyGatewayExe target above.
+           Link= places it at the VSIX root next to VsMcp.dll so that, after
+           VSIX install, GatewayLauncher.ResolveGatewayPath's same-directory
+           branch finds it (the two must share a directory for the deployment
+           to be valid). -->
+      <Content Include="$(TargetDir)VsMcpGateway.exe" Condition="Exists('$(TargetDir)VsMcpGateway.exe')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe</Link>
+      </Content>
       <Content Include="$(TargetDir)System.Text.Json.dll" Condition="Exists('$(TargetDir)System.Text.Json.dll')">
         <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Json.dll</Link>
       </Content>

@@ -1044,9 +1044,9 @@ namespace VsMcp
         /// event via <c>DebuggerEvents.OnEnterBreakMode</c> /
         /// <c>OnEnterDesignMode</c>, bridged to async with a
         /// <see cref="TaskCompletionSource{TResult}"/>. The HTTP response stays
-        /// open as long as needed; the MCP server writes SSE <c>: ping</c>
-        /// heartbeats every 2s to keep the connection alive (see
-        /// McpHttpServer.SseIdleStream).</para>
+        /// open as long as needed; KeepAliveNotifier periodically emits MCP
+        /// logging notifications over the in-flight response stream to keep
+        /// the connection alive while a tool is awaiting a break event.</para>
         ///
         /// <para><c>timeout_seconds</c> (only meaningful with wait_for_break=true):
         /// <c>0</c> (default) = wait indefinitely (relies on SSE keep-alive);

@@ -243,8 +243,8 @@ namespace VsMcp
 
     // ===========================================================================
     // SafeCall — the single error-routing boundary. Every facade-calling
-    // tool lambda in McpHttpServer.BuildToolCollection is wrapped here so a
-    // facade exception becomes a CallToolResult{IsError=true}+ErrorResult.
+    // tool lambda registered with the MCP SDK is wrapped here so a facade
+    // exception becomes a CallToolResult{IsError=true}+ErrorResult.
     // OperationCanceledException is rethrown unchanged: it signals shutdown
     // and must NEVER be swallowed into an error response.
     // ===========================================================================
@@ -259,7 +259,7 @@ namespace VsMcp
     /// </summary>
     public static class SafeCall
     {
-#pragma warning disable VSTHRD200 // "Wrap" is the established name across REMEDIATION/PATTERNS/plan; callers hand the resulting Task to the MCP SDK and never await it directly, so the "Async" suffix would mislead. Mirrors the sanctioned VSTHRD200 suppression on McpHttpServer.DisposeAsyncFireAndForget.
+#pragma warning disable VSTHRD200 // "Wrap" is the established name across REMEDIATION/PATTERNS/plan; callers hand the resulting Task to the MCP SDK and never await it directly, so the "Async" suffix would mislead.
         public static async Task<object> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {

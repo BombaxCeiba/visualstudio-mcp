@@ -19,7 +19,7 @@ namespace VsMcp.Common
     public static class PipeFraming
     {
         /// <summary>
-        /// 单帧 payload 字节上限（10MB）。与 McpHttpServer 的 POST body 上限
+        /// 单帧 payload 字节上限（10MB）。与历史 HTTP 监听端的 POST body 上限
         /// 对齐 —— 任何合法的 JSON-RPC 消息或 SSE 批次都应远小于此值。
         /// </summary>
         public const int MaxFrameBytes = 10 * 1024 * 1024;

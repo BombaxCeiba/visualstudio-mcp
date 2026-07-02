@@ -15,10 +15,10 @@ namespace VsMcp.Logging
     /// which lives in the concrete <c>Microsoft.Extensions.Logging</c> NuGet
     /// package. That package is not currently referenced by the project and
     /// bringing it in is unnecessary for this extension's logging needs: the
-    /// only consumer is <see cref="McpHttpServer"/> (which takes an
-    /// <see cref="ILoggerFactory"/> and forwards it to the MCP SDK), and the
-    /// only provider is <see cref="VsOutputWindowLoggerProvider"/>. A 20-line
-    /// factory covers the contract with zero new dependencies.
+    /// consumers are the VS package + PipeMcpServer + GatewayLauncher (each of
+    /// which takes an <see cref="ILoggerFactory"/> and forwards it to the MCP
+    /// SDK), and the only provider is <see cref="VsOutputWindowLoggerProvider"/>.
+    /// A 20-line factory covers the contract with zero new dependencies.
     /// </para>
     /// <para>
     /// Created loggers cache the underlying provider logger by category name;

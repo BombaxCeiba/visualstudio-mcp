@@ -13,7 +13,8 @@ namespace VsMcp
     /// <summary>
     /// 拥有 MCP SDK 资源（<see cref="StreamableHttpServerTransport"/> +
     /// <see cref="McpServer"/>）和全部工具注册逻辑，与具体的传输监听方式
-    /// （HTTP <see cref="McpHttpServer"/> / NamedPipe <see cref="PipeMcpServer"/>）解耦。
+    /// （当前为 NamedPipe <see cref="PipeMcpServer"/>；多实例架构下 VS 端不再
+    /// 直接监听 HTTP，而由独立 Gateway 进程独占端口）解耦。
     ///
     /// 任一监听端收到一条 JSON-RPC 消息后，调用 <see cref="HandleAsync"/> 把 SDK
     /// 产生的 SSE 响应字节写到它提供的输出流上 —— HTTP 端是
@@ -399,8 +400,8 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// 异步停机：cancel CTS → 观察 SDK run 循环 → dispose transport。顺序与
-        /// McpHttpServer.DisposeAsync 一致以复用同一套防死锁经验（RESEARCH Pitfall #3）。
+        /// 异步停机：cancel CTS → 观察 SDK run 循环 → dispose transport。顺序
+        /// 复用自原 HTTP 监听端的防死锁经验（RESEARCH Pitfall #3）。
         /// 幂等（_disposeLock + _disposed）。
         /// </summary>
         public async ValueTask DisposeAsync()
