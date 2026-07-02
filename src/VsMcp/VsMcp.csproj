@@ -158,6 +158,14 @@
     <Message Text="[VsMcp] Resolved VS SDK references from $(VsSdkAssembliesPath)" Importance="high" />
   </Target>
 
+  <!-- Shared pipe-framing library (used by the VS-side PipeMcpServer; also
+       referenced by the standalone VsMcpGateway exe). Pure netstandard2.0,
+       carries no VS-SDK references, so it does not drag the SDK into the
+       Gateway process. -->
+  <ItemGroup>
+    <ProjectReference Include="..\VsMcp.Common\VsMcp.Common.csproj" />
+  </ItemGroup>
+
   <!-- source.extension.vsixmanifest is auto-detected by VSSDK.BuildTools; no explicit include needed -->
 
   <!--

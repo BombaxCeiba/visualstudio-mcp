@@ -37,6 +37,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\VsMcp\VsMcp.csproj" />
+    <ProjectReference Include="..\..\src\VsMcp.Common\VsMcp.Common.csproj" />
+    <ProjectReference Include="..\..\src\VsMcpGateway\VsMcpGateway.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- 独立 Gateway 进程，独占 :43210，作为所有 MCP 客户端的唯一入口。 -->
+    <TargetFramework>net48</TargetFramework>
+    <!-- WinExe: 不创建控制台窗口（CREATE_NO_WINDOW 的等价物），用户无感知。 -->
+    <OutputType>WinExe</OutputType>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <Deterministic>true</Deterministic>
+    <RootNamespace>VsMcpGateway</RootNamespace>
+    <AssemblyName>VsMcpGateway</AssemblyName>
+    <!-- 纯转发进程，不承载 VS Package，无需 VSSDK.BuildTools / VSIX 容器。 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 共享 pipe framing + 协议 DTO。 -->
+    <ProjectReference Include="..\VsMcp.Common\VsMcp.Common.csproj" />
+    <!-- Gateway 端按帧 type 分派时解析 JSON，但绝不解析 JSON-RPC method（Wave 1
+         纯透传；method/session 路由是 Wave 2 的工作）。 -->
+    <PackageReference Include="System.Text.Json" Version="10.0.9" />
+  </ItemGroup>
+
+</Project>
