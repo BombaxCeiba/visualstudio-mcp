@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
@@ -10,53 +11,127 @@ using VsMcp.Common;
 namespace VsMcpGateway
 {
     /// <summary>
-    /// 维护到单个 VS 实例的 NamedPipe 连接，把 HTTP 层的 JSON-RPC 请求转发过去，
-    /// 再把 VS 返回的 SSE 字节流（head/data/end 帧）透传回 HTTP 响应流。
+    /// Result of forwarding one request: the VS head's HTTP status plus the
+    /// head's response headers (so the Gateway can read the VS-assigned
+    /// Mcp-Session-Id during initialize). Wave 1 callers ignore the headers
+    /// and only read <see cref="Status"/>.
+    /// </summary>
+    public sealed class ForwardResult
+    {
+        public int Status { get; }
+        public Dictionary<string, string> Headers { get; }
+
+        public ForwardResult(int status, Dictionary<string, string> headers)
+        {
+            Status = status;
+            Headers = headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Implicit int conversion keeps Wave 1's "int status = await ForwardAsync(...)" ergonomic.</summary>
+        public static implicit operator int(ForwardResult r) => r.Status;
+    }
+
+    /// <summary>
+    /// Maintains the pipe channel to one VS instance and multiplexes many
+    /// concurrent MCP requests over it. Each request gets a fresh id; a single
+    /// background read loop dispatches incoming head/data/end frames to the
+    /// matching pending request by id. This lets the Gateway forward multiple
+    /// in-flight SSE streams (one per MCP client session) over one pipe without
+    /// head-of-line blocking.
     ///
-    /// Wave 1：单实例、单连接、串行（<see cref="_sendLock"/> 保证同一时刻只有一条
-    /// 请求在 pipe 上飞行）。多实例路由、session 绑定、并发 demux 留待 Wave 2。
+    /// Two construction modes:
+    /// <list type="bullet">
+    /// <item>The Gateway's register-accept loop passes an ALREADY CONNECTED
+    ///     <see cref="NamedPipeServerStream"/> (VS dialed in to
+    ///     "vs-mcp-gateway"); the router just owns the read loop.</item>
+    /// <item>The static <see cref="ConnectAsync"/> factory creates a client and
+    ///     connects to <c>vs-mcp-{pid}</c> — retained for Wave 1 tests and
+    ///     smoke runs that simulate the VS-as-server direction.</item>
+    /// </list>
     /// </summary>
     public sealed class PipeRouter : IDisposable, IAsyncDisposable
     {
-        private readonly string _pipeName;
-        private NamedPipeClientStream? _client;
+        private Stream _stream;
+        private readonly bool _ownsStream;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
-        private bool _disposed;
+        private readonly ConcurrentDictionary<string, Pending> _pending =
+            new ConcurrentDictionary<string, Pending>(StringComparer.Ordinal);
+        private Task? _readLoop;
+        private readonly CancellationTokenSource _loopCts = new CancellationTokenSource();
+        private volatile bool _disposed;
 
-        public PipeRouter(string pipeName)
+        /// <param name="connectedStream">An already-connected pipe stream. The
+        /// router starts the read loop immediately and owns the stream's
+        /// disposal (when <paramref name="ownsStream"/> is true).</param>
+        public PipeRouter(Stream connectedStream, bool ownsStream = true)
+        {
+            _stream = connectedStream ?? throw new ArgumentNullException(nameof(connectedStream));
+            _ownsStream = ownsStream;
+            // Read loop runs until cancellation; it is observed in DisposeAsync.
+            _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
+        }
+
+        private PipeRouter(Stream connectedStream, bool ownsStream, bool startLoop)
+        {
+            _stream = connectedStream;
+            _ownsStream = ownsStream;
+            // Test helper path: defer the read loop so the test can wire up
+            // expectations first. Currently unused but kept for symmetry.
+            if (startLoop)
+                _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
+        }
+
+        /// <summary>Current pipe connectivity (rough — the read loop observes disconnects).</summary>
+        public bool IsConnected
+        {
+            get
+            {
+                if (_disposed) return false;
+                if (_stream is NamedPipeServerStream ps) return ps.IsConnected;
+                if (_stream is NamedPipeClientStream pc) return pc.IsConnected;
+                return _stream.CanRead;
+            }
+        }
+
+        /// <summary>
+        /// Wave 1 / test factory: create a <c>NamedPipeClientStream</c> and
+        /// connect to <c>vs-mcp-{pipeName}</c> with retry. Returns a router
+        /// that already owns the connection and read loop. Kept for the
+        /// Wave 1 passthrough tests, which construct the router this way.
+        ///
+        /// Uses <see cref="PipeOptions.Asynchronous"/> + async IO (ConnectAsync /
+        /// ReadAsync / WriteAsync): the demux model runs a continuous read loop
+        /// concurrent with ForwardAsync writes on the SAME handle, which requires
+        /// overlapped IO. The Wave 1 "PipeOptions.None" note applied to Wave 1's
+        /// SERIAL model (write-then-read inside one lock); concurrent demux needs
+        /// Asynchronous. The Wave 1 hang was Asynchronous + SYNCHRONOUS IO; the
+        /// correct pairing here is Asynchronous + ASYNC IO throughout.
+        /// </summary>
+        public static async Task<PipeRouter> ConnectAsync(string pipeName, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(pipeName))
                 throw new ArgumentException("pipeName is required", nameof(pipeName));
-            _pipeName = pipeName;
-        }
 
-        /// <summary>当前是否已连上一个 VS 实例。</summary>
-        public bool IsConnected => _client != null && _client.IsConnected;
-
-        /// <summary>
-        /// 连接目标 VS 的 pipe，重试直到成功或取消。VS 可能在 Gateway 之后启动，
-        /// 故轮询重试（每 500ms）而非立即失败。
-        /// </summary>
-        public async Task ConnectAsync(CancellationToken ct)
-        {
+            NamedPipeClientStream? client = null;
             while (!ct.IsCancellationRequested)
             {
-                // PipeOptions.None（同步 pipe）：Asynchronous flag 使 handle 成为
-                // FILE_FLAG_OVERLAPPED，在其上做同步 Connect/Read 行为未定义（实测会
-                // 挂死）。同步 pipe + Task.Run 异步化是 .NET Framework 上最确定的用法。
-                var client = new NamedPipeClientStream(
-                    ".", _pipeName, PipeDirection.InOut, PipeOptions.None);
-
+                client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 try
                 {
-                    // 用同步 Connect(int timeout) —— 它是 .NET Framework 4.x 全版本
-                    // 确定可用的连接 API（异步重载 ConnectAsync(CancellationToken) 与
-                    // ConnectAsync(int) 的可用性随 4.8 子版本不一致，testhost 运行时
-                    // 可能缺失）。在 Task.Run 中异步化，2s 超时让 VS pipe 一就绪即被
-                    // 发现；失败则短暂退避重试。
-                    await Task.Run(() => client.Connect(2000), ct).ConfigureAwait(false);
-                    _client = client;
-                    return;
+                    // ConnectAsync() has no timeout overload on net48 — emulate
+                    // by racing against a delay; on timeout, dispose the stream
+                    // (which aborts the in-flight connect) and retry. Disposing
+                    // during ConnectAsync is safe; the abandoned stream is GC'd.
+                    Task connectTask = client.ConnectAsync();
+                    Task winner = await Task.WhenAny(connectTask, Task.Delay(2000, ct)).ConfigureAwait(false);
+                    if (winner != connectTask)
+                    {
+                        TryDispose(client);
+                        await Task.Delay(500, ct).ConfigureAwait(false);
+                        continue;
+                    }
+                    await connectTask.ConfigureAwait(false); // observe connect errors
+                    return new PipeRouter(client, ownsStream: true);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -65,27 +140,177 @@ namespace VsMcpGateway
                 }
                 catch (Exception)
                 {
-                    // Pipe 还没创建（VS 未启动）或 2s 超时 —— 释放本次 client，等 500ms 再试。
                     TryDispose(client);
                     await Task.Delay(500, ct).ConfigureAwait(false);
                 }
             }
+            throw new OperationCanceledException(ct);
         }
 
         /// <summary>
-        /// 转发一条 JSON-RPC 请求：封 <see cref="PipeRequest"/> 发往 VS → 读取
-        /// head/data/end 帧序列 → data 帧的 base64 body 解码后实时写入
-        /// <paramref name="outputStream"/>（保活通知不被缓冲）。返回 VS head 中的
-        /// HTTP 状态码（用于写 HTTP 响应行）。
+        /// Read loop: continuously reads frames, dispatching each by (type, id)
+        /// to the matching pending request. Runs in the background from the
+        /// constructor until the stream closes or the router is disposed.
         /// </summary>
-        public async Task<int> ForwardAsync(
+        private async Task ReadLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                string? json;
+                try
+                {
+                    json = await PipeFraming.ReadFrameJsonAsync(_stream, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex) when (IsBenignDisconnect(ex))
+                {
+                    // Pipe closed / VS gone — fall through to fail all pending.
+                    break;
+                }
+                catch (Exception)
+                {
+                    // A malformed/truncated frame is treated as connection loss;
+                    // the Gateway's accept loop will reap this entry.
+                    break;
+                }
+
+                if (json == null)
+                    break; // clean EOF
+
+                string type = "";
+                string id = "";
+                try
+                {
+                    using (var doc = JsonDocument.Parse(json))
+                    {
+                        if (doc.RootElement.TryGetProperty("type", out var t))
+                            type = t.GetString() ?? "";
+                        if (doc.RootElement.TryGetProperty("id", out var i))
+                            id = i.GetString() ?? "";
+                    }
+                }
+                catch (JsonException)
+                {
+                    continue; // skip unparseable frame
+                }
+
+                if (string.IsNullOrEmpty(id))
+                    continue;
+
+                if (!_pending.TryGetValue(id, out var pending))
+                    continue; // unknown id (stale / duplicate) — ignore
+
+                if (string.Equals(type, "head", StringComparison.Ordinal))
+                {
+                    try
+                    {
+                        using (var doc = JsonDocument.Parse(json))
+                        {
+                            if (doc.RootElement.TryGetProperty("status", out var s) && s.TryGetInt32(out int st))
+                                pending.Status = st;
+                            if (doc.RootElement.TryGetProperty("headers", out var h))
+                            {
+                                foreach (var prop in h.EnumerateObject())
+                                    pending.Headers[prop.Name] = prop.Value.ValueKind == JsonValueKind.Null
+                                        ? ""
+                                        : prop.Value.GetString() ?? "";
+                            }
+                        }
+                    }
+                    catch { /* best-effort parse */ }
+                }
+                else if (string.Equals(type, "data", StringComparison.Ordinal))
+                {
+                    try
+                    {
+                        string? bodyBase64 = "";
+                        using (var doc = JsonDocument.Parse(json))
+                        {
+                            if (doc.RootElement.TryGetProperty("body", out var b))
+                                bodyBase64 = b.GetString();
+                        }
+                        if (!string.IsNullOrEmpty(bodyBase64))
+                        {
+                            byte[] bytes = Convert.FromBase64String(bodyBase64);
+                            await pending.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+                            await pending.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        pending.CompletionTcs.TrySetCanceled();
+                        _pending.TryRemove(id, out _);
+                        throw;
+                    }
+                    catch (Exception ex) when (IsBenignDisconnect(ex))
+                    {
+                        pending.CompletionTcs.TrySetException(ex);
+                        _pending.TryRemove(id, out _);
+                        return;
+                    }
+                    catch
+                    {
+                        // A write to a cancelled/closed output stream must not
+                        // kill the read loop for OTHER pending requests.
+                    }
+                }
+                else if (string.Equals(type, "end", StringComparison.Ordinal))
+                {
+                    pending.CompletionTcs.TrySetResult(true);
+                    _pending.TryRemove(id, out _);
+                }
+                // Other types (register/heartbeat/solution-changed) don't
+                // belong to the response stream and are ignored here; Program.cs
+                // reads the register frame off the accept stream before wrapping
+                // it in a router, so they never arrive on a router's read loop.
+            }
+
+            // Connection lost: fail every still-pending request so its
+            // ForwardAsync caller unblocks instead of hanging forever.
+            foreach (var kv in _pending)
+            {
+                kv.Value.CompletionTcs.TrySetException(
+                    new IOException("VS pipe disconnected before the response completed."));
+                _pending.TryRemove(kv.Key, out _);
+            }
+        }
+
+        /// <summary>
+        /// Forward one JSON-RPC request: write a PipeRequest frame (under the
+        /// send lock, released immediately after the write) and wait on the
+        /// pending entry's completion TCS until the read loop sees the matching
+        /// end frame (or the pipe drops). Returns the head status + headers.
+        /// </summary>
+        public async Task<ForwardResult> ForwardAsync(
             string jsonRpcBody,
             IDictionary<string, string>? requestHeaders,
             Stream outputStream,
             CancellationToken ct)
         {
-            var client = _client ?? throw new InvalidOperationException("PipeRouter is not connected.");
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(PipeRouter));
+
             string id = Guid.NewGuid().ToString("N");
+            var pending = new Pending
+            {
+                Id = id,
+                OutputStream = outputStream,
+                Status = 200,
+                Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                CompletionTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            };
+            _pending[id] = pending;
+
+            // Unregister on cancellation so a dropped request doesn't leak and
+            // a late end frame finds no matching pending.
+            using var reg = ct.Register(() =>
+            {
+                pending.CompletionTcs.TrySetCanceled();
+                _pending.TryRemove(id, out _);
+            });
 
             var headers = new Dictionary<string, string>();
             if (requestHeaders != null)
@@ -97,70 +322,36 @@ namespace VsMcpGateway
             await _sendLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                await PipeFraming.WriteFrameAsync(client, new PipeRequest
+                await PipeFraming.WriteFrameAsync(_stream, new PipeRequest
                 {
                     Id = id,
                     Body = jsonRpcBody,
                     Headers = headers,
                 }, ct).ConfigureAwait(false);
-
-                // head —— 拿到 VS 决定的 HTTP 状态码（200 / 400 / ...）。
-                PipeResponseHead? head = await PipeFraming.ReadFrameAsync<PipeResponseHead>(client, ct).ConfigureAwait(false);
-                int status = head?.Status ?? 200;
-
-                // data* —— 逐帧透传，base64 解码后写 HTTP body 并 flush（实时性）。
-                while (true)
-                {
-                    string? json;
-                    try
-                    {
-                        json = await PipeFraming.ReadFrameJsonAsync(client, ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (IsBenignDisconnect(ex))
-                    {
-                        // VS 断开 → 提前结束。
-                        break;
-                    }
-
-                    if (json == null)
-                        break; // clean disconnect
-
-                    // 单次 Parse：取 type 分派；data 帧直接从同一 document 取 body
-                    // （协议统一 camelCase，见 PipeFraming.Options；不复用 Deserialize
-                    // 以避免 options 不一致导致字段丢失）。
-                    using (var doc = JsonDocument.Parse(json))
-                    {
-                        if (!doc.RootElement.TryGetProperty("type", out var typeEl))
-                            continue;
-                        string type = typeEl.GetString() ?? "";
-
-                        if (string.Equals(type, "data", StringComparison.Ordinal))
-                        {
-                            if (doc.RootElement.TryGetProperty("body", out var bodyEl))
-                            {
-                                string? bodyBase64 = bodyEl.GetString();
-                                if (!string.IsNullOrEmpty(bodyBase64))
-                                {
-                                    byte[] bytes = Convert.FromBase64String(bodyBase64);
-                                    await outputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
-                                    await outputStream.FlushAsync(ct).ConfigureAwait(false);
-                                }
-                            }
-                        }
-                        else if (string.Equals(type, "end", StringComparison.Ordinal))
-                        {
-                            break;
-                        }
-                        // 其他类型在 Wave 1 不应出现在响应流中，忽略。
-                    }
-                }
-
-                return status;
+                // Lock released immediately — concurrent requests may now write
+                // their own frames; the read loop demuxes by id.
             }
             finally
             {
                 _sendLock.Release();
             }
+
+            try
+            {
+                await pending.CompletionTcs.Task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // Pending's own TCS was canceled without our ct firing — treat
+                // as a transport fault and surface to the HTTP layer.
+                throw new IOException("Pipe request was canceled.");
+            }
+
+            return new ForwardResult(pending.Status, pending.Headers);
         }
 
         private static bool IsBenignDisconnect(Exception ex)
@@ -168,36 +359,53 @@ namespace VsMcpGateway
             return ex is IOException || ex is ObjectDisposedException;
         }
 
-        /// <summary>同步停机：非阻塞地释放底层 pipe 连接（Gateway 进程退出路径）。</summary>
         public void Dispose()
         {
-            if (_disposed)
-                return;
+            if (_disposed) return;
             _disposed = true;
-            try { _client?.Dispose(); } catch { /* best-effort */ }
-            _client = null;
+            try { _loopCts.Cancel(); } catch { /* best-effort */ }
+            if (_ownsStream) TryDispose(_stream);
+            FailAllPending();
         }
 
         public async ValueTask DisposeAsync()
         {
-            if (_disposed)
-                return;
+            if (_disposed) return;
             _disposed = true;
-            await _sendLock.WaitAsync().ConfigureAwait(false);
-            try
+            try { _loopCts.Cancel(); } catch { /* best-effort */ }
+            if (_readLoop != null)
             {
-                TryDispose(_client);
-                _client = null;
+#pragma warning disable VSTHRD003
+                try { await _readLoop.ConfigureAwait(false); }
+                catch { /* teardown must not throw */ }
+#pragma warning restore VSTHRD003
             }
-            finally
+            if (_ownsStream) TryDispose(_stream);
+            FailAllPending();
+        }
+
+        private void FailAllPending()
+        {
+            foreach (var kv in _pending)
             {
-                _sendLock.Release();
+                kv.Value.CompletionTcs.TrySetException(
+                    new ObjectDisposedException(nameof(PipeRouter), "Router disposed while a request was in flight."));
+                _pending.TryRemove(kv.Key, out _);
             }
         }
 
         private static void TryDispose(IDisposable? disposable)
         {
             try { disposable?.Dispose(); } catch { /* best-effort */ }
+        }
+
+        private sealed class Pending
+        {
+            public string Id { get; set; } = "";
+            public Stream OutputStream { get; set; } = Stream.Null;
+            public int Status { get; set; }
+            public Dictionary<string, string> Headers { get; set; } = new();
+            public TaskCompletionSource<bool> CompletionTcs { get; set; } = new();
         }
     }
 }

@@ -68,14 +68,32 @@ namespace VsMcp
             bool enableGoToDefinition = false;
             try { enableGoToDefinition = ((McpOptionsPage)GetDialogPage(typeof(McpOptionsPage))).EnableGoToDefinition; } catch { }
 
-            // Open the per-instance NamedPipe. VsMcpGateway.exe (launched separately
-            // in Wave 1; auto-launched by GatewayLauncher from Wave 2) connects here
-            // and multiplexes MCP clients. PipeMcpServer.StartAsync returns once the
-            // accept loop is armed (the loop runs in the background), so this await
-            // does not block InitializeAsync past the VS package-load timeout.
+            // Open the per-instance connection to the Gateway. PipeMcpServer now
+            // (Wave 2) dials the Gateway's "vs-mcp-gateway" pipe as a client and
+            // sends a register frame; the Gateway multiplexes MCP clients onto it.
+            // PipeMcpServer.StartAsync returns once the connect loop is armed (the
+            // loop runs in the background), so this await does not block
+            // InitializeAsync past the VS package-load timeout.
             int pid = Process.GetCurrentProcess().Id;
             _pipeServer = new PipeMcpServer(
                 pid, _facade, _symbolFacade, enableGoToDefinition, loggerFactory, this.DisposalToken);
+
+            // Best-effort: make sure the standalone Gateway exe is up before the
+            // pipe client starts, so the first connect attempt lands. Fire-and-
+            // forget — if the Gateway can't be launched (exe not on disk yet, Wave 5
+            // will ship it in the VSIX), the pipe client keeps retrying connect.
+            var pkgLogger = loggerFactory.CreateLogger<VsMcpPackage>();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await GatewayLauncher.EnsureGatewayRunningAsync(this.DisposalToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    pkgLogger.LogError(ex, "Gateway launch/probe failed: {Message}", ex.Message);
+                }
+            });
 
             try
             {
@@ -83,8 +101,7 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
-                loggerFactory.CreateLogger<VsMcpPackage>()
-                             .LogError(ex, "MCP pipe server failed to start: {Message}", ex.Message);
+                pkgLogger.LogError(ex, "MCP pipe server failed to start: {Message}", ex.Message);
             }
         }
 
