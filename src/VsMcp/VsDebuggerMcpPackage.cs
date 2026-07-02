@@ -36,6 +36,7 @@ namespace VsMcp
     public sealed class VsMcpPackage : AsyncPackage, IVsPackage
     {
         private PipeMcpServer? _pipeServer;
+        private HeartbeatClient? _heartbeat;
         private DebuggerFacade? _facade;
         private SymbolFacade? _symbolFacade;
         private SolutionEventsSubscriber? _solutionSubscriber;
@@ -105,6 +106,20 @@ namespace VsMcp
                 pkgLogger.LogError(ex, "MCP pipe server failed to start: {Message}", ex.Message);
             }
 
+            // Heartbeat: periodically probe the Gateway's liveness by writing a
+            // heartbeat frame through the pipe. A sustained miss window (Gateway
+            // crashed / taskkilled) triggers a preemptive relaunch so VS self-heals
+            // without user intervention (设计文档 §抢占式 Gateway 拉起). The loop
+            // starts in the constructor and stops on Dispose; it never blocks VS
+            // exit (HeartbeatClient.Dispose is synchronous + non-blocking, cloning
+            // KeepAliveNotifier's teardown pattern).
+            _heartbeat = new HeartbeatClient(
+                pid,
+                sendHeartbeat: ct => _pipeServer.SendHeartbeatAsync(ct),
+                ensureGatewayRunning: ct => GatewayLauncher.EnsureGatewayRunningAsync(ct),
+                callerToken: this.DisposalToken,
+                logger: loggerFactory.CreateLogger<HeartbeatClient>());
+
             // Subscribe to solution open/close so the Gateway's routing table
             // (SolutionDir used by the ① Header tier + list_vs_instances) stays
             // live as the user opens/closes solutions after VS startup. Runs on
@@ -137,6 +152,7 @@ namespace VsMcp
             if (disposing)
             {
                 try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
+                try { _heartbeat?.Dispose(); } catch { /* teardown must never throw */ }
                 try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
                 _facade?.Dispose();
                 _symbolFacade?.Dispose();
@@ -153,6 +169,7 @@ namespace VsMcp
         int Microsoft.VisualStudio.Shell.Interop.IVsPackage.Close()
         {
             try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
+            try { _heartbeat?.Dispose(); } catch { /* teardown must never throw */ }
             try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
             _facade?.Dispose();
             _symbolFacade?.Dispose();

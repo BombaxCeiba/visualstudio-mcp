@@ -35,6 +35,14 @@ namespace VsMcp
     {
         private const string GatewayPipeName = "vs-mcp-gateway";
 
+        /// <summary>
+        /// Max wait for the send lock when emitting a heartbeat. A heartbeat must
+        /// never queue behind a long SSE stream write — if the lock is held this
+        /// long, treat it as a connectivity problem and count a miss rather than
+        /// stalling the heartbeat cadence.
+        /// </summary>
+        private const int HeartbeatLockTimeoutMs = 2000;
+
         private readonly int _pid;
         private readonly DebuggerFacade? _facade;
         private readonly McpRequestProcessor _processor;
@@ -253,6 +261,42 @@ namespace VsMcp
             {
                 _loggerFactory?.CreateLogger<PipeMcpServer>()
                     ?.LogDebug(ex, "Failed to send solution-changed frame");
+            }
+        }
+
+        /// <summary>
+        /// Send a <c>heartbeat</c> control frame (no id) so the Gateway knows
+        /// this VS is alive, and — equally important — so the VS-side
+        /// <see cref="HeartbeatClient"/> can confirm the pipe is still writable
+        /// (i.e. the Gateway process is still up). Throws on any failure (no
+        /// active pipe, write error, send-lock contention) so HeartbeatClient
+        /// can count a consecutive miss; does NOT log, because heartbeat misses
+        /// are expected during a Gateway restart and a log line per miss would
+        /// spam the output window.
+        /// </summary>
+        public async Task SendHeartbeatAsync(CancellationToken ct)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(PipeMcpServer));
+
+            Stream? pipe = _activePipe;
+            if (pipe == null)
+                throw new IOException("Not connected to the gateway pipe.");
+
+            // Acquire the send lock with a short timeout rather than an indefinite
+            // wait: a heartbeat that queues behind a long SSE stream write would
+            // skew the liveness signal. A timeout here surfaces as a miss, which
+            // HeartbeatClient handles gracefully.
+            if (!await _sendLock.WaitAsync(HeartbeatLockTimeoutMs, ct).ConfigureAwait(false))
+                throw new TimeoutException("Timed out waiting for the pipe send lock to send heartbeat.");
+
+            try
+            {
+                await PipeFraming.WriteFrameAsync(pipe, new PipeHeartbeat { Pid = _pid }, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
             }
         }
 

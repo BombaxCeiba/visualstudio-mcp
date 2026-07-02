@@ -71,6 +71,19 @@ namespace VsMcpGateway
             }
         }
 
+        /// <summary>Refresh <see cref="InstanceEntry.LastSeen"/> for a known PID
+        /// on heartbeat (Wave 4). No-op if the PID has dropped — a heartbeat
+        /// from a stale pipe is harmless. Called inline from the PipeRouter read
+        /// loop so it must be fast and non-throwing (a ConcurrentDictionary field
+        /// write satisfies both). Pipe disconnect remains the primary VS-exit
+        /// signal (OS semantics); LastSeen is the supplementary liveness signal
+        /// that makes ProcessScanner mechanism 1's "empty" judgment precise.</summary>
+        public void TouchLastSeen(int pid)
+        {
+            if (_byPid.TryGetValue(pid, out var existing))
+                existing.LastSeen = DateTime.UtcNow;
+        }
+
         /// <summary>Record the VS-assigned Mcp-Session-Id for this VS instance
         /// the first time an initialize reaches it. Per-VS authoritative (VS is
         /// single-session server-side). No-op if the PID has dropped.</summary>

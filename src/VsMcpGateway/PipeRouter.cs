@@ -71,6 +71,11 @@ namespace VsMcpGateway
         /// InstanceRegistry, which cannot throw). Null = ignore the frame.</summary>
         private readonly Action<PipeSolutionChanged>? _onSolutionChanged;
 
+        /// <summary>Optional sink for VS-pushed <c>heartbeat</c> control frames
+        /// (Wave 4). Invoked inline from the read loop; the Gateway's handler
+        /// refreshes the InstanceRegistry's LastSeen. Null = ignore the frame.</summary>
+        private readonly Action<PipeHeartbeat>? _onHeartbeat;
+
         /// <summary>
         /// Control-frame payloads are written by PipeFraming in camelCase (the
         /// shared pipe-framing policy), so deserialization here must use the same
@@ -85,12 +90,17 @@ namespace VsMcpGateway
         /// <param name="onSolutionChanged">Optional callback invoked when a
         /// <c>solution-changed</c> control frame arrives (no id). The Gateway
         /// uses it to refresh the InstanceRegistry's solution fields live.</param>
+        /// <param name="onHeartbeat">Optional callback invoked when a
+        /// <c>heartbeat</c> control frame arrives (no id). The Gateway uses it
+        /// to refresh the InstanceRegistry's LastSeen timestamp.</param>
         public PipeRouter(Stream connectedStream, bool ownsStream = true,
-            Action<PipeSolutionChanged>? onSolutionChanged = null)
+            Action<PipeSolutionChanged>? onSolutionChanged = null,
+            Action<PipeHeartbeat>? onHeartbeat = null)
         {
             _stream = connectedStream ?? throw new ArgumentNullException(nameof(connectedStream));
             _ownsStream = ownsStream;
             _onSolutionChanged = onSolutionChanged;
+            _onHeartbeat = onHeartbeat;
             // Read loop runs until cancellation; it is observed in DisposeAsync.
             _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
         }
@@ -243,8 +253,21 @@ namespace VsMcpGateway
                             // pipe — other in-flight requests depend on it.
                         }
                     }
-                    // Unknown control frames (heartbeat etc.) fall through and
-                    // are silently dropped.
+                    else if (string.Equals(type, "heartbeat", StringComparison.Ordinal) && _onHeartbeat != null)
+                    {
+                        try
+                        {
+                            var beat = JsonSerializer.Deserialize<PipeHeartbeat>(json, ControlFrameJsonOptions);
+                            if (beat != null)
+                                _onHeartbeat(beat);
+                        }
+                        catch
+                        {
+                            // A malformed heartbeat must not tear down the pipe.
+                        }
+                    }
+                    // Unknown control frames fall through and are silently
+                    // dropped so a newer/older peer pairing never breaks the stream.
                     continue;
                 }
 

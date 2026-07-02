@@ -123,6 +123,24 @@ namespace VsMcp.Tests
             await Task.Delay(200);
             Assert.False(invoked);
         }
+
+        [Fact]
+        public async Task PipeRouter_DispatchesHeartbeatFrame_ToCallback()
+        {
+            // Wave 4: a heartbeat control frame routes to the dedicated onHeartbeat
+            // callback (not the solution-changed one), so the Gateway can refresh
+            // InstanceEntry.LastSeen on every VS heartbeat.
+            var tcs = new TaskCompletionSource<PipeHeartbeat>(TaskCreationOptions.RunContinuationsAsynchronously);
+            byte[] frameBytes = PipeFraming.BuildFrameBytes(new PipeHeartbeat { Pid = 42 });
+
+            using var stream = new MemoryStream(frameBytes);
+            using var router = new PipeRouter(stream, ownsStream: false,
+                onSolutionChanged: null,
+                onHeartbeat: beat => tcs.TrySetResult(beat));
+
+            PipeHeartbeat received = await tcs.Task.WaitForAsync(OpTimeoutMs);
+            Assert.Equal(42, received.Pid);
+        }
     }
 
     internal static class TaskTestExtensions

@@ -33,6 +33,7 @@ namespace VsMcpGateway
 
         private static readonly InstanceRegistry Registry = new InstanceRegistry();
         private static readonly SessionTable Sessions = new SessionTable();
+        private static ProcessScanner? _scanner;
 
         private static async Task<int> Main(string[] args)
         {
@@ -59,6 +60,16 @@ namespace VsMcpGateway
             // to the CLIENT side doing synchronous Connect — see Wave 1 notes).
             _ = Task.Run(() => PipeAcceptLoopAsync(cts.Token));
 
+            // Self-termination watchdog: the Gateway exits on its own once no VS
+            // instance is left, so it can never become a permanent orphan process
+            // (设计文档 §Gateway 自杀). Both the registry-empty and devenv-scan
+            // mechanisms funnel through cts.Cancel, letting the accept loops unwind
+            // gracefully instead of Environment.Exit. Started after the pipe accept
+            // loop is armed so the initial empty-registry grace overlaps the first
+            // VS connection window.
+            _scanner = new ProcessScanner(Registry, onSelfKill: () => cts.Cancel(), cts.Token);
+            _scanner.Start();
+
             // HTTP accept loop.
             while (!cts.Token.IsCancellationRequested)
             {
@@ -73,6 +84,7 @@ namespace VsMcpGateway
                 _ = HandleRequestAsync(ctx, cts.Token);
             }
 
+            _scanner?.Dispose();
             return 0;
         }
 
@@ -120,7 +132,7 @@ namespace VsMcpGateway
                         catch { /* best-effort */ }
                     }
 
-                    var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged);
+                    var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged, OnHeartbeat);
                     Registry.Register(new InstanceEntry(router, info, DateTime.UtcNow));
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -178,6 +190,21 @@ namespace VsMcpGateway
                 VsVersion = existing.Info.VsVersion,
             };
             Registry.UpdateInfo(changed.Pid, merged);
+        }
+
+        /// <summary>
+        /// PipeRouter control-frame callback: a VS heartbeat. Refreshes that
+        /// instance's LastSeen so ProcessScanner mechanism 1's emptiness/staleness
+        /// view stays current between pipe disconnects. Pipe disconnect is the
+        /// primary VS-exit signal (OS semantics); LastSeen is the supplementary
+        /// liveness heartbeat. Runs inline on the pipe read loop, so it must be
+        /// fast and never throw — InstanceRegistry.TouchLastSeen is a
+        /// ConcurrentDictionary field write and satisfies both.
+        /// </summary>
+        private static void OnHeartbeat(PipeHeartbeat beat)
+        {
+            if (beat == null || beat.Pid <= 0) return;
+            Registry.TouchLastSeen(beat.Pid);
         }
 
         // ───────────────────────────── HTTP routing ──────────────────────────────
