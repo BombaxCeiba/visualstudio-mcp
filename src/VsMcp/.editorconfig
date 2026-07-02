@@ -1,0 +1,18 @@
+# D-19 (c): elevate the VSTHRD threading analyzers to errors in the main
+# extension project so the F-3 class of sync-over-async regression cannot be
+# silently reintroduced. Scoped to this directory (sits next to the csproj)
+# so the test project — which legitimately uses synchronous test scaffolding
+# (e.g. .GetAwaiter().GetResult() in setup helpers) — stays free of the gate.
+#
+# RESEARCH Open Q #2: .editorconfig is preferred over csproj
+# <WarningsAsErrors> because it is honored consistently across IDE and CLI
+# builds (avoids MSBuild issue #10801/#10871 edge cases).
+#
+# Only the three VSTHRD codes that directly guard the F-3 deadlock class.
+# CS86xx nullable-warning severities are NOT touched here — separate
+# code-quality cleanup deferred per 05-CONTEXT.md.
+
+[*.cs]
+dotnet_diagnostic.VSTHRD002.severity = error
+dotnet_diagnostic.VSTHRD003.severity = error
+dotnet_diagnostic.VSTHRD200.severity = error

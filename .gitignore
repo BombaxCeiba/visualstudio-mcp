@@ -1,0 +1,35 @@
+## Agent / planning tooling (local only, never commit)
+.planning/
+.omo/
+
+## Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.vsix
+dist/
+
+## Test results
+TestResults/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+# VS one-way solution migration artifacts
+UpgradeLog.htm
+[Bb]ackup/
+
+## JetBrains Rider
+.idea/
+
+## Logs & temp
+*.log
+*.tmp
+*.bak
+
+## OS cruft
+.DS_Store
+Thumbs.db

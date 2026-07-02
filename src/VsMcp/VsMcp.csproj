@@ -1,0 +1,206 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <Deterministic>true</Deterministic>
+    <RootNamespace>VsMcp</RootNamespace>
+    <AssemblyName>VsMcp</AssemblyName>
+    <!-- Strong-name-sign the assembly so the ProvideCodeBase codeBase entry
+         in the generated pkgdef loads cleanly. Without a strong name the CLR
+         refuses a codeBase located outside the VS application base
+         (HRESULT 0x80131041) and the package fails to load. -->
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>VsMcp.snk</AssemblyOriginatorKeyFile>
+    <!-- Suppress warnings from packages that don't declare net48 support -->
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+    <!-- Disable auto-generated AssemblyInfo since we have an explicit one -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- Default VS SDK assembly path for command-line builds.
+         Multi-target policy: prefer the OLDEST installed VS so the compiled
+         IL binds against the lowest SDK metadata, keeping the VSIX loadable
+         on every targeted VS version. The default below points at VS2022
+         (Dev17) to match the [17.0,18.0) installation target in vsixmanifest.
+         If that path is missing on this machine, ResolveVsSdkPath (below)
+         uses vswhere to discover whatever VS is installed and falls back to it. -->
+    <VsWherePath Condition=" '$(VsWherePath)' == '' ">$(MSBuildProgramFiles32)\Microsoft Visual Studio\Installer\vswhere.exe</VsWherePath>
+    <VsSdkAssembliesPath Condition=" '$(VsSdkAssembliesPath)' == '' ">C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\PublicAssemblies</VsSdkAssembliesPath>
+    <!-- Generate pkgdef from [PackageRegistration]/[ProvideAutoLoad] attributes (we ship a real VS Package) -->
+    <GeneratePkgDefFile>true</GeneratePkgDefFile>
+    <!-- Produce the .vsix container via the VS SDK build tooling (full MSBuild only — not dotnet build) -->
+    <GenerateVsixContainer>true</GenerateVsixContainer>
+    <CopyVsixManifestToOutput>true</CopyVsixManifestToOutput>
+    <!-- Import the VS SDK core targets (defines CreateVsixContainer/GeneratePkgDef). VSSDK.BuildTools.props sets VsSDKInstall to the package's tools folder. -->
+    <CustomAfterMicrosoftCSharpTargets Condition="'$(VsSDKInstall)' != ''">$(VsSDKInstall)\Microsoft.VsSDK.targets</CustomAfterMicrosoftCSharpTargets>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+  </PropertyGroup>
+
+  <!-- NuGet Package References -->
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
+    <!-- Microsoft.VisualStudio.Threading is intentionally NOT a PackageReference:
+         binding a NuGet version (e.g. 17.14.15) against an SDK Shell.15.0 from a
+         different VS install triggers CS1705 (Threading 17.x vs Shell's internal
+         reference to Threading 18.x). Instead we resolve the dll from the same
+         VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.9" />
+    <PackageReference Include="System.Text.Json" Version="10.0.9" />
+    <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
+    <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Discover VS SDK path via vswhere when the default path (VS2022) is absent.
+       -sort by major version ascending would be ideal, but vswhere lacks ascending
+       sort, so we list all matching installs and pick the FIRST (vswhere default
+       sort is version-descending; we work around by querying oldest-first via
+       separate version-range calls). -->
+  <Target Name="ResolveVsSdkPath" BeforeTargets="ResolveAssemblyReferences"
+          Condition="!Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll') And Exists('$(VsWherePath)')">
+    <!-- Try VS2022 first (Dev17, oldest targeted). -->
+    <Exec Command='"$(VsWherePath)" -version "[17.0,18.0)" -property installationPath'
+          ConsoleToMSBuild="true" Condition=" '$(_Vs2022Path)' == '' ">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_Vs2022Path" />
+    </Exec>
+    <PropertyGroup Condition=" '$(_Vs2022Path)' != '' ">
+      <_VsInstallPath>$(_Vs2022Path)</_VsInstallPath>
+    </PropertyGroup>
+    <!-- Fall back to VS2026 (Dev18) if VS2022 is absent. -->
+    <Exec Command='"$(VsWherePath)" -version "[18.0,19.0)" -property installationPath'
+          ConsoleToMSBuild="true" Condition=" '$(_VsInstallPath)' == '' ">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_Vs2026Path" />
+    </Exec>
+    <PropertyGroup Condition=" '$(_VsInstallPath)' == '' And '$(_Vs2026Path)' != '' ">
+      <_VsInstallPath>$(_Vs2026Path)</_VsInstallPath>
+    </PropertyGroup>
+    <PropertyGroup Condition=" '$(_VsInstallPath)' != '' ">
+      <VsSdkAssembliesPath>$(_VsInstallPath)\Common7\IDE\PublicAssemblies</VsSdkAssembliesPath>
+    </PropertyGroup>
+    <Warning Text="[VsMcp] VS2022 not found on this machine; falling back to $(_VsInstallPath) — the compiled VSIX may not load on VS2022 if the code calls APIs added after Dev17." Condition=" '$(_VsInstallPath)' != '' And '$(_Vs2022Path)' == '' " />
+    <Error Text="[VsMcp] No Visual Studio installation found via vswhere. Install VS2022 or VS2026, or pass /p:VsSdkAssembliesPath=..." Condition=" '$(_VsInstallPath)' == '' " />
+    <Message Text="[VsMcp] Resolved VS SDK via vswhere: $(VsSdkAssembliesPath)" Importance="high" Condition=" '$(_VsInstallPath)' != '' " />
+  </Target>
+
+  <!-- Bind Microsoft.VisualStudio.Threading to the SAME VS install that provides
+       Shell.15.0 — this prevents CS1705 by aligning the Threading metadata
+       version with whatever Shell.15.0 internally references.
+       VS2022 layout: PublicAssemblies\Microsoft.VisualStudio.Threading.dll
+       VS2026 layout: PublicAssemblies\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll
+                     (the subdir name suggests 17.x but the dll inside is actually 18.x;
+                      that's intentional — VS2026 ships a Threading whose API surface
+                      still covers the 17.x contract). -->
+  <Target Name="ResolveThreadingReference" BeforeTargets="ResolveAssemblyReferences"
+          DependsOnTargets="ResolveVsSdkPath">
+    <PropertyGroup>
+      <_ThreadingHintPath Condition="Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.dll')">$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.dll</_ThreadingHintPath>
+      <_ThreadingHintPath Condition=" '$(_ThreadingHintPath)' == '' And Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll')">$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll</_ThreadingHintPath>
+    </PropertyGroup>
+    <ItemGroup Condition=" '$(_ThreadingHintPath)' != '' ">
+      <Reference Include="Microsoft.VisualStudio.Threading">
+        <HintPath>$(_ThreadingHintPath)</HintPath>
+        <Private>false</Private>
+      </Reference>
+    </ItemGroup>
+    <Error Text="[VsMcp] Microsoft.VisualStudio.Threading.dll not found under $(VsSdkAssembliesPath) (looked at root and Microsoft.VisualStudio.Threading.17.x\)" Condition=" '$(_ThreadingHintPath)' == '' " />
+    <Message Text="[VsMcp] Threading reference resolved to: $(_ThreadingHintPath)" Importance="high" />
+  </Target>
+
+
+  <!-- VS SDK Assembly References (from VS installation).
+       These MUST be created inside a Target (not a static ItemGroup) so that
+       VsSdkAssembliesPath — potentially rewritten by ResolveVsSdkPath — is
+       evaluated at reference-resolution time, not at csproj load time. -->
+  <Target Name="ResolveVsSdkReferences" BeforeTargets="ResolveAssemblyReferences"
+          DependsOnTargets="ResolveVsSdkPath;ResolveThreadingReference">
+    <ItemGroup>
+      <Reference Include="Microsoft.VisualStudio.Shell.15.0">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.Shell.Framework">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Framework.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.OLE.Interop">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.OLE.Interop.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.Shell.Interop.8.0">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Interop.8.0.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.Shell.Interop">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Interop.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.Interop">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Interop.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System" />
+      <Reference Include="System.Core" />
+      <Reference Include="System.Net.Http" />
+    </ItemGroup>
+    <Message Text="[VsMcp] Resolved VS SDK references from $(VsSdkAssembliesPath)" Importance="high" />
+  </Target>
+
+  <!-- source.extension.vsixmanifest is auto-detected by VSSDK.BuildTools; no explicit include needed -->
+
+  <!--
+    Force-include copy-local runtime dependencies that VSSDK.BuildTools wrongly excludes because VS ships
+    same-named assemblies in isolated per-extension folders (not a shared probing path). Without these the
+    extension fails to load at runtime (e.g. ModelContextProtocol needs System.Text.Json). Bundling our own
+    copy makes the VSIX self-contained. Must run before GetVsixSourceItems (which collects IncludeInVSIX
+    Content items); Link= forces placement at the VSIX root next to the package DLL.
+  -->
+  <Target Name="ForceIncludeRuntimeDependencies" BeforeTargets="GetVsixSourceItems">
+    <ItemGroup>
+      <Content Include="$(TargetDir)System.Text.Json.dll" Condition="Exists('$(TargetDir)System.Text.Json.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Json.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Text.Encodings.Web.dll" Condition="Exists('$(TargetDir)System.Text.Encodings.Web.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Encodings.Web.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)Microsoft.Bcl.AsyncInterfaces.dll" Condition="Exists('$(TargetDir)Microsoft.Bcl.AsyncInterfaces.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>Microsoft.Bcl.AsyncInterfaces.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.IO.Pipelines.dll" Condition="Exists('$(TargetDir)System.IO.Pipelines.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.IO.Pipelines.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Buffers.dll" Condition="Exists('$(TargetDir)System.Buffers.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Buffers.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Memory.dll" Condition="Exists('$(TargetDir)System.Memory.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Memory.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Numerics.Vectors.dll" Condition="Exists('$(TargetDir)System.Numerics.Vectors.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Numerics.Vectors.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Runtime.CompilerServices.Unsafe.dll" Condition="Exists('$(TargetDir)System.Runtime.CompilerServices.Unsafe.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Runtime.CompilerServices.Unsafe.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Diagnostics.DiagnosticSource.dll" Condition="Exists('$(TargetDir)System.Diagnostics.DiagnosticSource.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Diagnostics.DiagnosticSource.dll</Link>
+      </Content>
+      <Content Include="$(TargetDir)System.Threading.Tasks.Extensions.dll" Condition="Exists('$(TargetDir)System.Threading.Tasks.Extensions.dll')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Threading.Tasks.Extensions.dll</Link>
+      </Content>
+    </ItemGroup>
+    <Message Text="ForceIncludeRuntimeDependencies: bundling runtime deps from $(TargetDir)" Importance="high" />
+  </Target>
+
+</Project>
