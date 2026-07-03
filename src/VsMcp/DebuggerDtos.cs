@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -17,11 +18,48 @@ namespace System.Runtime.CompilerServices
 namespace VsMcp
 {
     // ===========================================================================
-    // F-6 typed result DTOs. All serialize via McpJsonUtilities.DefaultOptions
-    // (camelCase web defaults) so the LLM sees stable, schema-friendly JSON.
+    // F-6 typed result DTOs. 工具成功结果经 SafeCall → McpJson.ToTextResult 用
+    // McpJson.ReadableOptions（宽松编码器，不转义中文）序列化进 TextContentBlock；
+    // 错误结果（ErrorResult）同样走 ReadableOptions。不再使用 SDK 的
+    // McpJsonUtilities.DefaultOptions —— 其 Encoder 为 null，会把中文等非 ASCII
+    // 转义成 \uXXXX，模型最终收到的是字面转义串而非可读文本。
     // The previous hand-built JSON layer (EscapeJson/SerializeError/etc.) is
     // deleted in DebuggerFacade.cs — these records replace it wholesale.
     // ===========================================================================
+
+    /// <summary>
+    /// 可读 JSON 序列化基础设施。MCP SDK 的 <see cref="McpJsonUtilities"/>.DefaultOptions
+    /// 其 Encoder 为 null（等价 <see cref="JavaScriptEncoder"/>.Default），会把非 ASCII
+    /// 字符（中文等）和引号转义为 \uXXXX；而 SDK 把工具返回的 DTO 自动序列化进
+    /// <see cref="TextContentBlock.Text"/> 时正用该 DefaultOptions，导致模型最终收到字面
+    /// 的转义串（生成 而非可读的"生成"）。该 DefaultOptions 只读且 getter 返回的实例
+    /// 已被冻结、<see cref="McpServerOptions"/> 也无 JSON 注入点，无法在 SDK 层替换 ——
+    /// 故工具成功结果统一经 <see cref="ToTextResult"/> 用本类的宽松选项序列化后包成
+    /// <see cref="CallToolResult"/> 返回（SDK 对 CallToolResult 原样透传）。最外层 wire
+    /// 上中文会被 SDK 的 DefaultOptions 合法转义为 \uXXXX，客户端 JSON 解码后还原为真实
+    /// 字符，模型看到可读文本。
+    /// </summary>
+    internal static class McpJson
+    {
+        /// <summary>宽松编码器：不转义非 ASCII（中文等）与 HTML 敏感字符。MCP 的
+        /// JSON-RPC 由客户端 JSON 解析器消费，非嵌入 HTML，故 UnsafeRelaxed 的 XSS
+        /// 风险在此场景不适用。</summary>
+        public static JsonSerializerOptions ReadableOptions { get; } = new(JsonSerializerDefaults.Web)
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+
+        /// <summary>把任意 DTO 用 <see cref="ReadableOptions"/> 序列化进单个
+        /// <see cref="TextContentBlock"/> 的 <see cref="CallToolResult"/>。供 SafeCall
+        /// 成功路径与 <see cref="ErrorResult.ToCallToolResult"/> 复用。</summary>
+        public static CallToolResult ToTextResult<T>(T dto) => new()
+        {
+            Content = new List<ContentBlock>
+            {
+                new TextContentBlock { Text = JsonSerializer.Serialize(dto, ReadableOptions) },
+            },
+        };
+    }
 
     /// <summary>Result of <c>get_debugger_state</c>.</summary>
     public sealed record DebuggerStateResult(string State);
@@ -177,7 +215,7 @@ namespace VsMcp
         /// Builds an MCP-spec <see cref="CallToolResult"/> with
         /// <see cref="CallToolResult.IsError"/> = true and a single
         /// <see cref="TextContentBlock"/> whose text is this ErrorResult
-        /// serialized via <see cref="McpJsonUtilities.DefaultOptions"/>.
+        /// serialized via <see cref="McpJson.ReadableOptions"/>.
         /// </summary>
         public CallToolResult ToCallToolResult() => new()
         {
@@ -186,7 +224,7 @@ namespace VsMcp
             {
                 new TextContentBlock
                 {
-                    Text = JsonSerializer.Serialize(this, McpJsonUtilities.DefaultOptions)
+                    Text = JsonSerializer.Serialize(this, McpJson.ReadableOptions)
                 }
             },
         };
@@ -250,12 +288,13 @@ namespace VsMcp
     // ===========================================================================
 
     /// <summary>
-    /// Routes facade exceptions into the D-12 structured-error contract.
-    /// The widened <c>Task&lt;object&gt;</c> return type satisfies the MCP
-    /// SDK's tool-invocation contract: the SDK serializes a plain DTO via
-    /// McpJsonUtilities, but returns a CallToolResult verbatim (REMEDIATION
-    /// fact #7), so both success DTOs and ErrorResult.ToCallToolResult()
-    /// results flow through one delegate type.
+    /// Routes facade exceptions into the D-12 structured-error contract, and
+    /// wraps every success result via <see cref="McpJson.ToTextResult"/> so the
+    /// LLM sees readable (unescaped) JSON. The widened <c>Task&lt;object&gt;</c>
+    /// return type satisfies the MCP SDK's tool-invocation contract: success and
+    /// error paths both yield a <see cref="CallToolResult"/>, which the SDK
+    /// returns verbatim (REMEDIATION fact #7) instead of re-serializing it via
+    /// the Chinese-escaping <c>McpJsonUtilities.DefaultOptions</c>.
     /// </summary>
     public static class SafeCall
     {
@@ -265,7 +304,12 @@ namespace VsMcp
         {
             try
             {
-                return await work().ConfigureAwait(false);
+                // 用宽松编码器把 DTO 序列化进 CallToolResult 返回，绕过 SDK 对 DTO 的
+                // 自动序列化（它用转义中文的 McpJsonUtilities.DefaultOptions）。SDK 对
+                // CallToolResult 原样透传；最外层 wire 上的合法 \uXXXX 转义由客户端 JSON
+                // 解码还原为真实字符。详见 McpJson。
+                T result = await work().ConfigureAwait(false);
+                return McpJson.ToTextResult(result);
             }
             catch (OperationCanceledException)
             {
