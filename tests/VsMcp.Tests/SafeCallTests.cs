@@ -1,7 +1,9 @@
+extern alias vsmpc;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 using ModelContextProtocol.Protocol;
+using vsmpc::VsMcp;
 using Xunit;
 
 namespace VsMcp.Tests

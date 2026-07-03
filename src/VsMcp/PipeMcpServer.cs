@@ -186,30 +186,13 @@ namespace VsMcp
             string? solutionDir = null;
             string? solutionPath = null;
 
-            if (_facade != null)
-            {
-                try
-                {
-                    var info = await _facade.GetSessionInfoAsync(ct).ConfigureAwait(false);
-                    solutionPath = info.SolutionPath;
-                    solutionDir = info.SolutionDir;
-                    if (!string.IsNullOrEmpty(solutionPath))
-                    {
-                        try { solutionName = Path.GetFileName(solutionPath); }
-                        catch { solutionName = null; }
-                    }
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch
-                {
-                    // Solution not open yet / DTE not ready — leave fields null;
-                    // the register still goes out so the Gateway knows we exist.
-                    // solution-changed notification will refresh it later.
-                }
-            }
+            // 不在此取 solution info：GetSessionInfoAsync 会 SwitchToMainThreadAsync 切 UI，
+            // 而 ConnectLoop 是 Task.Run 启动的裸后台线程（无 JoinableTask 上下文），从它
+            // 切 UI 会卡死，register 帧永远发不出去、Gateway 收不到任何注册。先把 PID
+            // 注册上保证连通；solution info 由 solution-changed（IVsSolutionEvents 回调本就
+            // 在 UI 线程，安全）补充。
+            _loggerFactory?.CreateLogger<PipeMcpServer>()
+                ?.LogInformation("SendRegister: sending register frame (pid={Pid})", _pid);
 
             var register = new PipeRegister
             {

@@ -11,13 +11,34 @@
     <RootNamespace>VsMcpGateway</RootNamespace>
     <AssemblyName>VsMcpGateway</AssemblyName>
     <!-- 纯转发进程，不承载 VS Package，无需 VSSDK.BuildTools / VSIX 容器。 -->
+
+    <!-- Auto-generate bindingRedirects into VsMcpGateway.exe.config at build
+         time. The Gateway ships its own copy of System.Text.Json 10.0.9 (which
+         depends on System.Memory 4.0.2.0), but net48's System.Memory 4.0.5.0
+         also floats around — without these redirects the Gateway process hits
+         a System.Memory FileLoadException on launch. The VSIX-bundled copy of
+         this .exe.config (see VsMcp.csproj ForceIncludeRuntimeDependencies) is
+         what makes the post-install Gateway actually startable. -->
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 共享 pipe framing + 协议 DTO。 -->
-    <ProjectReference Include="..\VsMcp.Common\VsMcp.Common.csproj" />
+    <!-- Pipe framing + protocol DTO source-link (former VsMcp.Common project).
+         Same rationale as VsMcp.csproj: removing the shared DLL eliminates its
+         NuGet-bound System.Text.Json version fighting the consumer's host.
+         Namespace stays VsMcp.Common so every `using VsMcp.Common;` is
+         unchanged. -->
+    <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
+    <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Gateway 端按帧 type 分派时解析 JSON，但绝不解析 JSON-RPC method（Wave 1
-         纯透传；method/session 路由是 Wave 2 的工作）。 -->
+         纯透传；method/session 路由是 Wave 2 的工作）。
+         Unlike VsMcp (which inherits VS host's System.Text.Json via codeBase),
+         the Gateway is an independent process and MUST carry its own
+         System.Text.Json copy for the bindingRedirects to redirect against. -->
     <PackageReference Include="System.Text.Json" Version="10.0.9" />
   </ItemGroup>
 

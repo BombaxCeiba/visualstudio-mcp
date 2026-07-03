@@ -31,13 +31,28 @@
     <PackageReference Include="xunit" Version="2.*" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.*" />
     <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
-    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.*" />
-    <PackageReference Include="System.Text.Json" Version="10.*" />
+    <!-- System.Text.Json / Microsoft.Bcl.AsyncInterfaces are no longer declared
+         here: they were VsMcp.Common's transitive deps, and VsMcp.Common is
+         gone. They now flow in transitively from VsMcpGateway's explicit
+         System.Text.Json PackageReference (and ModelContextProtocol above). -->
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\VsMcp\VsMcp.csproj" />
-    <ProjectReference Include="..\..\src\VsMcp.Common\VsMcp.Common.csproj" />
+    <!-- VsMcp.Common source files are linked into BOTH VsMcp.dll and
+         VsMcpGateway.exe, so the VsMcp.Common.* types exist in two assemblies.
+         To avoid CS0433 ("type exists in both"), VsMcp is referenced under a
+         non-global alias. Tests that need VsMcp types (KeepAliveNotifier,
+         HeartbeatClient, DebuggerFacade, SafeCall, BreakpointInfo, etc.) add
+         `extern alias vsmpc;` at the top and `using vsmpc::VsMcp;`.
+         VsMcp.Common.* types resolve to VsMcpGateway.exe (in global) for
+         everyone — which is exactly where VsMcpGateway's own code uses them,
+         so the PipeRegister/PipeResponseHead/etc types tests build are the
+         same in-memory type PipeRouter/InstanceRegistry/ProcessScanner expect.
+         VsMcp.dll's separate copy of VsMcp.Common (compiled from the same
+         linked source) lives in the vsmpc alias and is wire-compatible. -->
+    <ProjectReference Include="..\..\src\VsMcp\VsMcp.csproj">
+      <Aliases>vsmpc</Aliases>
+    </ProjectReference>
     <ProjectReference Include="..\..\src\VsMcpGateway\VsMcpGateway.csproj" />
   </ItemGroup>
 

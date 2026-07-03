@@ -1,3 +1,5 @@
+extern alias vsmpc;
+using vsmpc::VsMcp;
 using Xunit;
 
 namespace VsMcp.Tests

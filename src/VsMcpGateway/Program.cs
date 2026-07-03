@@ -48,7 +48,7 @@ namespace VsMcpGateway
             {
                 listener.Start();
             }
-            catch (HttpListenerException)
+            catch (HttpListenerException ex)
             {
                 return 3; // another Gateway already owns :43210
             }
@@ -63,11 +63,16 @@ namespace VsMcpGateway
             // Self-termination watchdog: the Gateway exits on its own once no VS
             // instance is left, so it can never become a permanent orphan process
             // (设计文档 §Gateway 自杀). Both the registry-empty and devenv-scan
-            // mechanisms funnel through cts.Cancel, letting the accept loops unwind
-            // gracefully instead of Environment.Exit. Started after the pipe accept
-            // loop is armed so the initial empty-registry grace overlaps the first
-            // VS connection window.
-            _scanner = new ProcessScanner(Registry, onSelfKill: () => cts.Cancel(), cts.Token);
+            // mechanisms funnel through onSelfKill, which Environment.Exit(0)s the
+            // process directly. A graceful cts.Cancel unwind is impossible here:
+            // the HTTP accept loop's listener.GetContextAsync() does not respond
+            // to cancellation, so cancelling would leave the process hung on the
+            // blocking accept. Self-termination is a sanctioned shutdown path —
+            // any in-flight requests are abandoned by design. The Ctrl+C path
+            // above still uses cts.Cancel for the user-initiated stop. Started
+            // after the pipe accept loop is armed so the initial empty-registry
+            // grace overlaps the first VS connection window.
+            _scanner = new ProcessScanner(Registry, onSelfKill: () => Environment.Exit(0), cts.Token);
             _scanner.Start();
 
             // HTTP accept loop.
@@ -154,19 +159,13 @@ namespace VsMcpGateway
             regCts.CancelAfter(RegisterReadTimeoutMs);
             try
             {
-                // Deserialize through PipeFraming's camelCase options. The wire
-                // frame is camelCase (pid / solutionPath / ...); a bare
-                // JsonSerializer.Deserialize<PipeRegister> uses the default
-                // PascalCase policy and silently binds nothing — Pid parses as 0,
-                // the caller treats Pid<=0 as a bogus register, drops the
-                // connection, and no VS instance ever registers.
                 return await PipeFraming.ReadFrameAsync<PipeRegister>(stream, regCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (regCts.IsCancellationRequested)
             {
                 return null;
             }
-            catch
+            catch (Exception)
             {
                 return null;
             }

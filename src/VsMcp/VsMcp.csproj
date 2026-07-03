@@ -50,7 +50,15 @@
     <DefineConstants>TRACE</DefineConstants>
   </PropertyGroup>
 
-  <!-- NuGet Package References -->
+  <!-- NuGet Package References.
+       System.Text.Json is pinned explicitly (not left to MCP's transitive
+       resolution) so VsMcp.dll's compile-time reference matches the version
+       VsMcpGateway.exe carries directly. The Gateway ships its own
+       System.Text.Json in the VSIX next to VsMcp.dll, and the two processes
+       share that single bundled dll; aligning both compile-time references to
+       10.0.0.9 eliminates the cross-project version skew that would otherwise
+       need error-prone manual bindingRedirects. ProvideBindingRedirection in
+       AssemblyInfo.cs then points the pkgged redirect at 10.0.0.9. -->
   <ItemGroup>
     <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
     <!-- Microsoft.VisualStudio.Threading is intentionally NOT a PackageReference:
@@ -58,7 +66,6 @@
          different VS install triggers CS1705 (Threading 17.x vs Shell's internal
          reference to Threading 18.x). Instead we resolve the dll from the same
          VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
-    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.9" />
     <PackageReference Include="System.Text.Json" Version="10.0.9" />
     <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
     <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
@@ -158,12 +165,16 @@
     <Message Text="[VsMcp] Resolved VS SDK references from $(VsSdkAssembliesPath)" Importance="high" />
   </Target>
 
-  <!-- Shared pipe-framing library (used by the VS-side PipeMcpServer; also
-       referenced by the standalone VsMcpGateway exe). Pure netstandard2.0,
-       carries no VS-SDK references, so it does not drag the SDK into the
-       Gateway process. -->
+  <!-- Pipe framing + protocol DTO source-link. The former VsMcp.Common DLL was
+       removed because its NuGet-bound System.Text.Json version fought the VS
+       host's codeBase-pinned version (FileLoadException on package load). The
+       source is now compiled directly into VsMcp.dll (VS extension) and
+       VsMcpGateway.exe (Gateway) so neither carries a shared DLL with strong-name
+       / version / deployment constraints. The namespace stays VsMcp.Common, so
+       every `using VsMcp.Common;` in this project resolves unchanged. -->
   <ItemGroup>
-    <ProjectReference Include="..\VsMcp.Common\VsMcp.Common.csproj" />
+    <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
+    <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
   </ItemGroup>
 
   <!-- VsMcpGateway.exe is a separate WinExe process that owns :43210 and
@@ -184,21 +195,31 @@
   </ItemGroup>
 
   <!-- After the Gateway project builds (driven by the ProjectReference above),
-       copy its exe into VsMcp's output directory so that, post-VSIX-install, the
-       exe and VsMcp.dll land in the SAME directory. The Gateway's runtime
-       dependencies (VsMcp.Common.dll, System.Text.Json.dll, etc.) are already
-       bundled by ForceIncludeRuntimeDependencies below — VsMcp itself depends
-       on the same assemblies — so no extra packaging work is needed for them. -->
+       copy its exe AND its generated .exe.config into VsMcp's output directory.
+       The .exe.config is the SDK's auto-generated bindingRedirect output
+       (AutoGenerateBindingRedirects=true), needed at runtime for any minor
+       version unification inside the Gateway's own dependency graph. The
+       bundled dependency dlls (System.Text.Json, System.Memory, etc.) come from
+       VsMcp's own copy-local set, which — because VsMcp pins System.Text.Json
+       10.0.9 directly — match Gateway's compile-time references, so the VSIX's
+       single bundled System.Text.Json.dll satisfies both processes without
+       extra manual bindingRedirects. -->
   <Target Name="CopyGatewayExe" AfterTargets="ResolveProjectReferences"
           BeforeTargets="GetVsixSourceItems">
     <PropertyGroup>
-      <VsMcpGatewayExePath>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\VsMcpGateway.exe</VsMcpGatewayExePath>
+      <VsMcpGatewayOutputDir>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\</VsMcpGatewayOutputDir>
+      <VsMcpGatewayExePath>$(VsMcpGatewayOutputDir)VsMcpGateway.exe</VsMcpGatewayExePath>
+      <VsMcpGatewayConfigPath>$(VsMcpGatewayOutputDir)VsMcpGateway.exe.config</VsMcpGatewayConfigPath>
     </PropertyGroup>
     <Copy SourceFiles="$(VsMcpGatewayExePath)"
           DestinationFolder="$(TargetDir)"
           Condition="Exists('$(VsMcpGatewayExePath)')"
           SkipUnchangedFiles="true" />
-    <Message Text="Copied VsMcpGateway.exe -> $(TargetDir)" Importance="high"
+    <Copy SourceFiles="$(VsMcpGatewayConfigPath)"
+          DestinationFolder="$(TargetDir)"
+          Condition="Exists('$(VsMcpGatewayConfigPath)')"
+          SkipUnchangedFiles="true" />
+    <Message Text="Copied VsMcpGateway.exe + .exe.config -> $(TargetDir)" Importance="high"
              Condition="Exists('$(VsMcpGatewayExePath)')" />
     <Warning Text="VsMcpGateway.exe not found at $(VsMcpGatewayExePath) — Gateway will be MISSING from the VSIX"
              Condition="!Exists('$(VsMcpGatewayExePath)')" />
@@ -207,22 +228,32 @@
   <!-- source.extension.vsixmanifest is auto-detected by VSSDK.BuildTools; no explicit include needed -->
 
   <!--
-    Force-include copy-local runtime dependencies that VSSDK.BuildTools wrongly excludes because VS ships
-    same-named assemblies in isolated per-extension folders (not a shared probing path). Without these the
-    extension fails to load at runtime (e.g. ModelContextProtocol needs System.Text.Json). Bundling our own
-    copy makes the VSIX self-contained. Must run before GetVsixSourceItems (which collects IncludeInVSIX
-    Content items); Link= forces placement at the VSIX root next to the package DLL.
+    Force-include Gateway-side runtime files into the VSIX root next to
+    VsMcpGateway.exe. These are NOT for the VS extension itself: VsMcp.dll runs
+    inside the VS host, whose devenv.exe.config codeBase already pins
+    System.Text.Json / System.Memory / etc. from VS SharedAssemblies. The VS
+    extension loader honors the host codeBase and ignores these copies.
+
+    The Gateway is a SEPARATE process (VsMcpGateway.exe) and needs its own
+    private copies of these dlls + its .exe.config (bindingRedirects that the
+    Gateway's GenerateBindingRedirectsOutputType produces) to launch
+    successfully. After VSIX install everything lands in one directory, so the
+    Gateway exe finds its config and dependencies next to itself.
+    Must run before GetVsixSourceItems; Link= forces VSIX-root placement.
   -->
   <Target Name="ForceIncludeRuntimeDependencies" BeforeTargets="GetVsixSourceItems">
     <ItemGroup>
-      <!-- VsMcpGateway.exe copied here by the CopyGatewayExe target above.
-           Link= places it at the VSIX root next to VsMcp.dll so that, after
-           VSIX install, GatewayLauncher.ResolveGatewayPath's same-directory
-           branch finds it (the two must share a directory for the deployment
-           to be valid). -->
+      <!-- VsMcpGateway.exe + its generated .exe.config (bindingRedirects). The
+           config is mandatory: without it the Gateway process hits
+           System.Memory 4.0.2.0 vs 4.0.5.0 FileLoadException on startup. -->
       <Content Include="$(TargetDir)VsMcpGateway.exe" Condition="Exists('$(TargetDir)VsMcpGateway.exe')">
         <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe</Link>
       </Content>
+      <Content Include="$(TargetDir)VsMcpGateway.exe.config" Condition="Exists('$(TargetDir)VsMcpGateway.exe.config')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe.config</Link>
+      </Content>
+      <!-- Gateway-side runtime deps (its own private copies; VS host is
+           unaffected because it loads System.* via devenv codeBase). -->
       <Content Include="$(TargetDir)System.Text.Json.dll" Condition="Exists('$(TargetDir)System.Text.Json.dll')">
         <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Json.dll</Link>
       </Content>
@@ -254,7 +285,7 @@
         <IncludeInVSIX>true</IncludeInVSIX><Link>System.Threading.Tasks.Extensions.dll</Link>
       </Content>
     </ItemGroup>
-    <Message Text="ForceIncludeRuntimeDependencies: bundling runtime deps from $(TargetDir)" Importance="high" />
+    <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(TargetDir)" Importance="high" />
   </Target>
 
 </Project>

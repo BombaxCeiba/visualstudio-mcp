@@ -23,9 +23,8 @@ namespace VsMcpGateway
     ///     a stale registry entry would otherwise defeat mechanism 1.</item>
     /// </list>
     /// Either mechanism firing invokes <c>onSelfKill</c> exactly once
-    /// (production: cancels the Main CTS so the accept loops unwind gracefully —
-    /// never <c>Environment.Exit</c>, which would truncate in-flight requests
-    /// abruptly).
+    /// (production: <c>Environment.Exit(0)</c> — see Program.cs for why a
+    /// graceful cancel cannot unwind the HTTP accept loop).
     /// <para>
     /// Every timer is injectable (production = seconds, tests = milliseconds)
     /// and the devenv probe is a <c>Func&lt;bool&gt;</c> so tests never touch the
@@ -57,7 +56,8 @@ namespace VsMcpGateway
         /// <param name="registry">The Gateway's instance table; <see cref="InstanceRegistry.Count"/>
         /// drives mechanism 1.</param>
         /// <param name="onSelfKill">Invoked at most once when either mechanism
-        /// trips. Production cancels the Main CTS. Must not throw.</param>
+        /// trips. Production calls <c>Environment.Exit(0)</c> (the HTTP accept
+        /// loop cannot be cancelled). Must not throw.</param>
         /// <param name="cancellationToken">The Main CTS's token; canceling it
         /// (Gateway shutdown) stops the scan loop.</param>
         /// <param name="anyDevenvAlive">Injectable devenv probe. Defaults to a

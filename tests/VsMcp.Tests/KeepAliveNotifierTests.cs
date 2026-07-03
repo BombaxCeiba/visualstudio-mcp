@@ -1,8 +1,9 @@
+extern alias vsmpc;
 using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using VsMcp;
+using vsmpc::VsMcp;
 using Xunit;
 
 namespace VsMcp.Tests

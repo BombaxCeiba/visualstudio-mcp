@@ -1,6 +1,8 @@
+extern alias vsmpc;
 using System.Collections.Generic;
 using System.Text.Json;
 using ModelContextProtocol;
+using vsmpc::VsMcp;
 using Xunit;
 
 namespace VsMcp.Tests

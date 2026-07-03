@@ -22,7 +22,7 @@ using Microsoft.VisualStudio.Shell;
 // Microsoft.Bcl.* infrastructure assemblies (pulled in by ModelContextProtocol),
 // while VS2026 ships its own older copies (10.0.0.2) in its Private/Public
 // probing paths. Without redirection the CLR may bind the extension's
-// higher-versioned ref (e.g. 10.0.0.9) against VS's 10.0.0.2 copy and fail with
+// higher-versioned ref (e.g. 10.0.0.5) against VS's 10.0.0.2 copy and fail with
 // REF_DEF_MISMATCH (0x80131040). Each ProvideBindingRedirection below pins the
 // whole 0.0.0.0-<bundled> range onto the version we actually ship in the VSIX
 // and, via the default GenerateCodeBase=true, emits a codeBase entry pointing at
@@ -30,13 +30,14 @@ using Microsoft.VisualStudio.Shell;
 // own matching copies sitting next to VsMcp.dll, sidestepping VS's
 // older runtime copies entirely.
 //
-// NOTE on version numbers: NewVersion is the version each bundled DLL carries
-// (verified from the built bin), NOT VS2026's 10.0.0.2. CreatePkgDef rejects a
-// redirect whose OldVersionUpperBound exceeds NewVersion ("OldVersion 高于
-// NewVersion"), and a CLR binding redirect cannot map a higher-versioned request
-// onto a lower-versioned assembly anyway, so redirecting to 10.0.0.2 is neither
-// buildable nor semantically valid. Pinning to the bundled version is the
-// correct resolution.
+// NOTE on version numbers: NewVersion is the version VsMcp.dll's manifest
+// references at compile time, NOT VS2026's 10.0.0.2. After VsMcp.Common was
+// removed (sources linked into VsMcp.dll + VsMcpGateway.exe), VsMcp and
+// VsMcpGateway both pin System.Text.Json 10.0.9 directly so both compile-time
+// references resolve to assembly version 10.0.0.9 — the VSIX then ships ONE
+// 10.0.0.9 dll that satisfies both processes with zero manual bindingRedirects.
+// CreatePkgDef rejects a redirect whose OldVersionUpperBound exceeds NewVersion,
+// so the values below must track VsMcp's compile-time reference versions.
 // ProvideBindingRedirection is [AttributeUsage(AllowMultiple = true)].
 [assembly: ProvideBindingRedirection(AssemblyName = "Microsoft.Bcl.AsyncInterfaces", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "10.0.0.9", NewVersion = "10.0.0.9")]
 [assembly: ProvideBindingRedirection(AssemblyName = "Microsoft.Bcl.Memory", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "10.0.0.5", NewVersion = "10.0.0.5")]
