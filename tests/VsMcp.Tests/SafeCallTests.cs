@@ -89,14 +89,22 @@ namespace VsMcp.Tests
         // --- Success path returns the DTO value unchanged ---
 
         [Fact]
-        public async Task Wrap_Success_ReturnsFacadeValueUnchanged()
+        public async Task Wrap_Success_ReturnsFacadeValueAsReadableJson()
         {
+            // The success path wraps the DTO via McpJson.ToTextResult so the LLM
+            // sees readable (unescaped) JSON rather than the SDK's Chinese-
+            // escaping default. The return is a CallToolResult whose text content
+            // carries the serialized DTO; the state value must round-trip.
             object result = await SafeCall.Wrap(
                 () => Task.FromResult<object>(new DebuggerStateResult("break")),
                 CancellationToken.None);
 
-            var dto = Assert.IsType<DebuggerStateResult>(result);
-            Assert.Equal("break", dto.State);
+            var ctr = Assert.IsType<CallToolResult>(result);
+            // Success path leaves IsError unset (null) — distinct from the error
+            // path's explicit true. `!= true` accepts both null and false.
+            Assert.True(ctr.IsError != true);
+            var block = Assert.IsType<TextContentBlock>(ctr.Content[0]);
+            Assert.Contains("break", block.Text);
         }
 
         // --- helpers: parse the TextContentBlock JSON for an ErrorResult field ---
