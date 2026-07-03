@@ -154,9 +154,17 @@ namespace VsMcpGateway
             regCts.CancelAfter(RegisterReadTimeoutMs);
             try
             {
-                string? json = await PipeFraming.ReadFrameJsonAsync(stream, regCts.Token).ConfigureAwait(false);
-                if (json == null) return null;
-                return JsonSerializer.Deserialize<PipeRegister>(json);
+                // Deserialize through PipeFraming's camelCase options. The wire
+                // frame is camelCase (pid / solutionPath / ...); a bare
+                // JsonSerializer.Deserialize<PipeRegister> uses the default
+                // PascalCase policy and silently binds nothing — Pid parses as 0,
+                // the caller treats Pid<=0 as a bogus register, drops the
+                // connection, and no VS instance ever registers.
+                return await PipeFraming.ReadFrameAsync<PipeRegister>(stream, regCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (regCts.IsCancellationRequested)
+            {
+                return null;
             }
             catch
             {
@@ -309,14 +317,18 @@ namespace VsMcpGateway
                     vsPid = match.Pid;
                 else if (match.Kind == WorkspaceMatchKind.None)
                 {
-                    await WriteToolErrorAsync(ctx, body,
+                    // initialize failure → JSON-RPC error (NOT a tool-error). MCP
+                    // clients schema-validate the initialize result; a tool-error
+                    // (result.isError) has no protocolVersion/capabilities/serverInfo
+                    // and trips zod, surfacing as three undefined fields to the user.
+                    await WriteJsonRpcErrorAsync(ctx, body, -32001,
                         GatewayTools.BuildWorkspaceMissMessage(workspaceHeader!, snap)).ConfigureAwait(false);
                     return;
                 }
                 else
                 {
                     var matchedInstances = snap.Where(e => match.MatchedPids.Contains(e.Info.Pid)).ToArray();
-                    await WriteToolErrorAsync(ctx, body,
+                    await WriteJsonRpcErrorAsync(ctx, body, -32001,
                         GatewayTools.BuildAmbiguousMessage(workspaceHeader!, matchedInstances)).ConfigureAwait(false);
                     return;
                 }
@@ -329,11 +341,13 @@ namespace VsMcpGateway
                 vsPid = ResolveInitializeTarget(vsPid, snap.Count, () => snap.First().Info.Pid);
                 if (!vsPid.HasValue)
                 {
+                    // initialize failure → JSON-RPC error so MCP clients parse it
+                    // as an initialize failure rather than a schema-mismatched result.
                     int count = snap.Count;
                     string msg = count == 0
                         ? "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry."
                         : GatewayTools.BuildInterceptMessage(snap);
-                    await WriteToolErrorAsync(ctx, body, msg).ConfigureAwait(false);
+                    await WriteJsonRpcErrorAsync(ctx, body, -32001, msg).ConfigureAwait(false);
                     return;
                 }
                 isAutoFallback = true;

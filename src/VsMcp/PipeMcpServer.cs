@@ -114,14 +114,25 @@ namespace VsMcp
                 NamedPipeClientStream? pipe = null;
                 try
                 {
-                    // PipeOptions.None + 同步 Connect in Task.Run：net48 上唯一不挂死的
-                    // client 连接范式（Asynchronous handle + 同步 Connect 行为未定义）。
+                    // Asynchronous (overlapped) handle + async Connect/Read/Write
+                    // throughout. The prior PipeOptions.None + async ReadAsync/WriteAsync
+                    // was an inconsistent pairing: None makes a non-overlapped handle,
+                    // and async IO on it failed to actually flush, so the VS side
+                    // connected but never sent its register frame (the Gateway saw
+                    // connection-then-immediate-EOF). An overlapped handle requires
+                    // async Connect too — synchronous Connect on an overlapped handle
+                    // deadlocks on net48 (Wave 1 lesson) — so ConnectAsync is raced
+                    // against a 2s timeout.
                     pipe = new NamedPipeClientStream(
-                        ".", GatewayPipeName, PipeDirection.InOut, PipeOptions.None);
+                        ".", GatewayPipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
 
                     using (ct.Register(() => { try { pipe.Dispose(); } catch { /* raced */ } }))
                     {
-                        await Task.Run(() => pipe.Connect(2000), ct).ConfigureAwait(false);
+                        Task connectTask = pipe.ConnectAsync();
+                        Task winner = await Task.WhenAny(connectTask, Task.Delay(2000, ct)).ConfigureAwait(false);
+                        if (winner != connectTask)
+                            throw new TimeoutException("Timed out connecting to the gateway pipe.");
+                        await connectTask.ConfigureAwait(false); // observe connect errors
                     }
 
                     logger?.LogInformation("Connected to gateway pipe {Pipe}", GatewayPipeName);
@@ -147,8 +158,10 @@ namespace VsMcp
                 {
                     // Connect failed (Gateway not up yet) or the established
                     // connection dropped — retry after a short backoff so VS
-                    // auto-recovers when the Gateway (re)starts.
-                    logger?.LogDebug(ex, "Gateway pipe connect/serve error; will retry");
+                    // auto-recovers when the Gateway (re)starts. Information-level
+                    // so connection problems surface in the VS Output window during
+                    // startup (Debug is hidden by the package's Information filter).
+                    logger?.LogInformation(ex, "Gateway pipe connect/serve error; will retry");
                 }
                 finally
                 {
@@ -214,8 +227,11 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
+                // Information-level: a register failure means VS isn't visible to
+                // the Gateway yet, which is exactly the kind of connection problem
+                // users need to see in the Output window to diagnose.
                 _loggerFactory?.CreateLogger<PipeMcpServer>()
-                    ?.LogDebug(ex, "Failed to send register frame; continuing");
+                    ?.LogInformation(ex, "Failed to send register frame; continuing");
             }
         }
 
@@ -355,8 +371,9 @@ namespace VsMcp
                 {
                     // Truncated frame / IO error → treat as connection loss and let
                     // ConnectLoop retry (Gateway crash, taskkill, etc.).
+                    // Information-level so disconnects are visible during diagnosis.
                     _loggerFactory?.CreateLogger<PipeMcpServer>()
-                        ?.LogDebug(ex, "Pipe frame read failed; treating as disconnect");
+                        ?.LogInformation(ex, "Pipe frame read failed; treating as disconnect");
                     return;
                 }
 
@@ -380,11 +397,18 @@ namespace VsMcp
                 if (string.Equals(type, "request", StringComparison.Ordinal))
                 {
                     PipeRequest? req;
-                    try { req = System.Text.Json.JsonSerializer.Deserialize<PipeRequest>(json); }
+                    try { req = System.Text.Json.JsonSerializer.Deserialize<PipeRequest>(json, PipeFraming.Options); }
                     catch (System.Text.Json.JsonException) { continue; }
 
                     if (req != null)
+                    {
+                        // Log each incoming MCP request body so connection / call
+                        // issues are visible in the VS Output window — the package
+                        // logger factory runs at Information level.
+                        _loggerFactory?.CreateLogger<PipeMcpServer>()
+                            ?.LogInformation("MCP request {Id}: {Body}", req.Id, req.Body);
                         await HandleRequestAsync(pipe, req, ct).ConfigureAwait(false);
+                    }
                 }
                 // Other frame types (register echo / heartbeat) are silently
                 // ignored so an older/newer peer pairing never breaks the stream.
@@ -421,15 +445,19 @@ namespace VsMcp
             };
             await WriteLockedAsync(head, ct).ConfigureAwait(false);
 
+            // chunkSink turns every SDK SSE write into a real-time data frame so
+            // build_solution keep-alive notifications reach the client unbuffered.
+            // Created up here (not just in the parsed path) so the response log
+            // below has a valid byte count on both branches.
+            var sink = new PipeChunkSink(this, req.Id);
+
             if (!parsed)
             {
                 await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
+                LogResponse(req.Id, head.Status, sink.WrittenBytes);
                 return;
             }
 
-            // chunkSink turns every SDK SSE write into a real-time data frame so
-            // build_solution keep-alive notifications reach the client unbuffered.
-            var sink = new PipeChunkSink(this, req.Id);
             try
             {
                 await _processor.HandleAsync(message!, sink, ct).ConfigureAwait(false);
@@ -447,6 +475,22 @@ namespace VsMcp
             }
 
             await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
+            LogResponse(req.Id, head.Status, sink.WrittenBytes);
+        }
+
+        /// <summary>
+        /// Log the per-call response summary. Extracted so both the parsed and
+        /// parse-failure paths in <see cref="HandleRequestAsync"/> emit one
+        /// response line, giving every request a matched response trace.
+        /// </summary>
+        private void LogResponse(string id, int status, long bytes)
+        {
+            // Response summary: the SSE body was streamed to the sink in fragments,
+            // so log the aggregated byte count + HTTP status rather than each chunk.
+            // This pairs with the request log in ServeConnectionAsync to give a
+            // per-call trace in the VS Output window.
+            _loggerFactory?.CreateLogger<PipeMcpServer>()
+                ?.LogInformation("MCP response {Id}: status {Status}, body bytes {Bytes}", id, status, bytes);
         }
 
         /// <summary>
@@ -461,11 +505,20 @@ namespace VsMcp
             private readonly PipeMcpServer _owner;
             private readonly string _id;
 
+            // Counts original (pre-base64) body bytes written by the SDK so
+            // HandleRequestAsync can log a response-size summary per MCP call.
+            // SSE responses are streamed in fragments; recording total bytes
+            // (rather than the fragmented chunks) gives one meaningful number.
+            private long _written;
+
             public PipeChunkSink(PipeMcpServer owner, string id)
             {
                 _owner = owner;
                 _id = id;
             }
+
+            /// <summary>Total original body bytes streamed through this sink.</summary>
+            public long WrittenBytes => Interlocked.Read(ref _written);
 
             public override bool CanRead => false;
             public override bool CanSeek => false;
@@ -486,6 +539,7 @@ namespace VsMcp
                     Id = _id,
                     Body = Convert.ToBase64String(buffer, offset, count),
                 });
+                Interlocked.Add(ref _written, count);
             }
 
             public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
@@ -496,6 +550,7 @@ namespace VsMcp
                     Id = _id,
                     Body = Convert.ToBase64String(buffer, offset, count),
                 }, cancellationToken).ConfigureAwait(false);
+                Interlocked.Add(ref _written, count);
             }
         }
 

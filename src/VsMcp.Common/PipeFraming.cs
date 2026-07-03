@@ -31,7 +31,11 @@ namespace VsMcp.Common
         // TryGetProperty("type")）一致。不设此项时 System.Text.Json 默认保留属性原名
         // （"Type"），与解析端的小写 "type" 不匹配，帧被静默跳过、读到 end 永不命中
         // —— 曾表现为 ForwardAsync 死循环卡死。
-        private static readonly JsonSerializerOptions Options = new JsonSerializerOptions
+        // Public so callers that hold a raw frame JSON string (e.g. PipeMcpServer
+        // after dispatching on "type" via JsonDocument) can deserialize a DTO with
+        // the identical policy — a bare JsonSerializer.Deserialize<T>(json) would
+        // fall back to PascalCase and silently bind nothing on camelCase frames.
+        public static readonly JsonSerializerOptions Options = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         };
