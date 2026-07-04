@@ -1,0 +1,116 @@
+name: release
+
+# 打 tag 触发自动打包并发布 GitHub Release；手动触发只构建不发布。
+# tag 约定：v{semver}，例如 v1.2.0、v1.2.0-rc1（含预发布标识符自动识别为 prerelease）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # softprops/action-gh-release 需要 write 权限来创建 Release 和上传 assets
+
+jobs:
+  build:
+    runs-on: windows-latest   # 预装 VS 2022 Enterprise + VS SDK + MSBuild
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 完整 git 历史，便于 generate_release_notes 比较 commits
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # tag 推送时从 tag 提取版本号；手动触发时从 vsixmanifest 读当前版本号。
+      - name: Extract version
+        id: version
+        shell: pwsh
+        run: |
+          $version = $null
+          if ($env:GITHUB_REF -match '^refs/tags/v(.+)$') {
+            $version = $matches[1]
+          } else {
+            $manifest = Get-Content src/VsMcp/source.extension.vsixmanifest -Raw
+            if ($manifest -match '<Identity[^>]*\sVersion="([^"]+)"') {
+              $version = $matches[1]
+            }
+          }
+          if (-not $version) {
+            throw "Could not extract version (tag=${env:GITHUB_REF})"
+          }
+
+          # semver 预发布识别：版本字符串里含 '-' 视为 prerelease（v1.2.0-rc1 / v1.2.0-alpha.3）
+          $isPrerelease = $version.Contains('-')
+
+          "version=$version"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "prerelease=$isPrerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $version (prerelease=$isPrerelease)"
+
+      # 把 tag 版本号注入 vsixmanifest 的 Identity 元素，让 VSIX 内部版本与 tag 一致。
+      # 只替换 <Identity .../> 里的 Version 属性，不动 PackageManifest 顶层 Version。
+      # 改动只在工作区生效，不 commit——开发者下次发版前应同步本地 manifest。
+      - name: Patch VSIX manifest version
+        shell: pwsh
+        run: |
+          $manifestPath = 'src/VsMcp/source.extension.vsixmanifest'
+          $content = Get-Content $manifestPath -Raw
+          $version = '${{ steps.version.outputs.version }}'
+          $patched = [regex]::Replace(
+              $content,
+              '(<Identity\s[^>]*?\sVersion=")[^"]+(")',
+              "`${1}${version}`${2}")
+          if ($patched -eq $content) {
+            throw "Failed to patch Version in $manifestPath"
+          }
+          Set-Content -Path $manifestPath -Value $patched -NoNewline
+          Write-Host "Patched Version -> $version"
+          Select-String -Path $manifestPath -Pattern 'Identity' | ForEach-Object { $_.Line.Trim() }
+
+      - name: Build Release VSIX
+        run: msbuild src\VsMcp.sln /p:Configuration=Release /p:EvalCsharpEnabled=false /v:minimal /nologo
+
+      # 把 VSIX 重命名为带版本号的文件，并生成 SHA256 校验文件，便于下载方验证完整性。
+      - name: Package artifact + SHA256
+        id: package
+        shell: pwsh
+        run: |
+          $src = Get-ChildItem src/VsMcp/bin/Release/net48/*.vsix | Select-Object -First 1
+          if (-not $src) { throw "VSIX not found in build output" }
+
+          $version = '${{ steps.version.outputs.version }}'
+          $dest = "VsMcp-$version.vsix"
+          Copy-Item $src.FullName $dest
+
+          $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLower()
+          "$hash *$dest" | Out-File -FilePath "$dest.sha256" -Encoding ascii -NoNewline
+
+          Write-Host "Artifact: $dest ($([math]::Round($src.Length / 1KB, 1)) KB)"
+          Write-Host "SHA256: $hash"
+          "filename=$dest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # 始终上传 artifact，便于 workflow_dispatch 调试时也能从 Actions 页面取 VSIX。
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VsMcp-vsix
+          path: |
+            ${{ steps.package.outputs.filename }}
+            ${{ steps.package.outputs.filename }}.sha256
+          if-no-files-found: error
+          retention-days: 30   # 调试用 artifacts 保留 30 天，Release 里的不受此限
+
+      # 仅 tag 触发时创建 Release；workflow_dispatch 不创建。
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.filename }}
+            ${{ steps.package.outputs.filename }}.sha256
+          name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true   # GitHub 自动按 commits 生成 body
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          draft: false

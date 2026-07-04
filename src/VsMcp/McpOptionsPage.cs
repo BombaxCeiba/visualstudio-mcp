@@ -3,21 +3,33 @@ using Microsoft.VisualStudio.Shell;
 namespace VsMcp
 {
     /// <summary>
-    /// Tools → Options page for the Visual Studio MCP extension. Controls
-    /// opt-in tools that have side effects the user may want to disable.
-    /// Settings are read once at MCP server startup (in
-    /// <see cref="VsMcpPackage.InitializeAsync"/>); changing them
-    /// requires a VS restart to take effect on the registered tool set.
+    /// Visual Studio MCP 扩展的 Tools → Options 页。控制那些有副作用、
+    /// 用户可能想禁用的 opt-in 工具。
+    /// 设置在 MCP server 启动时读取一次（在
+    /// <see cref="VsMcpPackage.InitializeAsync"/> 中）；改完要重启 VS 才对
+    /// 已注册工具集生效。
     /// </summary>
     public class McpOptionsPage : DialogPage
     {
         /// <summary>
-        /// Enables the <c>go_to_definition</c> tool. Default false: the tool
-        /// drives VS via <c>Edit.GoToDefinition</c> which moves the editor
-        /// cursor and may open files — opt in only if that side effect is
-        /// acceptable. When false the tool is not registered and stays
-        /// invisible to the agent.
+        /// 启用 <c>go_to_definition</c> 工具。默认 false：该工具经
+        /// <c>Edit.GoToDefinition</c> 驱动 VS，会移动编辑器光标并可能打开
+        /// 文件——仅在该副作用可接受时 opt in。为 false 时该工具不注册，
+        /// 对 agent 不可见。
         /// </summary>
         public bool EnableGoToDefinition { get; set; } = false;
+
+#if EVAL_CSHARP
+        /// <summary>
+        /// 启用 <c>eval_csharp</c> 工具。默认 true：该工具在 VS 进程内用
+        /// Roslyn CSharpCompilation 动态执行任意 C#，是强力的实时调试手段（探查 VS
+        /// 内部状态、反射读非 public 字段，无需重编重装扩展）。等价于任意代码
+        /// 执行——默认开是为了装上即用、省去手动开启+重启；仅在自己受控的开发机
+        /// 上可接受。若要关掉，取消勾选并重启 VS（设置只在启动时读）。
+        /// 注意：发布构建（<c>EvalCsharpEnabled=false</c>）整个 eval_csharp 会被
+        /// 编译移除，届时此开关不存在。
+        /// </summary>
+        public bool EnableEvalCsharp { get; set; } = true;
+#endif
     }
 }
