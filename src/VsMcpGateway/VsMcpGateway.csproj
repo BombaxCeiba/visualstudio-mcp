@@ -31,6 +31,7 @@
          unchanged. -->
     <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
     <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
+    <Compile Include="..\VsMcp.Common\ExtensionVersion.cs" Link="Common\ExtensionVersion.cs" />
   </ItemGroup>
 
   <ItemGroup>

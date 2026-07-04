@@ -40,42 +40,43 @@ namespace VsMcpGateway
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-            // Bind HTTP first — port ownership is the distributed lock that
-            // guarantees only one Gateway survives (设计文档 §抢占式 Gateway 拉起).
+            // 第一行打版本号，方便排查日志对应哪个版本。
+            GatewayLogger.Log($"VsMcp gateway v{ExtensionVersion.Current} 启动");
+
+            // 先绑定 HTTP——端口所有权是分布式锁，保证只有一个 Gateway 存活
+            // （设计文档 §抢占式 Gateway 拉起）。
             var listener = new HttpListener();
             listener.Prefixes.Add($"http://127.0.0.1:{Port}/mcp/");
             try
             {
                 listener.Start();
+                GatewayLogger.Log($"Gateway listening on http://127.0.0.1:{Port}/mcp/");
             }
             catch (HttpListenerException ex)
             {
-                return 3; // another Gateway already owns :43210
+                GatewayLogger.Log("bind failed — another Gateway owns the port", ex);
+                return 3; // 另一个 Gateway 已占用 :43210
             }
 
-            // Pipe accept loop: VS instances dial in to "vs-mcp-gateway", send a
-            // register frame, and the resulting stream becomes one PipeRouter
-            // per VS. Server uses Asynchronous (WaitForConnectionAsync is
-            // well-behaved on it; the PipeOptions.None constraint only applies
-            // to the CLIENT side doing synchronous Connect — see Wave 1 notes).
+            // Pipe accept 循环：VS 实例拨入 "vs-mcp-gateway"，发送 register 帧，
+            // 得到的流为每个 VS 包装成一个 PipeRouter。服务端用 Asynchronous
+            // （WaitForConnectionAsync 在它上面行为良好；PipeOptions.None 约束
+            // 只适用于做同步 Connect 的客户端——见 Wave 1 笔记）。
             _ = Task.Run(() => PipeAcceptLoopAsync(cts.Token));
 
-            // Self-termination watchdog: the Gateway exits on its own once no VS
-            // instance is left, so it can never become a permanent orphan process
-            // (设计文档 §Gateway 自杀). Both the registry-empty and devenv-scan
-            // mechanisms funnel through onSelfKill, which Environment.Exit(0)s the
-            // process directly. A graceful cts.Cancel unwind is impossible here:
-            // the HTTP accept loop's listener.GetContextAsync() does not respond
-            // to cancellation, so cancelling would leave the process hung on the
-            // blocking accept. Self-termination is a sanctioned shutdown path —
-            // any in-flight requests are abandoned by design. The Ctrl+C path
-            // above still uses cts.Cancel for the user-initiated stop. Started
-            // after the pipe accept loop is armed so the initial empty-registry
-            // grace overlaps the first VS connection window.
-            _scanner = new ProcessScanner(Registry, onSelfKill: () => Environment.Exit(0), cts.Token);
+            // 自终止看门狗：一旦没有 VS 实例存活，Gateway 自行退出，绝不成为永久
+            // 孤儿进程（设计文档 §Gateway 自杀）。注册表清空与 devenv 扫描两种机制
+            // 都汇聚到 onSelfKill，由它直接 Environment.Exit(0) 进程。这里无法
+            // 优雅地 cts.Cancel 收尾：HTTP accept 循环的 listener.GetContextAsync()
+            // 不响应取消，取消会让进程卡在阻塞的 accept 上。自终止是受认可的关闭
+            // 路径——进行中的请求按设计被放弃。上面的 Ctrl+C 路径仍用 cts.Cancel
+            // 处理用户主动停止。本看门狗在 pipe accept 循环就绪后才启动，让初始的
+            // 空注册表宽限窗口与首个 VS 连接窗口重叠。
+            _scanner = new ProcessScanner(Registry, onSelfKill: () => Environment.Exit(0), cts.Token,
+                aliveDevenvPids: ProcessScanner.DefaultAliveDevenvPids);
             _scanner.Start();
 
-            // HTTP accept loop.
+            // HTTP accept 循环。
             while (!cts.Token.IsCancellationRequested)
             {
                 HttpListenerContext ctx;
@@ -93,13 +94,12 @@ namespace VsMcpGateway
             return 0;
         }
 
-        // ─────────────────────────── Pipe accept loop ───────────────────────────
+        // ─────────────────────────── Pipe accept 循环 ───────────────────────────
 
         /// <summary>
-        /// Accept VS connections on "vs-mcp-gateway", read the register frame,
-        /// wrap the stream in a PipeRouter, register it. Each connection runs
-        /// independently; a register-read timeout drops the connection without
-        /// killing the loop.
+        /// 在 "vs-mcp-gateway" 上 accept VS 连接，读取 register 帧，把流包装成
+        /// PipeRouter 并注册。每条连接独立运行；register 读超时会丢弃该连接但
+        /// 不会终止循环。
         /// </summary>
         private static async Task PipeAcceptLoopAsync(CancellationToken ct)
         {
@@ -117,28 +117,29 @@ namespace VsMcpGateway
 
                     await pipe.WaitForConnectionAsync(ct).ConfigureAwait(false);
 
-                    // Read the register frame on the raw stream BEFORE handing
-                    // off to PipeRouter (PipeRouter's read loop only knows how
-                    // to demux response frames by id; register has no id).
+                    // 在交给 PipeRouter 之前，先在原始流上读 register 帧
+                    // （PipeRouter 的读循环只懂按 id 多路分解响应帧；register 没有 id）。
                     PipeRegister? info = await ReadRegisterFrameAsync(pipe, ct).ConfigureAwait(false);
                     if (info == null || info.Pid <= 0)
                     {
-                        // Bogus / no register — drop the connection.
+                        GatewayLogger.Log("pipe connected but register frame missing/invalid — dropping");
+                        // 无效/缺失 register——丢弃连接。
                         TryDispose(pipe);
                         continue;
                     }
 
-                    // If this PID already has a connection (VS reconnected
-                    // without a clean disconnect), retire the old entry first.
+                    // 若该 PID 已有连接（VS 没有干净断开就重连），先淘汰旧条目。
                     if (Registry.TryGet(info.Pid, out var stale))
                     {
+                        GatewayLogger.Log($"PID={info.Pid} reconnected — retiring stale entry");
                         Registry.Remove(info.Pid);
                         try { await stale.Router.DisposeAsync().ConfigureAwait(false); }
-                        catch { /* best-effort */ }
+                        catch { /* 尽力而为 */ }
                     }
 
                     var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged, OnHeartbeat);
                     Registry.Register(new InstanceEntry(router, info, DateTime.UtcNow));
+                    GatewayLogger.Log($"registered VS PID={info.Pid} solution={info.SolutionPath ?? "<none>"} v{info.VsVersion}");
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -147,7 +148,7 @@ namespace VsMcpGateway
                 }
                 catch (Exception)
                 {
-                    // A single accept/register failure must not kill the loop.
+                    // 单次 accept/register 失败绝不能终止循环。
                     TryDispose(pipe);
                 }
             }
@@ -157,30 +158,41 @@ namespace VsMcpGateway
         {
             using var regCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             regCts.CancelAfter(RegisterReadTimeoutMs);
+            PipeRegister? info;
             try
             {
-                return await PipeFraming.ReadFrameAsync<PipeRegister>(stream, regCts.Token).ConfigureAwait(false);
+                info = await PipeFraming.ReadFrameAsync<PipeRegister>(stream, regCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (regCts.IsCancellationRequested)
             {
+                // 诊断：区分超时 vs 异常 vs 干净 EOF。超时 = VS 连上了但 5s 内没发出 register 帧。
+                GatewayLogger.Log($"register 读超时（{RegisterReadTimeoutMs}ms 内没收到 register 帧）");
                 return null;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                // 诊断：读到一半异常（帧长度越界 / 反序列化失败等），打详情定位。
+                GatewayLogger.Log("register 读异常", ex);
                 return null;
             }
+            if (info == null)
+            {
+                // ReadFrameAsync 返回 null = 对端在帧起始处干净关闭（读了 0 字节）。
+                // 这条单独打出来：它不进上面的 catch，否则只会落到调用方笼统的
+                // "missing/invalid"，无法与超时/异常区分。典型成因是 VS 误判 connect
+                // 超时后 Dispose 了实际已连上的管道，网关这端只看到一个空连接。
+                GatewayLogger.Log("register 读到 EOF（VS 连上后未发任何帧即断开）");
+            }
+            return info;
         }
 
         /// <summary>
-        /// PipeRouter control-frame callback: a VS pushed a
-        /// <c>solution-changed</c> notification (user opened/closed a solution).
-        /// Refresh that instance's Info in the registry so the ① Header tier
-        /// matches against the live SolutionDir without waiting for a
-        /// reconnect. Solution name/dir/path come from the push; VsVersion and
-        /// PipeName are preserved from the existing entry (the push DTO omits
-        /// them). Runs inline on the pipe read loop, so it must be fast and
-        /// never throw — InstanceRegistry.UpdateInfo is a ConcurrentDictionary
-        /// field swap and satisfies both.
+        /// PipeRouter 控制帧回调：VS 推送了 <c>solution-changed</c> 通知
+        /// （用户打开/关闭了解决方案）。刷新注册表中该实例的 Info，让 ① Header
+        /// 层能匹配到最新的 SolutionDir，无需等重连。解决方案名/目录/路径来自推送；
+        /// VsVersion 和 PipeName 沿用既有条目（推送 DTO 不带这两项）。在 pipe 读
+        /// 循环上内联执行，必须快且绝不抛异常——InstanceRegistry.UpdateInfo 是一次
+        /// ConcurrentDictionary 字段交换，满足这两点。
         /// </summary>
         private static void OnSolutionChanged(PipeSolutionChanged changed)
         {
@@ -200,13 +212,11 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// PipeRouter control-frame callback: a VS heartbeat. Refreshes that
-        /// instance's LastSeen so ProcessScanner mechanism 1's emptiness/staleness
-        /// view stays current between pipe disconnects. Pipe disconnect is the
-        /// primary VS-exit signal (OS semantics); LastSeen is the supplementary
-        /// liveness heartbeat. Runs inline on the pipe read loop, so it must be
-        /// fast and never throw — InstanceRegistry.TouchLastSeen is a
-        /// ConcurrentDictionary field write and satisfies both.
+        /// PipeRouter 控制帧回调：VS 心跳。刷新该实例的 LastSeen，让 ProcessScanner
+        /// 机制 1 的"空/过期"判断在 pipe 断连之间保持最新。Pipe 断连是主要的 VS
+        /// 退出信号（OS 语义）；LastSeen 是补充的存活心跳。在 pipe 读循环上内联
+        /// 执行，必须快且绝不抛异常——InstanceRegistry.TouchLastSeen 是一次
+        /// ConcurrentDictionary 字段写入，满足这两点。
         /// </summary>
         private static void OnHeartbeat(PipeHeartbeat beat)
         {
@@ -214,7 +224,7 @@ namespace VsMcpGateway
             Registry.TouchLastSeen(beat.Pid);
         }
 
-        // ───────────────────────────── HTTP routing ──────────────────────────────
+        // ───────────────────────────── HTTP 路由 ──────────────────────────────
 
         private static async Task HandleRequestAsync(HttpListenerContext ctx, CancellationToken ct)
         {
@@ -246,15 +256,17 @@ namespace VsMcpGateway
                         headers[key] = ctx.Request.Headers[key] ?? string.Empty;
                 }
 
-                // Parse once for routing decisions; forward the original body
-                // text so VS's own JSON-RPC parser sees the bytes verbatim.
+                // 只解析一次用于路由决策；转发原始 body 文本，让 VS 自己的
+                // JSON-RPC 解析器看到逐字字节。
                 string method = "";
                 if (!TryGetMethod(body, out method))
                 {
+                    GatewayLogger.Log("REQ: unparseable JSON-RPC (no method) — 400");
                     ctx.Response.StatusCode = 400;
                     ctx.Response.Close();
                     return;
                 }
+                GatewayLogger.Log($"REQ {method} session={clientSessionId ?? "<none>"} workspace={workspaceHeader ?? "<none>"}");
 
                 if (string.Equals(method, "initialize", StringComparison.Ordinal))
                 {
@@ -277,25 +289,23 @@ namespace VsMcpGateway
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                try { ctx.Response.Close(); } catch { /* shutdown */ }
+                try { ctx.Response.Close(); } catch { /* 关闭中 */ }
             }
-            catch
+            catch (Exception ex)
             {
-                try { ctx.Response.StatusCode = 502; ctx.Response.Close(); } catch { /* client gone */ }
+                GatewayLogger.Log("HandleRequestAsync unhandled exception", ex);
+                try { ctx.Response.StatusCode = 502; ctx.Response.Close(); } catch { /* 客户端已断开 */ }
             }
         }
 
         /// <summary>
-        /// initialize: resolve the target VS via the priority chain
-        /// (<c>_meta.vsPid</c> &gt; ① Header single &gt; single-instance fallback),
-        /// forward with the client's Mcp-Session-Id stripped (so VS assigns its
-        /// own), capture VS's Mcp-Session-Id from the head, and record the
-        /// binding. The VS-assigned id is mirrored onto the InstanceEntry
-        /// (per-VS authoritative — 设计文档 §Solution 信息动态更新) so the
-        /// stateless ① Header tier can recover it later. The single-instance
-        /// fallback is treated as an auto-bind (Source="auto", HintPending=true);
-        /// an explicit <c>_meta.vsPid</c> or a ① Header match is a deliberate
-        /// bind (HintPending=false).
+        /// initialize：通过优先级链（<c>_meta.vsPid</c> &gt; ① Header 唯一 &gt;
+        /// 单实例 fallback）解析目标 VS，转发时剥掉客户端的 Mcp-Session-Id（让
+        /// VS 分配自己的），从 head 帧捕获 VS 的 Mcp-Session-Id，并记录绑定。
+        /// VS 分配的 id 同步写入 InstanceEntry（每个 VS 的权威来源——设计文档
+        /// §Solution 信息动态更新），让无状态的 ① Header 层之后能恢复它。单实例
+        /// fallback 视为自动绑定（Source="auto"，HintPending=true）；显式的
+        /// <c>_meta.vsPid</c> 或 ① Header 匹配是刻意绑定（HintPending=false）。
         /// </summary>
         private static async Task HandleInitializeAsync(
             HttpListenerContext ctx, string body, IDictionary<string, string> headers,
@@ -306,9 +316,9 @@ namespace VsMcpGateway
 
             if (!vsPid.HasValue && !string.IsNullOrWhiteSpace(workspaceHeader))
             {
-                // ① Header tier at initialize: pick the VS whose SolutionDir the
-                // header points at. Single → pre-bind; None/Ambiguous → fail with
-                // the same agent-facing message the forward path uses.
+                // initialize 时的 ① Header 层：挑选 SolutionDir 与 header 指向一致
+                // 的 VS。唯一→预绑定；None/Ambiguous→用与转发路径相同的面向 agent
+                // 的消息失败。
                 var snap = Registry.Snapshot();
                 var match = WorkspaceResolver.Resolve(workspaceHeader,
                     snap.Select(e => (e.Info.Pid, e.Info.SolutionDir)));
@@ -316,10 +326,10 @@ namespace VsMcpGateway
                     vsPid = match.Pid;
                 else if (match.Kind == WorkspaceMatchKind.None)
                 {
-                    // initialize failure → JSON-RPC error (NOT a tool-error). MCP
-                    // clients schema-validate the initialize result; a tool-error
-                    // (result.isError) has no protocolVersion/capabilities/serverInfo
-                    // and trips zod, surfacing as three undefined fields to the user.
+                    // initialize 失败→JSON-RPC error（不是 tool-error）。MCP 客户端
+                    // 会对 initialize result 做 schema 校验；tool-error
+                    // （result.isError）没有 protocolVersion/capabilities/serverInfo，
+                    // 会触发 zod，向用户暴露三个 undefined 字段。
                     await WriteJsonRpcErrorAsync(ctx, body, -32001,
                         GatewayTools.BuildWorkspaceMissMessage(workspaceHeader!, snap)).ConfigureAwait(false);
                     return;
@@ -335,13 +345,13 @@ namespace VsMcpGateway
 
             if (!vsPid.HasValue)
             {
-                // Single-instance fallback (③ at initialize time).
+                // 单实例 fallback（initialize 时的 ③）。
                 var snap = Registry.Snapshot();
                 vsPid = ResolveInitializeTarget(vsPid, snap.Count, () => snap.First().Info.Pid);
                 if (!vsPid.HasValue)
                 {
-                    // initialize failure → JSON-RPC error so MCP clients parse it
-                    // as an initialize failure rather than a schema-mismatched result.
+                    // initialize 失败→JSON-RPC error，让 MCP 客户端把它解析为
+                    // initialize 失败，而不是 schema 不匹配的 result。
                     int count = snap.Count;
                     string msg = count == 0
                         ? "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry."
@@ -358,23 +368,20 @@ namespace VsMcpGateway
                 return;
             }
 
-            // Strip the client's session header so VS's SDK treats this as a new
-            // session and assigns its own Mcp-Session-Id (which we capture below).
+            // 剥掉客户端的 session header，让 VS 的 SDK 把它当作新会话并分配自己的
+            // Mcp-Session-Id（我们在下面捕获）。
             var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
             forwardedHeaders.Remove("Mcp-Session-Id");
 
-            // Pre-allocate the client-visible session id and set it as a response
-            // header BEFORE any byte reaches OutputStream. HttpListener flushes
-            // the status line + headers on the first write to the response stream
-            // (ForwardAsync's read loop flushes every data frame in real time),
-            // so a header set only after the forward would already be too late
-            // and the client would never receive its session id. VS's own session
-            // id is unknown until the forward returns, so the binding is created
-            // with a null placeholder and patched once the head frame is observed.
+            // 预分配客户端可见的 session id，并在任何字节到达 OutputStream 之前就把它
+            // 设为响应 header。HttpListener 在第一次写入响应流时刷新状态行 + headers
+            // （ForwardAsync 的读循环实时刷新每个 data 帧），所以转发后才设 header
+            // 已经太迟，客户端永远收不到它的 session id。VS 自己的 session id 在转发
+            // 返回前未知，所以绑定先用 null 占位创建，等观察到 head 帧再补上。
             string source = isAutoFallback ? "auto" : "initialize";
             var (clientSessionId, binding) = Sessions.CreateWithId(vsPid.Value, vsSessionId: null, source);
-            // The single-instance fallback is an auto-bind: arm the one-shot hint
-            // so the first tool result after this initialize carries it.
+            // 单实例 fallback 是自动绑定：武装一次性 hint，让本次 initialize 后的
+            // 第一个 tool result 携带它。
             if (isAutoFallback)
                 binding.HintPending = true;
 
@@ -388,28 +395,26 @@ namespace VsMcpGateway
             {
                 result = await entry.Router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
             }
+            GatewayLogger.Log($"initialize OK: client session {clientSessionId} → VS PID={vsPid.Value}");
 
-            // The read loop populated result.Headers from VS's head frame; record
-            // the VS-assigned session id so subsequent forwards carry it back to
-            // that VS's SDK, letting it resume the right server-side session.
-            // The InstanceEntry is the authoritative per-VS home for this id
-            // (stateless ① routing reads it directly).
+            // 读循环已从 VS 的 head 帧填好 result.Headers；记录 VS 分配的 session id，
+            // 让后续转发把它带回该 VS 的 SDK，使其恢复正确的服务端会话。
+            // InstanceEntry 是该 id 的每个 VS 权威存放处（无状态的 ① 路由直接读它）。
             if (result.Headers.TryGetValue("Mcp-Session-Id", out var vsSid) && !string.IsNullOrEmpty(vsSid))
             {
                 binding.VsSessionId = vsSid;
                 Registry.SetVsSessionId(vsPid.Value, vsSid);
             }
 
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// tools/list: resolve the target via the 4-tier flow (①②③④), forward to
-        /// the bound VS, buffer the SSE response, inject the gateway tools, and
-        /// write the rewritten bytes. tools/list is not a tool CALL, so the
-        /// auto-bind hint is armed (③) but not injected here — the next
-        /// tools/call surfaces it. The auto-bound client session id is echoed so
-        /// the client adopts it before that next call.
+        /// tools/list：通过 4 层流程（①②③④）解析目标，转发到绑定的 VS，缓冲 SSE
+        /// 响应，注入 gateway 工具，并写入改写后的字节。tools/list 不是工具调用
+        /// （tool CALL），所以这里武装 ③ 的自动绑定 hint 但不在此注入——下一次
+        /// tools/call 才让它浮现。回显自动绑定的客户端 session id，让客户端在
+        /// 下一次调用前采纳它。
         /// </summary>
         private static async Task HandleToolsListAsync(
             HttpListenerContext ctx, string body, IDictionary<string, string> headers,
@@ -435,15 +440,15 @@ namespace VsMcpGateway
             else
                 forwardedHeaders.Remove("Mcp-Session-Id");
 
-            // Buffer the entire response: tools/list is a single small SSE
-            // message, and we need the full JSON to splice in our tools.
+            // 缓冲整个响应：tools/list 是单条小 SSE 消息，我们需要完整 JSON 才能
+            // 插入我们的工具。
             using var buffer = new MemoryStream();
             await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
 
             byte[] injected = GatewayTools.InjectIntoToolsListSse(buffer.ToArray());
 
-            // Echo the session id the binding was created under (matters for the
-            // ③ auto-bind case where the client sent none and we minted one).
+            // 回显绑定创建时所用的 session id（对 ③ 自动绑定场景重要：客户端没发，
+            // 我们铸造了一个）。
             string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
 
             ctx.Response.StatusCode = 200;
@@ -453,12 +458,12 @@ namespace VsMcpGateway
                 ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
 
             await ctx.Response.OutputStream.WriteAsync(injected, 0, injected.Length, ct).ConfigureAwait(false);
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// Gateway-handled tool calls (list_vs_instances / select_vs_instance):
-        /// build the JSON-RPC response locally, never forward to a VS.
+        /// Gateway 自处理的工具调用（list_vs_instances / select_vs_instance）：
+        /// 本地构造 JSON-RPC 响应，绝不转发到 VS。
         /// </summary>
         private static async Task HandleGatewayToolCallAsync(
             HttpListenerContext ctx, string body, string? clientSessionId, string toolName)
@@ -489,12 +494,13 @@ namespace VsMcpGateway
                 else
                 {
                     Sessions.Rebind(clientSessionId!, targetPid);
+                    GatewayLogger.Log($"select_vs_instance: session {clientSessionId} → PID={targetPid}");
                     responseJson = GatewayTools.BuildSelectResponse(jsonRpcId, targetPid);
                 }
             }
 
-            // Tool results are delivered over SSE so the transport stays uniform
-            // with the streamed tool calls the agent will make next.
+            // tool result 通过 SSE 下发，让传输方式与 agent 接下来要发起的流式
+            // 工具调用保持一致。
             string sse = "event: message\ndata: " + responseJson + "\n\n";
             byte[] bytes = Encoding.UTF8.GetBytes(sse);
 
@@ -505,17 +511,15 @@ namespace VsMcpGateway
                 ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
 
             await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// Default path (tools/call etc.): resolve via the 4-tier flow (①②③④),
-        /// forward to the bound VS. If the resolution armed a hint (③ auto-bind
-        /// or a leftover HintPending from a prior auto-bind), buffer the SSE
-        /// response, inject the hint text at the front of result.content, and
-        /// clear the one-shot flag. Otherwise stream the response straight
-        /// through so long tasks (build_solution) keep their real-time keep-alive
-        /// notifications unbuffered.
+        /// 默认路径（tools/call 等）：通过 4 层流程（①②③④）解析，转发到绑定的 VS。
+        /// 若解析武装了 hint（③ 自动绑定或之前自动绑定遗留的 HintPending），缓冲
+        /// SSE 响应，把 hint 文本注入 result.content 前端，并清除一次性标志。否则
+        /// 直接流式转发响应，让长任务（build_solution）的实时 keep-alive 通知保持
+        /// 不缓冲。
         /// </summary>
         private static async Task HandleForwardAsync(
             HttpListenerContext ctx, string body, IDictionary<string, string> headers,
@@ -541,17 +545,15 @@ namespace VsMcpGateway
             else
                 forwardedHeaders.Remove("Mcp-Session-Id");
 
-            // Echo the session id the binding was created under. For the ③
-            // auto-bind case the client sent none and we minted one — it MUST be
-            // echoed so subsequent requests carry it (otherwise every call would
-            // auto-bind again and the hint would fire forever).
+            // 回显绑定创建时所用的 session id。对 ③ 自动绑定场景，客户端没发，我们
+            // 铸造了一个——必须回显，让后续请求携带它（否则每次调用都会再次自动
+            // 绑定，hint 会永远触发）。
             string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
 
-            // Hint injection is gated on HintPending. The stateless ① tier never
-            // sets a binding, so it never injects (correct: header-routed calls
-            // are deliberate, not auto-bound). When injecting we must buffer the
-            // full response — but only then, to keep streaming for the common
-            // case (the design note's hint-buffering tradeoff).
+            // hint 注入由 HintPending 门控。无状态的 ① 层从不设置绑定，所以从不
+            // 注入（正确：header 路由的调用是刻意的，不是自动绑定）。注入时必须
+            // 缓冲完整响应——但仅限于此，以保持常见场景的流式传输（设计文档里
+            // hint 缓冲的权衡）。
             SessionBinding? binding = resolution.Binding;
             bool needsHint = binding != null && binding.HintPending;
 
@@ -563,17 +565,25 @@ namespace VsMcpGateway
 
             if (needsHint)
             {
+                // 通过 SSE 感知的注入器流式转发响应，而不是整体缓冲。整体缓冲会
+                // 饿死长任务（build_solution）：它们的 keep-alive 日志通知堆在
+                // MemoryStream 里直到构建结束，客户端看不到任何字节于是超时。注入器
+                // 在每个完整 SSE 事件到达时重组——通知立即透传（保留 2s 的
+                // keep-alive 节奏），只有第一个 result.content 被前置 hint。
                 string hint = GatewayTools.BuildAutoBindHint(entry);
-                using var buffer = new MemoryStream();
-                await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
-                var (rewritten, injected) = GatewayTools.InjectHintIntoToolResultSse(buffer.ToArray(), hint);
-                if (injected)
+                var injector = new HintInjectingStream(ctx.Response.OutputStream, hint);
+                try
                 {
-                    // One-shot: only the first tools/call result that successfully
-                    // carried the hint clears the flag (设计文档 MI-07).
-                    binding!.HintPending = false;
+                    await entry.Router.ForwardAsync(body, forwardedHeaders, injector, ct).ConfigureAwait(false);
                 }
-                await ctx.Response.OutputStream.WriteAsync(rewritten, 0, rewritten.Length, ct).ConfigureAwait(false);
+                finally
+                {
+                    await injector.FlushRemainingAsync(ct).ConfigureAwait(false);
+                }
+                // 一次性：只有 hint 真正被某个 result 携带后才清除标志。无 result
+                // 的响应（错误）让它保持武装，等下一次调用（设计文档 MI-07）。
+                if (injector.DidInject)
+                    binding!.HintPending = false;
             }
             else
             {
@@ -582,16 +592,14 @@ namespace VsMcpGateway
                     await entry.Router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
                 }
             }
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// Map a failed <see cref="TargetResolution"/> to the right SSE response
-        /// shape. Agent-facing guidance (① miss/ambiguous, ④ intercept) goes out
-        /// as a tool-error result so the agent treats it as a tool failure and
-        /// relays it to the user; protocol-level routing problems (instance
-        /// gone, needs re-initialize) go out as JSON-RPC errors for transport
-        /// continuity with Wave 2.
+        /// 把失败的 <see cref="TargetResolution"/> 映射到正确的 SSE 响应形态。面向
+        /// agent 的引导（① 未命中/歧义、④ 拦截）以 tool-error result 形式发出，让
+        /// agent 当作工具失败并转达给用户；协议层路由问题（实例已下线、需要重新
+        /// initialize）以 JSON-RPC error 形式发出，保持与 Wave 2 的传输连续性。
         /// </summary>
         private static async Task RespondToResolutionFailureAsync(
             HttpListenerContext ctx, string body, string? clientSessionId, TargetResolution resolution)
@@ -612,16 +620,14 @@ namespace VsMcpGateway
             }
         }
 
-        // ─────────────────────────── Routing helpers ────────────────────────────
+        // ─────────────────────────── 路由辅助 ────────────────────────────
 
         /// <summary>
-        /// Resolve the target VS PID for an initialize request. Priority:
-        ///   1. explicit <c>_meta.vsPid</c> (pre-bind)
-        ///   2. exactly one instance connected (single-instance fallback, ③ minus
-        ///      the Wave 3 hint injection)
-        ///   3. otherwise null → caller returns an ambiguous/empty error.
-        /// Extracted as a pure function so routing can be unit-tested without an
-        /// HttpListener / live pipe.
+        /// 为 initialize 请求解析目标 VS PID。优先级：
+        ///   1. 显式 <c>_meta.vsPid</c>（预绑定）
+        ///   2. 恰好一个实例已连接（单实例 fallback，即 ③ 减去 Wave 3 的 hint 注入）
+        ///   3. 否则返回 null→调用方返回歧义/空错误。
+        /// 抽成纯函数，让路由可不带 HttpListener / 实时 pipe 做单元测试。
         /// </summary>
         public static int? ResolveInitializeTarget(int? metaVsPid, int connectedCount, Func<int> singlePid)
         {
@@ -632,7 +638,7 @@ namespace VsMcpGateway
             return null;
         }
 
-        // ───────────────────────── JSON-RPC field extraction ────────────────────
+        // ───────────────────────── JSON-RPC 字段提取 ────────────────────
 
         private static bool TryGetMethod(string body, out string method)
         {
@@ -704,12 +710,19 @@ namespace VsMcpGateway
             try
             {
                 using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.TryGetProperty("params", out var p) &&
-                    p.TryGetProperty("pid", out var pidEl) &&
-                    pidEl.TryGetInt32(out int p2))
+                if (!doc.RootElement.TryGetProperty("params", out var p)) return false;
+                // 标准 MCP tools/call 把参数放在 params.arguments 下；遗留/直接形式
+                // 把 pid 直接放在 params 下。两种都接受，让任何客户端（包括 Claude
+                // Code 的标准 tools/call）都能绑定。
+                JsonElement pidEl;
+                if ((p.TryGetProperty("arguments", out var args) && args.TryGetProperty("pid", out pidEl))
+                    || p.TryGetProperty("pid", out pidEl))
                 {
-                    pid = p2;
-                    return pid > 0;
+                    if (pidEl.TryGetInt32(out int p2))
+                    {
+                        pid = p2;
+                        return pid > 0;
+                    }
                 }
             }
             catch { }
@@ -717,16 +730,16 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Write a JSON-RPC error response as a single SSE message. Used for
-        /// routing failures (no binding, unknown pid, etc.) where there is no
-        /// VS to forward to.
+        /// 以单条 SSE 消息写一个 JSON-RPC error 响应。用于路由失败（无绑定、未知
+        /// pid 等）且没有 VS 可转发的场景。
         /// </summary>
         private static async Task WriteJsonRpcErrorAsync(HttpListenerContext ctx, string body, int code, string message)
         {
             object? id = TryGetJsonRpcId(body) ?? (object)0;
+            GatewayLogger.Log($"← JSON-RPC error {code}: {message}");
             string errJson = GatewayTools.BuildErrorResponse(id, code, message);
-            // An error mid-routing has no session to resume; deliver it as an
-            // SSE error event so the client's MCP transport still parses it.
+            // 路由中途的错误没有 session 可恢复；以 SSE error 事件下发，让客户端的
+            // MCP 传输层仍能解析它。
             string sse = "event: message\ndata: " + errJson + "\n\n";
             byte[] bytes = Encoding.UTF8.GetBytes(sse);
 
@@ -734,19 +747,19 @@ namespace VsMcpGateway
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
             await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// Write a tool-error (isError) SSE response carrying <paramref name="message"/>
-        /// as the text content. Used for the ①③④ agent-facing intercept messages
-        /// (设计文档 §①/§③/§④) — they surface to the agent as a tool failure so the
-        /// agent relays the guidance to the user. <paramref name="clientSessionId"/>,
-        /// when present, is echoed so the client keeps its session.
+        /// 写一个 tool-error（isError）SSE 响应，把 <paramref name="message"/> 作为
+        /// 文本内容。用于 ①③④ 面向 agent 的拦截消息（设计文档 §①/§③/§④）——它们
+        /// 以工具失败形式浮现给 agent，让 agent 把引导转达给用户。
+        /// <paramref name="clientSessionId"/> 存在时回显，让客户端保留其会话。
         /// </summary>
         private static async Task WriteToolErrorAsync(HttpListenerContext ctx, string body, string message, string? clientSessionId = null)
         {
             object? id = TryGetJsonRpcId(body) ?? (object)0;
+            GatewayLogger.Log($"← tool-error: {message}");
             string respJson = GatewayTools.BuildToolErrorResponse(id, message);
             string sse = "event: message\ndata: " + respJson + "\n\n";
             byte[] bytes = Encoding.UTF8.GetBytes(sse);
@@ -756,15 +769,15 @@ namespace VsMcpGateway
             ctx.Response.Headers["Cache-Control"] = "no-cache";
             if (!string.IsNullOrEmpty(clientSessionId))
                 ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
-            // Headers must be set before the first OutputStream write —
-            // HttpListener flushes the status line + headers on first write.
+            // headers 必须在第一次 OutputStream 写之前设好——HttpListener 在第一次
+            // 写时刷新状态行 + headers。
             await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
-            try { ctx.Response.Close(); } catch { /* client gone */ }
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         private static void TryDispose(IDisposable? d)
         {
-            try { d?.Dispose(); } catch { /* best-effort */ }
+            try { d?.Dispose(); } catch { /* 尽力而为 */ }
         }
     }
 }

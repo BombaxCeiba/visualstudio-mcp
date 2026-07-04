@@ -11,10 +11,9 @@ using VsMcp.Common;
 namespace VsMcpGateway
 {
     /// <summary>
-    /// Result of forwarding one request: the VS head's HTTP status plus the
-    /// head's response headers (so the Gateway can read the VS-assigned
-    /// Mcp-Session-Id during initialize). Wave 1 callers ignore the headers
-    /// and only read <see cref="Status"/>.
+    /// 转发单个请求的结果：VS head 的 HTTP 状态码加上 head 的响应 headers
+    /// （让 Gateway 在 initialize 时能读到 VS 分配的 Mcp-Session-Id）。Wave 1
+    /// 调用方忽略 headers，只读 <see cref="Status"/>。
     /// </summary>
     public sealed class ForwardResult
     {
@@ -27,31 +26,28 @@ namespace VsMcpGateway
             Headers = headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
-        /// <summary>Implicit int conversion keeps Wave 1's "int status = await ForwardAsync(...)" ergonomic.</summary>
+        /// <summary>隐式 int 转换让 Wave 1 的 "int status = await ForwardAsync(...)" 写法顺手。</summary>
         public static implicit operator int(ForwardResult r) => r.Status;
     }
 
     /// <summary>
-    /// Maintains the pipe channel to one VS instance and multiplexes many
-    /// concurrent MCP requests over it. Each request gets a fresh id; a single
-    /// background read loop dispatches incoming head/data/end frames to the
-    /// matching pending request by id. This lets the Gateway forward multiple
-    /// in-flight SSE streams (one per MCP client session) over one pipe without
-    /// head-of-line blocking.
+    /// 维护到单个 VS 实例的 pipe 通道，并在其上多路复用多个并发 MCP 请求。每个
+    /// 请求获得一个新的 id；单个后台读循环按 id 把到达的 head/data/end 帧分派给
+    /// 对应的 pending 请求。这让 Gateway 能在一条 pipe 上转发多个在途 SSE 流
+    /// （每个 MCP 客户端会话一条），没有队头阻塞。
     ///
-    /// The read loop also recognizes VS-pushed CONTROL frames that carry no id
-    /// (solution-changed in Wave 3; heartbeat lands in Wave 4). Each control
-    /// frame type has its own optional callback; unrecognized control frames are
-    /// ignored so an older/newer peer pairing never breaks the stream.
+    /// 读循环也识别 VS 推送的不带 id 的 CONTROL 帧（Wave 3 的 solution-changed；
+    /// Wave 4 的 heartbeat）。每种控制帧有自己的可选回调；未识别的控制帧被忽略，
+    /// 所以新旧版本配对绝不会破坏流。
     ///
-    /// Two construction modes:
+    /// 两种构造模式：
     /// <list type="bullet">
-    /// <item>The Gateway's register-accept loop passes an ALREADY CONNECTED
-    ///     <see cref="NamedPipeServerStream"/> (VS dialed in to
-    ///     "vs-mcp-gateway"); the router just owns the read loop.</item>
-    /// <item>The static <see cref="ConnectAsync"/> factory creates a client and
-    ///     connects to <c>vs-mcp-{pid}</c> — retained for Wave 1 tests and
-    ///     smoke runs that simulate the VS-as-server direction.</item>
+    /// <item>Gateway 的 register-accept 循环传入一个已连接的
+    ///     <see cref="NamedPipeServerStream"/>（VS 拨入
+    ///     "vs-mcp-gateway"）；router 只拥有读循环。</item>
+    /// <item>静态 <see cref="ConnectAsync"/> 工厂创建客户端并连接到
+    ///     <c>vs-mcp-{pid}</c>——保留给 Wave 1 测试和模拟 VS 作服务端方向的
+    ///     冒烟运行用。</item>
     /// </list>
     /// </summary>
     public sealed class PipeRouter : IDisposable, IAsyncDisposable
@@ -65,34 +61,31 @@ namespace VsMcpGateway
         private readonly CancellationTokenSource _loopCts = new CancellationTokenSource();
         private volatile bool _disposed;
 
-        /// <summary>Optional sink for VS-pushed <c>solution-changed</c> control
-        /// frames. Invoked inline from the read loop; must be non-blocking and
-        /// swallow its own exceptions (the Gateway's handler just refreshes the
-        /// InstanceRegistry, which cannot throw). Null = ignore the frame.</summary>
+        /// <summary>VS 推送的 <c>solution-changed</c> 控制帧的可选接收端。从读循环
+        /// 内联调用；必须非阻塞且自行吞掉异常（Gateway 的处理器只是刷新
+        /// InstanceRegistry，不会抛）。Null = 忽略该帧。</summary>
         private readonly Action<PipeSolutionChanged>? _onSolutionChanged;
 
-        /// <summary>Optional sink for VS-pushed <c>heartbeat</c> control frames
-        /// (Wave 4). Invoked inline from the read loop; the Gateway's handler
-        /// refreshes the InstanceRegistry's LastSeen. Null = ignore the frame.</summary>
+        /// <summary>VS 推送的 <c>heartbeat</c> 控制帧的可选接收端（Wave 4）。从
+        /// 读循环内联调用；Gateway 的处理器刷新 InstanceRegistry 的 LastSeen。
+        /// Null = 忽略该帧。</summary>
         private readonly Action<PipeHeartbeat>? _onHeartbeat;
 
         /// <summary>
-        /// Control-frame payloads are written by PipeFraming in camelCase (the
-        /// shared pipe-framing policy), so deserialization here must use the same
-        /// policy or fields like <c>solutionPath</c> would silently fail to bind.
+        /// 控制帧载荷由 PipeFraming 以 camelCase 写出（共享的 pipe 帧策略），所以
+        /// 这里的反序列化必须用同一策略，否则 <c>solutionPath</c> 之类的字段会
+        /// 静默绑定失败。
         /// </summary>
         private static readonly JsonSerializerOptions ControlFrameJsonOptions =
             new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-        /// <param name="connectedStream">An already-connected pipe stream. The
-        /// router starts the read loop immediately and owns the stream's
-        /// disposal (when <paramref name="ownsStream"/> is true).</param>
-        /// <param name="onSolutionChanged">Optional callback invoked when a
-        /// <c>solution-changed</c> control frame arrives (no id). The Gateway
-        /// uses it to refresh the InstanceRegistry's solution fields live.</param>
-        /// <param name="onHeartbeat">Optional callback invoked when a
-        /// <c>heartbeat</c> control frame arrives (no id). The Gateway uses it
-        /// to refresh the InstanceRegistry's LastSeen timestamp.</param>
+        /// <param name="connectedStream">一个已连接的 pipe 流。router 立即启动读
+        /// 循环，并在 <paramref name="ownsStream"/> 为 true 时负责该流的释放。</param>
+        /// <param name="onSolutionChanged">可选回调，在 <c>solution-changed</c>
+        /// 控制帧到达（无 id）时调用。Gateway 用它实时刷新 InstanceRegistry 的
+        /// solution 字段。</param>
+        /// <param name="onHeartbeat">可选回调，在 <c>heartbeat</c> 控制帧到达
+        /// （无 id）时调用。Gateway 用它刷新 InstanceRegistry 的 LastSeen 时间戳。</param>
         public PipeRouter(Stream connectedStream, bool ownsStream = true,
             Action<PipeSolutionChanged>? onSolutionChanged = null,
             Action<PipeHeartbeat>? onHeartbeat = null)
@@ -101,7 +94,7 @@ namespace VsMcpGateway
             _ownsStream = ownsStream;
             _onSolutionChanged = onSolutionChanged;
             _onHeartbeat = onHeartbeat;
-            // Read loop runs until cancellation; it is observed in DisposeAsync.
+            // 读循环运行至取消；在 DisposeAsync 中被观察。
             _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
         }
 
@@ -109,13 +102,12 @@ namespace VsMcpGateway
         {
             _stream = connectedStream;
             _ownsStream = ownsStream;
-            // Test helper path: defer the read loop so the test can wire up
-            // expectations first. Currently unused but kept for symmetry.
+            // 测试辅助路径：延迟读循环，让测试先接好期望。当前未用，保留以对称。
             if (startLoop)
                 _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
         }
 
-        /// <summary>Current pipe connectivity (rough — the read loop observes disconnects).</summary>
+        /// <summary>当前 pipe 连通性（粗略——读循环负责观察断连）。</summary>
         public bool IsConnected
         {
             get
@@ -128,18 +120,16 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Wave 1 / test factory: create a <c>NamedPipeClientStream</c> and
-        /// connect to <c>vs-mcp-{pipeName}</c> with retry. Returns a router
-        /// that already owns the connection and read loop. Kept for the
-        /// Wave 1 passthrough tests, which construct the router this way.
+        /// Wave 1 / 测试工厂：创建 <c>NamedPipeClientStream</c> 并带重试连接到
+        /// <c>vs-mcp-{pipeName}</c>。返回一个已拥有连接和读循环的 router。保留给
+        /// Wave 1 直通测试用（它们以这种方式构造 router）。
         ///
-        /// Uses <see cref="PipeOptions.Asynchronous"/> + async IO (ConnectAsync /
-        /// ReadAsync / WriteAsync): the demux model runs a continuous read loop
-        /// concurrent with ForwardAsync writes on the SAME handle, which requires
-        /// overlapped IO. The Wave 1 "PipeOptions.None" note applied to Wave 1's
-        /// SERIAL model (write-then-read inside one lock); concurrent demux needs
-        /// Asynchronous. The Wave 1 hang was Asynchronous + SYNCHRONOUS IO; the
-        /// correct pairing here is Asynchronous + ASYNC IO throughout.
+        /// 用 <see cref="PipeOptions.Asynchronous"/> + 异步 IO（ConnectAsync /
+        /// ReadAsync / WriteAsync）：多路分解模型在同一个 handle 上运行持续读循环，
+        /// 与 ForwardAsync 写入并发，需要 overlapped IO。Wave 1 的 "PipeOptions.None"
+        /// 注释针对的是 Wave 1 的串行模型（一把锁内写完再读）；并发多路分解需要
+        /// Asynchronous。Wave 1 的卡死是 Asynchronous + 同步 IO；这里的正确搭配是
+        /// 全程 Asynchronous + 异步 IO。
         /// </summary>
         public static async Task<PipeRouter> ConnectAsync(string pipeName, CancellationToken ct)
         {
@@ -152,10 +142,9 @@ namespace VsMcpGateway
                 client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 try
                 {
-                    // ConnectAsync() has no timeout overload on net48 — emulate
-                    // by racing against a delay; on timeout, dispose the stream
-                    // (which aborts the in-flight connect) and retry. Disposing
-                    // during ConnectAsync is safe; the abandoned stream is GC'd.
+                    // ConnectAsync() 在 net48 上没有超时重载——用一个延时赛跑来模拟；
+                    // 超时则释放流（这会中止进行中的 connect）并重试。在 ConnectAsync
+                    // 期间 Dispose 是安全的；被放弃的流由 GC 回收。
                     Task connectTask = client.ConnectAsync();
                     Task winner = await Task.WhenAny(connectTask, Task.Delay(2000, ct)).ConfigureAwait(false);
                     if (winner != connectTask)
@@ -164,7 +153,7 @@ namespace VsMcpGateway
                         await Task.Delay(500, ct).ConfigureAwait(false);
                         continue;
                     }
-                    await connectTask.ConfigureAwait(false); // observe connect errors
+                    await connectTask.ConfigureAwait(false); // 观察 connect 错误
                     return new PipeRouter(client, ownsStream: true);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -182,9 +171,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Read loop: continuously reads frames, dispatching each by (type, id)
-        /// to the matching pending request. Runs in the background from the
-        /// constructor until the stream closes or the router is disposed.
+        /// 读循环：持续读帧，按 (type, id) 分派给对应的 pending 请求。从构造函数
+        /// 起在后台运行，直到流关闭或 router 被释放。
         /// </summary>
         private async Task ReadLoopAsync(CancellationToken ct)
         {
@@ -201,18 +189,17 @@ namespace VsMcpGateway
                 }
                 catch (Exception ex) when (IsBenignDisconnect(ex))
                 {
-                    // Pipe closed / VS gone — fall through to fail all pending.
+                    // Pipe 关闭 / VS 已走——往下走到 fail 所有 pending。
                     break;
                 }
                 catch (Exception)
                 {
-                    // A malformed/truncated frame is treated as connection loss;
-                    // the Gateway's accept loop will reap this entry.
+                    // 畸形/截断的帧视为连接丢失；Gateway 的 accept 循环会回收本条目。
                     break;
                 }
 
                 if (json == null)
-                    break; // clean EOF
+                    break; // 干净的 EOF
 
                 string type = "";
                 string id = "";
@@ -228,15 +215,13 @@ namespace VsMcpGateway
                 }
                 catch (JsonException)
                 {
-                    continue; // skip unparseable frame
+                    continue; // 跳过无法解析的帧
                 }
 
-                // Control frames (no id) are VS-pushed notifications, not
-                // request/response pairs. Dispatch them to their callbacks
-                // before the id-based demux below. solution-changed refreshes
-                // the InstanceRegistry; heartbeat (Wave 4) is recognized and
-                // ignored for now so an older/newer VS peer doesn't break the
-                // stream.
+                // 控制帧（无 id）是 VS 推送的通知，不是请求/响应对。在下面基于 id
+                // 的多路分解之前，先分派给各自的回调。solution-changed 刷新
+                // InstanceRegistry；heartbeat（Wave 4）目前被识别后忽略，让新旧
+                // VS 配对不破坏流。
                 if (string.IsNullOrEmpty(id))
                 {
                     if (string.Equals(type, "solution-changed", StringComparison.Ordinal) && _onSolutionChanged != null)
@@ -249,8 +234,7 @@ namespace VsMcpGateway
                         }
                         catch
                         {
-                            // A malformed control frame must never tear down the
-                            // pipe — other in-flight requests depend on it.
+                            // 畸形的控制帧绝不能拖垮 pipe——其他在途请求依赖它。
                         }
                     }
                     else if (string.Equals(type, "heartbeat", StringComparison.Ordinal) && _onHeartbeat != null)
@@ -263,16 +247,15 @@ namespace VsMcpGateway
                         }
                         catch
                         {
-                            // A malformed heartbeat must not tear down the pipe.
+                            // 畸形的 heartbeat 绝不能拖垮 pipe。
                         }
                     }
-                    // Unknown control frames fall through and are silently
-                    // dropped so a newer/older peer pairing never breaks the stream.
+                    // 未知控制帧落到这里被静默丢弃，让新旧版本配对绝不破坏流。
                     continue;
                 }
 
                 if (!_pending.TryGetValue(id, out var pending))
-                    continue; // unknown id (stale / duplicate) — ignore
+                    continue; // 未知 id（过期/重复）——忽略
 
                 if (string.Equals(type, "head", StringComparison.Ordinal))
                 {
@@ -291,7 +274,7 @@ namespace VsMcpGateway
                             }
                         }
                     }
-                    catch { /* best-effort parse */ }
+                    catch { /* 尽力解析 */ }
                 }
                 else if (string.Equals(type, "data", StringComparison.Ordinal))
                 {
@@ -324,8 +307,8 @@ namespace VsMcpGateway
                     }
                     catch
                     {
-                        // A write to a cancelled/closed output stream must not
-                        // kill the read loop for OTHER pending requests.
+                        // 对已取消/已关闭的输出流的写入绝不能害死其他 pending
+                        // 请求的读循环。
                     }
                 }
                 else if (string.Equals(type, "end", StringComparison.Ordinal))
@@ -333,14 +316,13 @@ namespace VsMcpGateway
                     pending.CompletionTcs.TrySetResult(true);
                     _pending.TryRemove(id, out _);
                 }
-                // Other id-bearing types (register echoes) don't belong to the
-                // response stream and are ignored here; Program.cs reads the
-                // register frame off the accept stream before wrapping it in a
-                // router, so it never arrives on a router's read loop.
+                // 其他带 id 的类型（register 回显）不属于响应流，这里忽略；Program.cs
+                // 在把它包装成 router 之前已从 accept 流上读走 register 帧，所以它
+                // 永远不会到达 router 的读循环。
             }
 
-            // Connection lost: fail every still-pending request so its
-            // ForwardAsync caller unblocks instead of hanging forever.
+            // 连接丢失：让所有仍在 pending 的请求失败，使其 ForwardAsync 调用方
+            // 解除阻塞，而不是永远挂起。
             foreach (var kv in _pending)
             {
                 kv.Value.CompletionTcs.TrySetException(
@@ -350,10 +332,9 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Forward one JSON-RPC request: write a PipeRequest frame (under the
-        /// send lock, released immediately after the write) and wait on the
-        /// pending entry's completion TCS until the read loop sees the matching
-        /// end frame (or the pipe drops). Returns the head status + headers.
+        /// 转发单个 JSON-RPC 请求：写一个 PipeRequest 帧（在 send 锁下，写完立即
+        /// 释放），并在 pending 条目的 completion TCS 上等待，直到读循环看到匹配的
+        /// end 帧（或 pipe 断开）。返回 head 状态 + headers。
         /// </summary>
         public async Task<ForwardResult> ForwardAsync(
             string jsonRpcBody,
@@ -375,8 +356,7 @@ namespace VsMcpGateway
             };
             _pending[id] = pending;
 
-            // Unregister on cancellation so a dropped request doesn't leak and
-            // a late end frame finds no matching pending.
+            // 取消时注销，让被丢弃的请求不泄漏，且迟到的 end 帧找不到匹配的 pending。
             using var reg = ct.Register(() =>
             {
                 pending.CompletionTcs.TrySetCanceled();
@@ -399,8 +379,7 @@ namespace VsMcpGateway
                     Body = jsonRpcBody,
                     Headers = headers,
                 }, ct).ConfigureAwait(false);
-                // Lock released immediately — concurrent requests may now write
-                // their own frames; the read loop demuxes by id.
+                // 锁立即释放——并发请求现在可以写各自的帧；读循环按 id 多路分解。
             }
             finally
             {
@@ -417,8 +396,8 @@ namespace VsMcpGateway
             }
             catch (OperationCanceledException)
             {
-                // Pending's own TCS was canceled without our ct firing — treat
-                // as a transport fault and surface to the HTTP layer.
+                // Pending 自己的 TCS 被取消而我们的 ct 没触发——视为传输故障，
+                // 上报给 HTTP 层。
                 throw new IOException("Pipe request was canceled.");
             }
 
@@ -434,7 +413,7 @@ namespace VsMcpGateway
         {
             if (_disposed) return;
             _disposed = true;
-            try { _loopCts.Cancel(); } catch { /* best-effort */ }
+            try { _loopCts.Cancel(); } catch { /* 尽力而为 */ }
             if (_ownsStream) TryDispose(_stream);
             FailAllPending();
         }
@@ -443,12 +422,12 @@ namespace VsMcpGateway
         {
             if (_disposed) return;
             _disposed = true;
-            try { _loopCts.Cancel(); } catch { /* best-effort */ }
+            try { _loopCts.Cancel(); } catch { /* 尽力而为 */ }
             if (_readLoop != null)
             {
 #pragma warning disable VSTHRD003
                 try { await _readLoop.ConfigureAwait(false); }
-                catch { /* teardown must not throw */ }
+                catch { /* 收尾绝不能抛 */ }
 #pragma warning restore VSTHRD003
             }
             if (_ownsStream) TryDispose(_stream);
@@ -467,7 +446,7 @@ namespace VsMcpGateway
 
         private static void TryDispose(IDisposable? disposable)
         {
-            try { disposable?.Dispose(); } catch { /* best-effort */ }
+            try { disposable?.Dispose(); } catch { /* 尽力而为 */ }
         }
 
         private sealed class Pending

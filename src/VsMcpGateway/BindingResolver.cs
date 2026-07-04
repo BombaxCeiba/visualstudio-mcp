@@ -5,33 +5,32 @@ using System.Linq;
 namespace VsMcpGateway
 {
     /// <summary>
-    /// Why a <see cref="TargetResolution"/> resolved the way it did. Only the
-    /// error cases carry a distinct kind — Program.cs keys hint/forward behavior
-    /// on <see cref="TargetResolution.Success"/> + <see cref="TargetResolution.Binding"/>.
+    /// 说明 <see cref="TargetResolution"/> 为何得到该结果。只有错误情形才带
+    /// 区分性的 kind——Program.cs 根据 <see cref="TargetResolution.Success"/> +
+    /// <see cref="TargetResolution.Binding"/> 决定 hint/forward 行为。
     /// </summary>
     public enum TargetErrorKind
     {
         None,
-        /// <summary>① Header matched zero instances.</summary>
+        /// <summary>① Header 匹配到 0 个实例。</summary>
         WorkspaceMiss,
-        /// <summary>① Header matched ≥2 instances.</summary>
+        /// <summary>① Header 匹配到 ≥2 个实例。</summary>
         WorkspaceAmbiguous,
-        /// <summary>②/③ No instance available / no binding and not exactly one instance (设计文档 §④).</summary>
+        /// <summary>②/③ 没有可用实例 / 无绑定且不恰好一个实例（设计文档 §④）。</summary>
         Intercept,
-        /// <summary>② Binding exists but the target VS dropped offline.</summary>
+        /// <summary>② 绑定存在但目标 VS 已下线。</summary>
         InstanceGone,
-        /// <summary>The bound VS has no Mcp-Session-Id yet (never initialized through this Gateway).</summary>
+        /// <summary>绑定的 VS 尚无 Mcp-Session-Id（从未通过本 Gateway initialize 过）。</summary>
         NeedsInitialize,
     }
 
     /// <summary>
-    /// Result of the 4-tier binding resolution (① Header &gt; ② Session &gt;
-    /// ③ Auto-bind &gt; ④ Intercept). On success <see cref="Pid"/> is the route
-    /// target, <see cref="VsSessionId"/> the per-VS session id to forward, and
-    /// <see cref="Binding"/> the session binding whose <c>HintPending</c> gates
-    /// hint injection (null for the stateless ① tier, which never injects).
-    /// On failure <see cref="ErrorText"/> carries the agent-facing message and
-    /// <see cref="ErrorKind"/> classifies it.
+    /// 4 层绑定解析的结果（① Header &gt; ② Session &gt; ③ 自动绑定 &gt;
+    /// ④ 拦截）。成功时 <see cref="Pid"/> 是路由目标，<see cref="VsSessionId"/>
+    /// 是要转发的每个 VS 的 session id，<see cref="Binding"/> 是其
+    /// <c>HintPending</c> 门控 hint 注入的会话绑定（无状态的 ① 层为 null，从不
+    /// 注入）。失败时 <see cref="ErrorText"/> 携带面向 agent 的消息，
+    /// <see cref="ErrorKind"/> 对其分类。
     /// </summary>
     public sealed class TargetResolution
     {
@@ -64,18 +63,15 @@ namespace VsMcpGateway
     }
 
     /// <summary>
-    /// The Gateway's binding resolution for any non-initialize, non-gateway-tool
-    /// request. Implements the 4-tier priority from 设计文档 §Session Binding
-    /// (① Header &gt; ② Session &gt; ③ Auto-bind &gt; ④ Intercept) as a single
-    /// method over the in-memory tables — no HTTP/pipe IO — so the full routing
-    /// logic is unit-testable. The ③ auto-bind tier performs its SessionTable
-    /// side effect (create-with-hint) here; ① is stateless (never touches the
-    /// SessionTable, per decision MI-06).
+    /// Gateway 对任何非 initialize、非 gateway 工具请求的绑定解析。在设计文档
+    /// §Session Binding 的 4 层优先级（① Header &gt; ② Session &gt; ③ 自动绑定
+    /// &gt; ④ 拦截）上实现，是内存表上的单个方法——无 HTTP/pipe IO——让完整路由
+    /// 逻辑可单元测试。③ 自动绑定层在此执行其 SessionTable 副作用（带 hint 创建）；
+    /// ① 无状态（按决策 MI-06 从不触碰 SessionTable）。
     ///
-    /// vsSessionId authority: the per-VS id captured at initialize time lives on
-    /// <see cref="InstanceEntry.VsSessionId"/> (VS is single-session
-    /// server-side). The ① tier reads it directly so a stateless header-routed
-    /// request still reaches the right VS-side session.
+    /// vsSessionId 权威来源：initialize 时捕获的每个 VS 的 id 存放在
+    /// <see cref="InstanceEntry.VsSessionId"/>（VS 服务端是单会话）。① 层直接读它，
+    /// 让无状态的 header 路由请求仍能到达正确的 VS 端会话。
     /// </summary>
     public static class BindingResolver
     {
@@ -88,7 +84,7 @@ namespace VsMcpGateway
             if (registry == null) throw new ArgumentNullException(nameof(registry));
             if (sessions == null) throw new ArgumentNullException(nameof(sessions));
 
-            // ① Header tier — stateless, highest priority (设计文档 §①).
+            // ① Header 层——无状态，最高优先级（设计文档 §①）。
             if (!string.IsNullOrWhiteSpace(workspaceHeader))
             {
                 var snap = registry.Snapshot();
@@ -98,14 +94,14 @@ namespace VsMcpGateway
                 {
                     if (registry.TryGet(match.Pid.Value, out var entry))
                         return TargetResolution.Routed(entry.Info.Pid, entry.VsSessionId, binding: null, hintJustAutoBound: false);
-                    // Raced off between Snapshot and TryGet — treat as miss.
+                    // Snapshot 与 TryGet 之间发生竞态——视为未命中。
                 }
                 else if (match.Kind == WorkspaceMatchKind.None)
                 {
                     return TargetResolution.Failed(TargetErrorKind.WorkspaceMiss,
                         GatewayTools.BuildWorkspaceMissMessage(workspaceHeader!, snap));
                 }
-                else // Ambiguous
+                else // 歧义（Ambiguous）
                 {
                     var matchedInstances = snap.Where(e => match.MatchedPids.Contains(e.Info.Pid)).ToArray();
                     return TargetResolution.Failed(TargetErrorKind.WorkspaceAmbiguous,
@@ -113,58 +109,43 @@ namespace VsMcpGateway
                 }
             }
 
-            // ② Session tier — a prior initialize / select bound this client session.
+            // ② Session 层——之前的 initialize / select 绑定了这个客户端会话。
             if (!string.IsNullOrEmpty(clientSessionId) && sessions.TryGet(clientSessionId!, out var binding))
             {
                 if (!registry.TryGet(binding.Pid, out var entry))
                     return TargetResolution.Failed(TargetErrorKind.InstanceGone,
                         $"Bound VS instance PID {binding.Pid} is no longer connected.");
 
-                string? vsid = entry.VsSessionId;
-                if (string.IsNullOrEmpty(vsid))
-                {
-                    // The target VS was never initialize'd through this Gateway
-                    // (select_vs_instance switched to a fresh instance, or the
-                    // Gateway restarted and lost the per-VS id). Ask for a new
-                    // initialize rather than fabricate one.
-                    return TargetResolution.Failed(TargetErrorKind.NeedsInitialize,
-                        "VS instance switched. Call initialize again to bind the new instance.");
-                }
-                // Pass the binding so Program.cs can honor a leftover HintPending
-                // from a prior auto-bind whose first tool call is THIS one.
-                return TargetResolution.Routed(entry.Info.Pid, vsid, binding, hintJustAutoBound: false);
+                // vsSessionId 可能为 null：VS 的 pipe 模式 SDK 从不在 head 帧里发
+                // Mcp-Session-Id，Gateway 无从捕获。这没问题——VS 端跑单个进程内会话
+                // 并忽略该 header，所以不带它转发即可，而不是阻塞每次 initialize 之后
+                // 的调用（之前这会在每次 tools/call 上以 -32004 "VS instance switched"
+                // 形式浮现）。
+                return TargetResolution.Routed(entry.Info.Pid, entry.VsSessionId, binding, hintJustAutoBound: false);
             }
 
-            // ③ Auto-bind — exactly one instance online, no header, no session.
+            // ③ 自动绑定——恰好一个实例在线，无 header，无 session。
             var snapshot = registry.Snapshot();
             if (snapshot.Count == 1)
             {
                 var only = snapshot.First();
-                string? vsid = only.VsSessionId;
-                if (string.IsNullOrEmpty(vsid))
-                {
-                    // Single instance but never initialized yet → the client must
-                    // initialize first (the binding can't route without a VS-side
-                    // session id). Don't auto-bind into a void.
-                    return TargetResolution.Failed(TargetErrorKind.NeedsInitialize,
-                        "No VS instance bound. Call initialize first.");
-                }
-                // Create the binding (stateful) and mark the one-shot hint.
-                // clientSessionId is null here (no header, no session) so the
-                // forward path must mint one; Program.cs handles that.
-                var (_, newBinding) = sessions.CreateWithId(only.Info.Pid, vsid, "auto");
+                // VS pipe 模式从不捕获 Mcp-Session-Id（head 帧不带），所以
+                // only.VsSessionId 为 null。这没问题——VS 端跑单个进程内会话并忽略
+                // 该 header。自动绑定（有状态）并标记一次性 hint；转发路径铸造客户端
+                // session id。
+                var (_, newBinding) = sessions.CreateWithId(only.Info.Pid, only.VsSessionId, "auto");
                 newBinding.HintPending = true;
-                return TargetResolution.Routed(only.Info.Pid, vsid, newBinding, hintJustAutoBound: true);
+                return TargetResolution.Routed(only.Info.Pid, only.VsSessionId, newBinding, hintJustAutoBound: true);
             }
 
-            // ④ Intercept — 0 or ≥2 instances, no header, no session (设计文档 §④).
+            // ④ 拦截——0 或 ≥2 个实例，无 header，无 session（设计文档 §④）。
             return TargetResolution.Failed(TargetErrorKind.Intercept,
                 BuildInterceptOrEmpty(snapshot));
         }
 
         /// <summary>
-        /// ④ message when unbound with multiple instances; an empty registry
-        /// instead yields a short "no instance" message (still ④-adjacent).
+        /// 多实例未绑定时的 ④ 消息；空注册表则给出一条短的"无实例"消息
+        /// （仍属 ④ 邻近情形）。
         /// </summary>
         private static string BuildInterceptOrEmpty(IReadOnlyCollection<InstanceEntry> snapshot)
         {

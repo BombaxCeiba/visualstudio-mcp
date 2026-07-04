@@ -9,27 +9,25 @@ using VsMcp.Common;
 namespace VsMcpGateway
 {
     /// <summary>
-    /// The two Gateway-level tools, their descriptions, their handlers, and the
-    /// SSE injector that stitches them into a VS tools/list response. All
-    /// Gateway-aware MCP logic lives here; Program.cs is just the HTTP/pipe
-    /// plumbing that calls into this.
+    /// 两个 Gateway 级工具、它们的描述、它们的处理器，以及把它们缝合进 VS
+    /// tools/list 响应的 SSE 注入器。所有 Gateway 感知的 MCP 逻辑都在这里；
+    /// Program.cs 只是调用本类的 HTTP/pipe 管道。
     /// </summary>
     public static class GatewayTools
     {
         public const string ListInstancesName = "list_vs_instances";
         public const string SelectInstanceName = "select_vs_instance";
 
-        /// <summary>JSON-serialized tool descriptions, camelCase, matching the
-        /// shape VS returns in tools/list results. Parsed once into JsonElement
-        /// form so they can be spliced into a result.tools array directly.</summary>
+        /// <summary>JSON 序列化的工具描述，camelCase，匹配 VS 在 tools/list 结果里
+        /// 返回的形态。一次性解析成 JsonElement 形式，可直接拼进 result.tools 数组。</summary>
         private static readonly Lazy<JsonElement[]> ToolElements = new Lazy<JsonElement[]>(() =>
         {
-            string listJson = "{\"name\":\"list_vs_instances\",\"description\":\"Lists all running Visual Studio instances connected to the gateway. Returns PID, solution path, solution directory, and debugger state for each instance.\",\"readOnly\":true}";
+            string listJson = "{\"name\":\"list_vs_instances\",\"description\":\"Lists all running Visual Studio instances connected to the gateway. Returns PID, solution path, solution directory, and debugger state for each instance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]},\"annotations\":{\"readOnlyHint\":true}}";
             string selectJson = "{\"name\":\"select_vs_instance\",\"description\":\"Binds this MCP session to a specific VS instance. All subsequent tool calls route to it. Use list_vs_instances first to find available PIDs.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\",\"description\":\"VS process ID to bind to\"}},\"required\":[\"pid\"]}}";
             using var d1 = JsonDocument.Parse(listJson);
             using var d2 = JsonDocument.Parse(selectJson);
-            // Clone because the documents get disposed; GetRawText re-parse is
-            // the simplest way to own the element lifetime.
+            // 克隆是因为 documents 会被释放；GetRawText 重新解析是拥有元素生命
+            // 周期最简单的方式。
             return new[]
             {
                 JsonSerializer.Deserialize<JsonElement>(d1.RootElement.GetRawText()),
@@ -37,16 +35,15 @@ namespace VsMcpGateway
             };
         });
 
-        /// <summary>True if <paramref name="toolName"/> is one of the Gateway-handled tools.</summary>
+        /// <summary>判断 <paramref name="toolName"/> 是否是 Gateway 自处理的工具之一。</summary>
         public static bool IsGatewayTool(string? toolName) =>
             string.Equals(toolName, ListInstancesName, StringComparison.Ordinal) ||
             string.Equals(toolName, SelectInstanceName, StringComparison.Ordinal);
 
         /// <summary>
-        /// Build the list_vs_instances payload from a snapshot of the registry.
-        /// debuggerState comes from the register frame's snapshot (Wave 2 has no
-        /// live state; Wave 3+ may refresh it). Returns the JSON text for the
-        /// tool's text content.
+        /// 从注册表快照构造 list_vs_instances 的载荷。debuggerState 来自 register
+        /// 帧的快照（Wave 2 没有实时状态；Wave 3+ 可能刷新它）。返回该工具文本
+        /// 内容的 JSON 文本。
         /// </summary>
         public static string BuildListInstancesContent(IReadOnlyCollection<InstanceEntry> instances)
         {
@@ -63,7 +60,7 @@ namespace VsMcpGateway
                     writer.WriteNumber("pid", info.Pid);
                     writer.WriteString("solution", info.SolutionPath);
                     writer.WriteString("solutionDir", info.SolutionDir);
-                    writer.WriteNull("debuggerState"); // Wave 2: register has no live state
+                    writer.WriteNull("debuggerState"); // Wave 2：register 没有实时状态
                     writer.WriteString("vsVersion", string.IsNullOrEmpty(info.VsVersion) ? null : info.VsVersion);
                     writer.WriteEndObject();
                 }
@@ -74,8 +71,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Build the JSON-RPC response for list_vs_instances (a text content
-        /// block carrying the instances JSON).
+        /// 为 list_vs_instances 构造 JSON-RPC 响应（一个携带 instances JSON 的
+        /// 文本内容块）。
         /// </summary>
         public static string BuildListInstancesResponse(object jsonRpcId, IReadOnlyCollection<InstanceEntry> instances)
         {
@@ -93,7 +90,7 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Build the JSON-RPC response for select_vs_instance on success.
+        /// 为 select_vs_instance 成功时构造 JSON-RPC 响应。
         /// </summary>
         public static string BuildSelectResponse(object jsonRpcId, int pid)
         {
@@ -110,8 +107,7 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Build a JSON-RPC error response (used for select without initialize,
-        /// unknown pid, etc.).
+        /// 构造一个 JSON-RPC error 响应（用于未 initialize 就 select、未知 pid 等）。
         /// </summary>
         public static string BuildErrorResponse(object jsonRpcId, int code, string message)
         {
@@ -125,9 +121,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Build a JSON-RPC error response wrapped as an MCP tool-call IsError
-        /// result (for gateway-tool failures that should surface to the agent
-        /// as a tool error, not a protocol error).
+        /// 构造一个包装成 MCP tool-call IsError result 的 JSON-RPC error 响应
+        /// （用于应作为工具错误而非协议错误浮现给 agent 的 gateway 工具失败）。
         /// </summary>
         public static string BuildToolErrorResponse(object jsonRpcId, string message)
         {
@@ -144,15 +139,13 @@ namespace VsMcpGateway
             return JsonSerializer.Serialize(resp);
         }
 
-        // ─────────────────────── Intercept / hint messages ──────────────────────
+        // ─────────────────────── 拦截 / hint 消息 ──────────────────────
         //
-        // The ①③④ tiers all surface to the agent as tool-error text (设计文档
-        // §①/§③/§④) so the agent relays the guidance to the user. Message text
-        // follows the design doc verbatim where given.
+        // ①③④ 层都以 tool-error 文本形式浮现给 agent（设计文档 §①/§③/§④），让
+        // agent 把引导转达给用户。消息文本在设计文档给出处逐字遵循。
 
-        /// <summary>Render one instance as a list line. Solution-only (Wave 2/3
-        /// carry no live debugger state from the register frame; Wave 4's
-        /// heartbeat may enrich this).</summary>
+        /// <summary>把一个实例渲染成列表行。仅解决方案信息（Wave 2/3 不从 register
+        /// 帧携带实时调试器状态；Wave 4 的 heartbeat 可能补充它）。</summary>
         private static string FormatInstance(InstanceEntry inst)
         {
             var info = inst.Info;
@@ -163,9 +156,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// ① Header miss intercept message (设计文档 §① "未命中时的拦截消息").
-        /// Lists every available instance so the agent can tell the user what to
-        /// open / configure against.
+        /// ① Header 未命中的拦截消息（设计文档 §① "未命中时的拦截消息"）。列出
+        /// 每个可用实例，让 agent 告诉用户该打开/配置哪个。
         /// </summary>
         public static string BuildWorkspaceMissMessage(string workspace, IReadOnlyCollection<InstanceEntry> instances)
         {
@@ -187,9 +179,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// ① Header ambiguity message: more than one VS's SolutionDir matched the
-        /// same workspace header. The agent should ask the user for a more
-        /// specific path or use select_vs_instance.
+        /// ① Header 歧义消息：超过一个 VS 的 SolutionDir 匹配到同一个 workspace
+        /// header。agent 应让用户提供更具体的路径或改用 select_vs_instance。
         /// </summary>
         public static string BuildAmbiguousMessage(string workspace, IReadOnlyCollection<InstanceEntry> matched)
         {
@@ -208,10 +199,9 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// ④ Intercept message for an unbound request with multiple instances
-        /// (设计文档 §④ "拦截未绑定请求"). Embeds a ready-to-paste <c>.mcp.json</c>
-        /// example; backslashes are doubled inside the JSON string so the agent
-        /// can quote it directly to the user.
+        /// ④ 多实例下未绑定请求的拦截消息（设计文档 §④ "拦截未绑定请求"）。内嵌
+        /// 一个可直接粘贴的 <c>.mcp.json</c> 示例；JSON 字符串里反斜杠已加倍，让
+        /// agent 可直接原样引用给用户。
         /// </summary>
         public static string BuildInterceptMessage(IReadOnlyCollection<InstanceEntry> instances)
         {
@@ -242,8 +232,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Hint text injected into the first tool result after an auto-bind
-        /// (设计文档 §③). One-shot — only the first tool call after ③ surfaces it.
+        /// 自动绑定后注入到第一个 tool result 的 hint 文本（设计文档 §③）。
+        /// 一次性——只有 ③ 之后的第一次工具调用会浮现它。
         /// </summary>
         public static string BuildAutoBindHint(InstanceEntry inst)
         {
@@ -262,14 +252,11 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Inject a hint text block at the FRONT of the <c>result.content</c>
-        /// array in a buffered tools/call SSE response. Reuses the SSE
-        /// data-payload extraction pattern from
-        /// <see cref="InjectIntoToolsListSse"/>. Returns the rewritten bytes and
-        /// whether injection happened. Non-tools/call responses (notifications,
-        /// error envelopes without a <c>content</c> array) are returned
-        /// unchanged with <c>injected=false</c> so the forward path can stay
-        /// streaming for them.
+        /// 在缓冲的 tools/call SSE 响应的 <c>result.content</c> 数组前端注入一段
+        /// hint 文本。复用 <see cref="InjectIntoToolsListSse"/> 的 SSE data 载荷
+        /// 提取模式。返回改写后的字节及是否注入。非 tools/call 响应（通知、没有
+        /// <c>content</c> 数组的 error 信封）原样返回且 <c>injected=false</c>，
+        /// 让转发路径对它们保持流式。
         /// </summary>
         public static (byte[] rewritten, bool injected) InjectHintIntoToolResultSse(byte[] sseBytes, string hint)
         {
@@ -289,11 +276,11 @@ namespace VsMcpGateway
             }
             catch
             {
-                return (sseBytes, false); // not valid JSON-RPC — pass through
+                return (sseBytes, false); // 不是有效的 JSON-RPC——透传
             }
 
-            // Only a result with a content array is a tools/call success we can
-            // prepend to. Errors / notifications stay untouched.
+            // 只有带 content 数组的 result 才是我们能前置的 tools/call 成功响应。
+            // 错误/通知保持不动。
             if (!root.TryGetProperty("result", out var result) ||
                 result.ValueKind != JsonValueKind.Object ||
                 !result.TryGetProperty("content", out var contentEl) ||
@@ -320,14 +307,36 @@ namespace VsMcpGateway
                     {
                         writer.WritePropertyName("content");
                         writer.WriteStartArray();
-                        // Hint first (the design doc §③ puts it at the front so
-                        // the agent sees the binding context before the payload).
-                        writer.WriteStartObject();
-                        writer.WriteString("type", "text");
-                        writer.WriteString("text", hint);
-                        writer.WriteEndObject();
+                        // hint 合并到第一个 text block 的末尾（结果在前、hint 在后），而非作为
+                        // 独立 block 放 content[0]。实测后者会让 agent 把 hint 当成完整回复、
+                        // 忽略 content[1] 的真实结果；合并到单 text block 后，agent 读一个 block
+                        // 即看到结果 + 绑定上下文，不会漏读。结果在前保证核心信息优先。
+                        bool merged = false;
                         foreach (var c in contentEl.EnumerateArray())
-                            c.WriteTo(writer);
+                        {
+                            if (!merged
+                                && c.TryGetProperty("type", out var ctype) && ctype.ValueKind == JsonValueKind.String && ctype.GetString() == "text"
+                                && c.TryGetProperty("text", out var ctext) && ctext.ValueKind == JsonValueKind.String)
+                            {
+                                writer.WriteStartObject();
+                                writer.WriteString("type", "text");
+                                writer.WriteString("text", ctext.GetString() + "\n\n" + hint);
+                                writer.WriteEndObject();
+                                merged = true;
+                            }
+                            else
+                            {
+                                c.WriteTo(writer);
+                            }
+                        }
+                        if (!merged)
+                        {
+                            // 没有 text block（如图像结果），追加一个 hint text block。
+                            writer.WriteStartObject();
+                            writer.WriteString("type", "text");
+                            writer.WriteString("text", hint);
+                            writer.WriteEndObject();
+                        }
                         writer.WriteEndArray();
                     }
                     else
@@ -335,8 +344,8 @@ namespace VsMcpGateway
                         prop.WriteTo(writer);
                     }
                 }
-                writer.WriteEndObject(); // result
-                writer.WriteEndObject(); // root
+                writer.WriteEndObject(); // result 结束
+                writer.WriteEndObject(); // root 结束
             }
 
             string newJson = Encoding.UTF8.GetString(outBuf.ToArray());
@@ -345,22 +354,21 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Inject the two gateway tool descriptions into a buffered tools/list
-        /// SSE response. The VS response is text/event-stream:
+        /// 把两个 gateway 工具描述注入缓冲的 tools/list SSE 响应。VS 响应是
+        /// text/event-stream：
         /// <c>event: message\ndata: {"jsonrpc":...,"result":{"tools":[...]}}\n\n</c>
-        /// We extract the data JSON, splice our tools onto the result.tools
-        /// array, and re-frame as SSE. Returns the rewritten bytes.
+        /// 我们提取 data JSON，把我们的工具拼到 result.tools 数组上，再重新
+        /// 封装成 SSE。返回改写后的字节。
         ///
-        /// If the buffer is not a parseable tools/list response (e.g. an error
-        /// envelope), it is returned unchanged so errors still reach the client.
+        /// 若缓冲不是可解析的 tools/list 响应（如 error 信封），原样返回，让错误
+        /// 仍能到达客户端。
         /// </summary>
         public static byte[] InjectIntoToolsListSse(byte[] sseBytes)
         {
             string text = Encoding.UTF8.GetString(sseBytes);
 
-            // Find the JSON-RPC payload. SSE "data:" lines carry it; a single
-            // message may split across multiple data lines that the spec joins
-            // with \n. We reassemble by concatenating every "data:" payload.
+            // 找 JSON-RPC 载荷。SSE 的 "data:" 行携带它；单条消息可能跨多个 data
+            // 行，规范用 \n 连接。我们通过拼接每个 "data:" 载荷来重组。
             string? jsonPayload = ExtractDataPayload(text);
             if (jsonPayload == null)
                 return sseBytes;
@@ -373,15 +381,14 @@ namespace VsMcpGateway
             }
             catch
             {
-                return sseBytes; // not valid JSON-RPC — pass through
+                return sseBytes; // 不是有效的 JSON-RPC——透传
             }
 
             if (!root.TryGetProperty("result", out var result) || !result.TryGetProperty("tools", out var toolsEl))
-                return sseBytes; // not a tools result — pass through
+                return sseBytes; // 不是 tools result——透传
 
-            // Rebuild the tools array with our two prepended. We serialize the
-            // original tools elements verbatim (preserving their full shape)
-            // and append our constant descriptions.
+            // 重建 tools 数组，前置我们的两个工具。我们把原始 tools 元素逐字
+            // 序列化（保留其完整形态），再追加我们的常量描述。
             using var outBuf = new MemoryStream();
             using (var writer = new Utf8JsonWriter(outBuf))
             {
@@ -400,11 +407,11 @@ namespace VsMcpGateway
                     {
                         writer.WritePropertyName("tools");
                         writer.WriteStartArray();
-                        // Gateway tools first so the agent sees the multiplexer
-                        // surface ahead of per-instance debugger tools.
+                        // Gateway 工具在前，让 agent 在各实例的调试器工具之前先
+                        // 看到多路复用器界面。
                         foreach (var gt in ToolElements.Value)
                             gt.WriteTo(writer);
-                        // Then every VS-provided tool, verbatim.
+                        // 然后是每个 VS 提供的工具，逐字保留。
                         foreach (var t in toolsEl.EnumerateArray())
                             t.WriteTo(writer);
                         writer.WriteEndArray();
@@ -414,8 +421,8 @@ namespace VsMcpGateway
                         prop.WriteTo(writer);
                     }
                 }
-                writer.WriteEndObject(); // result
-                writer.WriteEndObject(); // root
+                writer.WriteEndObject(); // result 结束
+                writer.WriteEndObject(); // root 结束
             }
 
             string newJson = Encoding.UTF8.GetString(outBuf.ToArray());
@@ -424,9 +431,8 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// Extract the joined payload of every "data:" line in an SSE frame.
-        /// Returns null if no data line is present. Per the SSE spec, multiple
-        /// data lines are concatenated with "\n".
+        /// 提取一个 SSE 帧里所有 "data:" 行的拼接载荷。没有 data 行则返回 null。
+        /// 按 SSE 规范，多个 data 行用 "\n" 拼接。
         /// </summary>
         private static string? ExtractDataPayload(string sseText)
         {
