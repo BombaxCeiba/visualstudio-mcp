@@ -43,14 +43,14 @@
 
 - **Gateway 是独立进程**（`VsMcpGateway.exe`），随 VSIX 一起部署。VS 启动时由扩展拉起，独占 `127.0.0.1:43210`，作为所有 MCP 客户端的唯一入口。
 - **每个 VS 实例不再开 HTTP 端口**，而是开一条 NamedPipe 主动连入 Gateway（`\\.\pipe\vs-mcp-gateway`），首帧 `register` 自报 PID 与 solution 信息。这从根上消除了多实例的端口冲突。
-- **Gateway 是 MCP 感知的 multiplexer**，不是简单的反向代理：它解析 JSON-RPC、维护 session↔VS 绑定、自己处理多实例管理工具、在 `tools/list` 响应里透明注入路由工具。
+- **Gateway 能看懂 MCP 协议、按请求智能路由，不是哑代理（无脑转发）**：它解析每条 JSON-RPC，判断"这次调用该交给哪个 VS"（靠 `X-VS-Workspace` header、会话绑定、或单实例自动绑定——下文「多实例路由」详述），把请求精准送到目标 VS；而 `list_vs_instances` / `select_vs_instance` 这两个多实例管理工具它自己处理，并在 `tools/list` 响应里把这两个工具透明地塞进去。
 - **Gateway 的生命周期独立于任何 VS**：所有 VS 退出后它宽限自杀（防孤儿）；它自己崩溃时 VS 会抢占式拉起一个新的（端口绑定作分布式锁，保证最终只剩一个）。
 
 ---
 
 ## 现在能做什么
 
-暴露 **22 个 VS 工具**（含 1 个可选项 `go_to_definition`）+ **2 个 Gateway 注入的多实例路由工具**，共 24 个。AI 调 `tools/list` 时会看到全部。
+暴露 **22 个 VS 工具**（含 2 个可选项：`go_to_definition`、`eval_csharp`）+ **2 个 Gateway 注入的多实例路由工具**，共 24 个。AI 调 `tools/list` 时会看到全部（可选项需在 Tools → Options 或编译时启用）。
 
 ### 多实例路由（Gateway 级工具）
 
@@ -107,11 +107,17 @@
 
 | 工具 | 作用 |
 |---|---|
-| `find_symbol` | 按名字子串搜索符号（用 VS 语义模型，比 grep 准） |
+| `find_symbol` | 按名字搜索符号：C++ 经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）、C#/VB 经 LSP。返回**每个符号 ±10 行带行号的源码上下文**（纯文本，`▶` 标记符号行）；`maxResults`/`maxChars` 限制输出 |
 | `get_type_hierarchy` | 返回类型的祖先链、派生类、兄弟类型（影响分析） |
 | `go_to_definition` | 解析指定位置的符号定义（可选，需在 Tools → Options 启用） |
 
-> 工具名称遵循 MCP 惯例使用 `snake_case`。所有返回值都是结构化的 JSON（typed DTO），而不是手拼的字符串——AI 拿到的是稳定、schema 友好的数据。
+### 动态执行（可选，开发调试用）
+
+| 工具 | 作用 |
+|---|---|
+| `eval_csharp` | 在 VS 进程内动态执行任意 C#（Roslyn 编译），注入 `Package`/`JTF`，用于实时探查 VS 内部状态、反射读非 public 字段，**无需重编重装扩展**。等价于任意代码执行——仅本地开发构建含此工具，发布版 VSIX 完全不含（见下文「eval_csharp 编译开关」） |
+
+> 工具名称遵循 MCP 惯例使用 `snake_case`。除 `find_symbol`（返回带行号的源码上下文纯文本，省 token、不转义换行）外，返回值都是结构化 JSON（typed DTO）——AI 拿到的是稳定、schema 友好的数据。
 
 ---
 
@@ -133,7 +139,20 @@ Gateway 只绑定到 `127.0.0.1`，**永远不会监听外部网络**。开第�
 
 ### 3. 配置你的 AI 客户端
 
-以 Claude Code 为例，在你的 MCP 配置中加入：
+以 Claude Code 为例，**推荐用 CLI 命令**（项目级，写到项目 `.mcp.json`，团队共享、提交进仓库）：
+
+```bash
+claude mcp add --transport http --scope project vsdebugger https://127.0.0.1:43210/mcp/
+```
+
+> 多实例场景想固定路由到某个 VS，加 `X-VS-Workspace` header（详见下文「多实例路由」）：
+
+```bash
+claude mcp add --transport http --scope project vsdebugger-backend https://127.0.0.1:43210/mcp/ \
+  --header "X-VS-Workspace: D:\projects\Backend"
+```
+
+或者直接编辑 MCP 配置 JSON（手动加 `mcpServers` 条目）：
 
 ```json
 {
@@ -211,13 +230,13 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 
 ## 路线图
 
-`vs-mcp` 的终局是**让 AI 拥有和人类开发者一样的 IDE 感知**，并强制把这种感知接回编辑闭环：
+`vs-mcp` 的最终目标是**让 AI 拥有和人类开发者一样的 IDE 感知**，并强制把这种感知接回编辑闭环：
 
 | 状态 | 能力 | 价值 |
 |---|---|---|
 | ✅ 已完成 | **构建控制** — 触发构建、读 build 输出 | AI 改完代码能验证编译 |
 | ✅ 已完成 | **调试器控制** — 断点、单步、调用栈、局部变量、表达式求值 | AI 能看到运行时状态 |
-| ✅ 已完成 | **符号导航（部分）** — find_symbol / get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
+| ✅ 已完成 | **符号导航** — find_symbol（C++/C#/VB，带源码上下文）/ get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
 | ✅ 已完成 | **多实例 Gateway** — 一个端口后挂多个 VS，按工作区/会话路由 | 同时开多个项目不再端口冲突 |
 | 🚧 规划中 | **语法诊断** — 直接读 VS 的编译/语义错误，不是 grep | 比 grep 准，覆盖 C++/C#/Python/… |
 | 🚧 规划中 | **符号导航扩展** — find-references / workspace symbols | 影响分析、重构场景 |
@@ -239,7 +258,7 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 | 并发模型 | 多会话并发路由；同一 VS 实例内串行 | 不同 VS 可并行服务；单个 VS 的工具调用按 VS SDK 单会话串行 |
 | 工作区路由 | `X-VS-Workspace` header | 无状态前缀匹配，可选 |
 
-日志写入 VS 的 **输出窗口 → "VS MCP" 面板**（Information 级别及以上），错误同时写入 `IVsActivityLog`。Gateway 是无窗口进程，自身不写文件日志——运行状态用任务管理器看 `VsMcpGateway.exe`、`netstat -ano | findstr :43210`、或 Sysinternals `pipelist` 看 `vs-mcp-gateway`。
+日志写入 VS 的 **输出窗口 → "VS MCP" 面板**（Information 级别及以上），错误同时写入 `IVsActivityLog`。**每次工具调用的回复也会原样打到该面板**（前缀 `← MCP 回复：`），方便立即观察 agent 实际收到的内容——**不截断**，面板看到的和 agent 收到的完全一致。Gateway 是无窗口进程，自身不写文件日志——运行状态用任务管理器看 `VsMcpGateway.exe`、`netstat -ano | findstr :43210`、或 Sysinternals `pipelist` 看 `vs-mcp-gateway`。
 
 ---
 
@@ -262,6 +281,14 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 ```
 msbuild src\VsMcp.sln /p:Configuration=Release
 ```
+
+本地构建默认**含 `eval_csharp`**（动态 C# 执行，开发调试用）。发布构建显式关闭——发布 VSIX 不含任意代码执行能力：
+
+```
+msbuild src\VsMcp.sln /p:Configuration=Release /p:EvalCsharpEnabled=false
+```
+
+> **eval_csharp 编译开关**：csproj 的 `<EvalCsharpEnabled>`（默认 `true`）控制 `EVAL_CSHARP` 编译常量。`EvalCsharpFacade`、`eval_csharp` 工具注册、`EnableEvalCsharp` 运行时开关、整条参数链路都用 `#if EVAL_CSHARP` 包裹——`/p:EvalCsharpEnabled=false` 时这些代码完全不编译进 VSIX。GitHub 发布管线（`.github/workflows/release.yml`）已默认带上此参数。
 
 产物：`src/VsMcp/bin/Release/net48/VsMcp.vsix`（内含 `VsMcpGateway.exe` 及其依赖，部署后与 `VsMcp.dll` 同目录）。
 
