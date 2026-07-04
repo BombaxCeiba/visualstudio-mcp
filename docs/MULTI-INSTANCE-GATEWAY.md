@@ -8,39 +8,30 @@
 
 根因：`HttpListener` 是独占式 TCP 绑定，同一端口只能被一个进程持有。当前架构里每个 `devenv.exe` 各自启动一个 `McpHttpServer`，端口冲突不可避免。
 
-## Solution: Gateway + NamedPipe Multiplexer
+## Solution: Gateway + NamedPipe
 
-引入一个独立的 Gateway 进程（`VsMcpGateway.exe`），独占 `:43210` 端口，作为所有 MCP 客户端的唯一入口。每个 VS 实例不再直接开 HTTP 端口，而是开一个 `NamedPipeServer`，Gateway 通过管道将请求路由到对应的 VS 实例。
+引入一个独立的 Gateway 进程（`VsMcpGateway.exe`），独占 `:43210` 端口，作为所有 MCP 客户端的唯一入口。每个 VS 实例不再开 HTTP 端口，而是作为 **NamedPipe 客户端**主动连入 Gateway 监听的固定管道 `\\.\pipe\vs-mcp-gateway`；Gateway 作为 pipe server 接收所有 VS 连接，按请求把调用路由到对应 VS。（实现过程中 反转了早期方向：Gateway 做 pipe server、VS 做 client，这样 Gateway 不必枚举 PID 反向连每个 VS，多实例下更稳。）
 
 ### Architecture
 
 ```
-                                     ┌──────────────────────────────┐
-   MCP Client ──HTTP :43210─────────►│  Gateway 进程 (独立存活)       │
-                                     │  HttpListener :43210          │
-                                     │                               │
-                                     │  Session 表:                   │
-                                     │    sess-1 → PID 1234           │
-                                     │    sess-2 → PID 5678           │
-                                     │                               │
-                                     │  路由表 (VS 实例注册):           │
-                                     │    PID 1234 → pipe-1234        │
-                                     │    PID 5678 → pipe-5678        │
-                                     │                               │
-                                     │  Gateway 级工具:               │
-                                     │    list_vs_instances           │
-                                     │    select_vs_instance          │
-                                     └──────┬───────────────┬────────┘
-                            NamedPipe      │               │    NamedPipe
-                     ┌─────────────────────┘               └──────────────────┐
-                     ▼                                                        ▼
-            ┌──────────────────┐                                    ┌──────────────────┐
-            │  VS-1 (PID 1234) │                                    │  VS-2 (PID 5678) │
-            │  PipeServer      │                                    │  PipeServer      │
-            │  pipe: vs-mcp-   │                                    │  pipe: vs-mcp-   │
-            │       1234       │                                    │       5678       │
-            │  心跳 ──► Gateway │                                    │  心跳 ──► Gateway │
-            └──────────────────┘                                    └──────────────────┘
+                                     ┌───────────────────────────────┐
+   MCP 客户端 ──HTTP :43210─────────►│  VsMcpGateway.exe（独立进程）   │
+   (Claude Code /                    │  独占 127.0.0.1:43210/mcp/      │
+    Cursor / Cline / …)              │  Session 表 + VS 实例路由表      │
+                                     │  + Gateway 级工具注入           │
+                                     └──────┬───────────────┬─────────┘
+                              NamedPipe   │               │  NamedPipe
+                            (\\.\pipe\vs-mcp-gateway)       │
+                            ┌─────────────┘               └─────────────┐
+                            ▼                                           ▼
+                  ┌──────────────────┐                       ┌──────────────────┐
+                  │  VS 实例 A        │                       │  VS 实例 B        │
+                  │  PipeMcpServer    │                       │  PipeMcpServer    │
+                  │  (pipe client,    │                       │  (pipe client,    │
+                  │   主动连 gateway) │                       │   主动连 gateway) │
+                  │   └ McpRequestProcessor（共享工具/调试/符号）│   └ 同上           │
+                  └──────────────────┘                       └──────────────────┘
 ```
 
 ## Components
@@ -55,12 +46,13 @@
 - 对 MCP 客户端暴露统一的 MCP endpoint
 - 注入 Gateway 级工具（`list_vs_instances`、`select_vs_instance`）
 - 心跳检测（双向：VS→Gateway 检测 Gateway 存活；Gateway→VS 检测 VS 存活）
-- 全部 VS 实例掉线后宽限 30 秒自杀（防孤儿进程）
+- 全部 VS 实例掉线后宽限 30 秒自动退出（防残留进程）
 
 ### 2. VS 插件端改动 (VsDebuggerMcpPackage)
 
-- 移除 `HttpListener`，替换为 `NamedPipeServerStream`
-- Pipe 名称：`\\.\pipe\vs-mcp-{PID}`
+- 移除 `HttpListener`，VS 端不再开 HTTP 端口
+- 作为 **NamedPipe 客户端**主动连入 Gateway 的固定管道 `\\.\pipe\vs-mcp-gateway`（实现过程中：Gateway 做 pipe server、VS 做 client）
+- 连接建立后发首帧 `register` 自报 PID + solution info
 - 启动时检测 Gateway 是否存活，不存在则拉起
 - 向 Gateway 注册实例信息（PID、solution info）
 - 监听 `IVsSolutionEvents`，solution 变化时通知 Gateway 更新路由表
@@ -215,19 +207,15 @@ VS 实例掉线时 session 标记为 `orphaned`，下次请求返回提示。
 - 自动绑定 session → 该 VS
 - 标记 `hintPending = true`
 
-**Hint 注入**：auto-bind 后的第一次 tool call 响应中，在 `content` 数组开头插入：
+**Hint 注入**：auto-bind 后的第一次 tool call 响应中，把 hint 文本**合并到结果 content 的第一个 text block 末尾**（真实结果在前、hint 在后），而不是作为独立 content block——独立 block 曾让 agent 只读到 hint、漏读后面的真实结果：
 
 ```json
 {
   "content": [
     {
       "type": "text",
-      "text": "[VS MCP] Auto-bound to VS instance PID 1234.\n"
-              "Solution: D:\\projects\\MyApp\\MyApp.sln\n"
-              "Solution dir: D:\\projects\\MyApp\n"
-              "If you need to target a different VS instance, call list_vs_instances."
-    },
-    { "type": "text", "text": "design" }
+      "text": "<真实工具结果>\n\n[VS MCP] Auto-bound to VS instance PID 1234.\nSolution: D:\\projects\\MyApp\\MyApp.sln\nSolution dir: D:\\projects\\MyApp\nIf you need to target a different VS instance, call list_vs_instances."
+    }
   ]
 }
 ```
@@ -268,12 +256,12 @@ Example .mcp.json the user can create:
 
 **核心原则：Gateway 的生命周期不绑定到任何 VS 实例。**
 
-Windows 进程模型：子进程不会因父进程退出而自动死亡，除非父进程在 Job Object 内。`devenv.exe` 正常情况下不在 Job Object 内，因此 VS 退出后 Gateway 自然成为孤儿进程继续运行。
+Windows 进程模型：子进程不会因父进程退出而自动死亡，除非父进程在 Job Object 内。`devenv.exe` 正常情况下不在 Job Object 内，因此 VS 退出后 Gateway 自然成为残留进程继续运行。
 
 防御措施：
 1. **VS Dispose 时不杀 Gateway**：只断开 pipe 连接，不碰 Gateway 进程
 2. **`CREATE_NO_WINDOW`**：不弹 console 窗口
-3. **Gateway 主动扫描 devenv.exe**：定期检查系统是否还有 VS 进程存活，全部退出则自杀（见下文）
+3. **Gateway 主动扫描 devenv.exe**：定期检查系统是否还有 VS 进程存活，全部退出则自动退出（见下文）
 
 ### 心跳机制 (双向)
 
@@ -294,20 +282,20 @@ Gateway→VS 方向不需要显式心跳：NamedPipe 连接断开即代表 VS �
 4. bind 失败的 Gateway 进程检测到端口已被占 → 优雅退出
 5. 启动失败的 VS 实例检测到新 Gateway 已上线 → 连接过去
 
-### Gateway 自杀 (双重防护)
+### Gateway 自动退出 (双重防护)
 
 Gateway 通过两种机制检测是否应该退出：
 
 **机制 1：路由表空**（被动）
 - 所有 VS 实例的 pipe 连接断开（路由表清空）
 - 等待 30 秒宽限期
-- 期间如有新 VS 连接，取消自杀
+- 期间如有新 VS 连接，取消自动退出
 - 超时后自行退出
 
 **机制 2：主动扫描 devenv.exe**（主动，更可靠）
 - Gateway 每 10 秒扫描一次系统进程列表，检查是否还有 `devenv.exe` 在运行
-- 如果**没有任何** `devenv.exe` 进程存活，立即开始自杀倒计时（10 秒）
-- 倒计时期间如果检测到新的 `devenv.exe` 启动，取消自杀
+- 如果**没有任何** `devenv.exe` 进程存活，立即开始自动退出倒计时（10 秒）
+- 倒计时期间如果检测到新的 `devenv.exe` 启动，取消自动退出
 - 超时后自行退出
 
 ```csharp
@@ -324,19 +312,19 @@ private async Task ProcessScanLoopAsync(CancellationToken ct)
 
         if (!anyVsAlive)
         {
-            // 没有 VS 在运行, 开始/继续自杀倒计时
+            // 没有 VS 在运行, 开始/继续自动退出倒计时
             _noVsCountdown.TryStart(gracePeriod: TimeSpan.FromSeconds(10));
         }
         else
         {
-            // 有 VS 在运行, 取消自杀倒计时
+            // 有 VS 在运行, 取消自动退出倒计时
             _noVsCountdown.Cancel();
         }
     }
 }
 ```
 
-**为什么需要主动扫描？** 路由表空（机制 1）覆盖正常场景——VS 正常退出时 pipe 断开，路由表自然清空。但如果 VS 被 `taskkill /F` 强杀，或者进程崩溃导致 pipe 没有正常关闭，路由表可能残留过期条目。主动扫描 `devenv.exe` 进程是最终兜底，确保 Gateway 不会在没有任何 VS 的情况下成为永久孤儿。
+**为什么需要主动扫描？** 路由表空（机制 1）覆盖正常场景——VS 正常退出时 pipe 断开，路由表自然清空。但如果 VS 被 `taskkill /F` 强杀，或者进程崩溃导致 pipe 没有正常关闭，路由表可能残留过期条目。主动扫描 `devenv.exe` 进程是最终兜底，确保 Gateway 不会在没有任何 VS 的情况下成为长期残留。
 
 ## VS Instance Registration
 
@@ -345,7 +333,7 @@ VS 插件向 Gateway 注册时提供：
 ```json
 {
   "pid": 1234,
-  "pipeName": "\\\\.\pipe\\vs-mcp-1234",
+  "pipeName": "\\\\.\pipe\\vs-mcp-gateway",
   "solutionName": "MyApp.sln",
   "solutionDir": "D:\\projects\\MyApp",
   "solutionPath": "D:\\projects\\MyApp\\MyApp.sln",
@@ -363,7 +351,7 @@ solution 信息是动态的（用户可能在 VS 启动后才打开解决方案�
 
 ## MCP Protocol Handling
 
-Gateway 是 **MCP 感知的 multiplexer**，不是简单的 HTTP 反向代理。
+Gateway 能看懂 MCP 协议、按请求智能路由，不是哑代理（无脑转发）。
 
 ### 请求处理流程
 
@@ -400,32 +388,6 @@ Gateway 透明地给 `tools/list` 响应追加两个工具描述。VS 端完全�
 ### Streamable HTTP 兼容性
 
 Gateway 重启会导致正在执行的 tool call 的 SSE 流被截断。由于 Gateway 设计为独立存活（不随 VS 退出），重启只在极端场景（Gateway 自身 bug/crash）发生。客户端重新 `initialize` 即可恢复。
-
-## File Changes Summary
-
-### New Files
-
-| File | Description |
-|------|-------------|
-| `src/VsMcpGateway/VsMcpGateway.csproj` | Gateway 独立 exe 项目 |
-| `src/VsMcpGateway/Program.cs` | Gateway 入口, HttpListener + 路由逻辑 |
-| `src/VsMcpGateway/InstanceRegistry.cs` | VS 实例路由表管理 |
-| `src/VsMcpGateway/SessionTable.cs` | MCP session 绑定表 |
-| `src/VsMcpGateway/PipeRouter.cs` | NamedPipe 连接池 + 转发逻辑 |
-| `src/VsMcpGateway/ProcessScanner.cs` | 定期扫描 devenv.exe 进程, 无 VS 时触发自杀 |
-| `src/VsMcp/GatewayLauncher.cs` | VS 端拉起 Gateway 的逻辑 (CREATE_NO_WINDOW) |
-| `src/VsMcp/HeartbeatClient.cs` | VS 端心跳发送 + 抢占逻辑 |
-| `src/VsMcp/PipeMcpServer.cs` | VS 端 NamedPipe 替代 HttpListener |
-
-### Modified Files
-
-| File | Change |
-|------|--------|
-| `src/VsMcp/VsDebuggerMcpPackage.cs` | 用 PipeMcpServer 替换 McpHttpServer; 加入 GatewayLauncher + HeartbeatClient |
-| `src/VsMcp/McpHttpServer.cs` | 保留但重构为接受 Stream 而非 HttpListener (复用核心 MCP 逻辑) |
-| `src/VsMcp/DebuggerFacade.cs` | 加入 PID 和 solution info 查询 (IVsSolutionEvents 监听) |
-| `src/VsMcp/source.extension.vsixmanifest` | 加入 Gateway exe 作为 Asset |
-
 ## Packaging
 
 Gateway exe 打包进 VSIX 的 `<Asset>`：
@@ -435,21 +397,3 @@ Gateway exe 打包进 VSIX 的 `<Asset>`：
 ```
 
 VSIX 安装时 Gateway exe 随插件部署到同一目录。VS 启动时从 `Assembly.GetExecutingAssembly().Location` 的同目录找到它。
-
-## Decisions Log
-
-| ID | Decision | Rationale |
-|----|----------|-----------|
-| MI-01 | Gateway 是独立 exe (非 DLL 内嵌 self-extract) | 清晰、可维护；VSIX Asset 打包 |
-| MI-02 | NamedPipe 替代 per-instance HTTP | 端口不冲突；NamedPipe 断开即感知 VS 退出 |
-| MI-03 | 端口绑定作为抢占分布式锁 | 无需额外协调协议，OS 语义保证唯一性 |
-| MI-04 | 不使用 CREATE_BREAKAWAY_FROM_JOB; Gateway 靠主动扫描 devenv.exe 自杀 | VS 默认不在 Job Object 内, 无需防 Job kill; 主动进程扫描比 Job Object 处理更简单可靠, 确保无 VS 时 Gateway 不残留 |
-| MI-05 | 四层绑定优先级 (Header > Session > Auto > Intercept) | 覆盖单实例零配置到多实例精确控制全场景 |
-| MI-06 | Header 绑定是无状态的 | agent 中途换 header 不需要 select_vs_instance |
-| MI-07 | Hint 只注入一次 (auto-bind 后首次 tool call) | 避免每次调用都注入冗余信息 |
-| MI-08 | 拦截消息面向 agent→user (提示用户配置) | agent 不能修改自己的客户端配置，需引导用户操作 |
-| MI-09 | Gateway 在 tools/list 响应中注入工具 | VS 端零改动，Gateway 透明 multiplexing |
-| MI-10 | Solution info 注册时提供 + 变更时推送 | 高效缓存 + 实时更新 |
-
----
-*Created: 2026-07-02*

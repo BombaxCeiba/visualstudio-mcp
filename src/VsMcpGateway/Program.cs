@@ -65,7 +65,7 @@ namespace VsMcpGateway
             _ = Task.Run(() => PipeAcceptLoopAsync(cts.Token));
 
             // 自终止看门狗：一旦没有 VS 实例存活，Gateway 自行退出，绝不成为永久
-            // 孤儿进程（设计文档 §Gateway 自杀）。注册表清空与 devenv 扫描两种机制
+            // 残留进程（设计文档 §Gateway 自动退出）。注册表清空与 devenv 扫描两种机制
             // 都汇聚到 onSelfKill，由它直接 Environment.Exit(0) 进程。这里无法
             // 优雅地 cts.Cancel 收尾：HTTP accept 循环的 listener.GetContextAsync()
             // 不响应取消，取消会让进程卡在阻塞的 accept 上。自终止是受认可的关闭

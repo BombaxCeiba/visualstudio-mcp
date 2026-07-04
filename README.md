@@ -44,7 +44,7 @@
 - **Gateway 是独立进程**（`VsMcpGateway.exe`），随 VSIX 一起部署。VS 启动时由扩展拉起，独占 `127.0.0.1:43210`，作为所有 MCP 客户端的唯一入口。
 - **每个 VS 实例不再开 HTTP 端口**，而是开一条 NamedPipe 主动连入 Gateway（`\\.\pipe\vs-mcp-gateway`），首帧 `register` 自报 PID 与 solution 信息。这从根上消除了多实例的端口冲突。
 - **Gateway 能看懂 MCP 协议、按请求智能路由，不是哑代理（无脑转发）**：它解析每条 JSON-RPC，判断"这次调用该交给哪个 VS"（靠 `X-VS-Workspace` header、会话绑定、或单实例自动绑定——下文「多实例路由」详述），把请求精准送到目标 VS；而 `list_vs_instances` / `select_vs_instance` 这两个多实例管理工具它自己处理，并在 `tools/list` 响应里把这两个工具透明地塞进去。
-- **Gateway 的生命周期独立于任何 VS**：所有 VS 退出后它宽限自杀（防孤儿）；它自己崩溃时 VS 会抢占式拉起一个新的（端口绑定作分布式锁，保证最终只剩一个）。
+- **Gateway 的生命周期独立于任何 VS**：所有 VS 退出后它宽限自动退出（防残留）；它自己崩溃时 VS 会抢占式拉起一个新的（端口绑定作分布式锁，保证最终只剩一个）。
 
 ---
 
@@ -224,7 +224,7 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 - **MCP 感知**：Gateway 解析 JSON-RPC 的 `method`：`initialize` 生成 Gateway session-id 并捕获 VS 分配的 session-id 做双向映射；`tools/list` 转发到 VS 后在响应里注入两个路由工具；路由工具自处理不转发；其余按四层解析路由。
 - **VS 能力驱动**：扩展通过 EnvDTE / `IVsDebugger` COM 接口驱动 VS 自带的调试器，通过 VS 语言服务的 Object Model 查询符号；构建走 `SolutionBuild`，构建输出读 Output Window 的 Build 面板。所有 COM 调用都正确切换到 VS 主线程，调试会话切换时重新获取 COM 对象（避免 RCW 失效）。
 - **solution 动态更新**：VS 端订阅 `IVsSolutionEvents`，打开/关闭 solution 时主动推 `solution-changed` 帧，Gateway 路由表实时刷新，保证 ① Header 匹配和 `list_vs_instances` 不 stale。
-- **生命周期**：VS 每 5s 经 pipe 发心跳探测 Gateway，连续失联 15s 即抢占式拉起新 Gateway（端口 bind 是分布式锁，多 VS 并发拉起只存活一个）；Gateway 路由表空 30s 或扫不到 `devenv.exe` 进程 10s 即自杀，杜绝孤儿进程。
+- **生命周期**：VS 每 5s 经 pipe 发心跳探测 Gateway，连续失联 15s 即抢占式拉起新 Gateway（端口 bind 是分布式锁，多 VS 并发拉起只存活一个）；Gateway 路由表空 30s 或扫不到 `devenv.exe` 进程 10s 即自动退出，杜绝残留进程。
 
 ---
 
@@ -264,13 +264,12 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 
 ## 已知限制
 
-- **依赖 VS 运行**：工具调用需要在 VS 进程内执行；没有任何 VS 实例运行时 Gateway 会宽限后自杀，MCP 端点不可达。Gateway 不会、也无法自动启动 VS（它不知道该开哪个 solution）。
+- **依赖 VS 运行**：工具调用需要在 VS 进程内执行；没有任何 VS 实例运行时 Gateway 会宽限后自动退出，MCP 端点不可达。Gateway 不会、也无法自动启动 VS（它不知道该开哪个 solution）。
 - **`list_vs_instances` 的 `debuggerState` 暂未实时**：当前返回注册快照（多为 null），实时调试状态留待后续增强。
 - **同一 VS 实例内串行**：单个 VS 的工具调用受 VS SDK 单会话契约约束串行处理；不同 VS 实例之间可并行。
 - **切换 VS 后需重新 initialize**：`select_vs_instance` 切换到一个尚未经本 Gateway 初始化的 VS 时，下一次请求会返回"需重新 initialize"的提示（Gateway 不擅自合成 initialize）。
 - **语言覆盖**：调试器工具本身语言无关（VS 支持的都能调），核心验证场景是 C++/CMake 与 C#。
 
-端到端手动验证清单见 [MULTI-INSTANCE-VERIFY.md](./MULTI-INSTANCE-VERIFY.md)（单/多实例、四层路由、solution 动态、生命周期自杀与抢占拉起、排错）。
 
 ---
 
@@ -299,10 +298,10 @@ msbuild src\VsMcp.sln /p:Configuration=Release /p:EvalCsharpEnabled=false
   src\VsMcp.Tests\bin\Release\net48\VsMcp.Tests.dll
 ```
 
-设计文档见 [MULTI-INSTANCE-GATEWAY.md](./MULTI-INSTANCE-GATEWAY.md)。
+设计文档见 [MULTI-INSTANCE-GATEWAY.md](./docs/MULTI-INSTANCE-GATEWAY.md)。
 
 ---
 
 ## 许可证
 
-MIT（LICENSE 文件待添加）。
+Apache 2.0。

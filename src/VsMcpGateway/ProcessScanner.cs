@@ -9,7 +9,7 @@ namespace VsMcpGateway
 {
     /// <summary>
     /// Gateway 自终止看门狗。两套独立机制决定 Gateway 何时退出，让它绝不致在
-    /// 所有 Visual Studio 实例都消失后仍作为孤儿进程残留（设计文档 §Gateway 自杀
+    /// 所有 Visual Studio 实例都消失后仍作为残留进程继续运行（设计文档 §Gateway 自动退出
     /// 双重防护）：
     /// <list type="number">
     /// <item><b>被动——注册表清空。</b>一旦某个 VS 连接过然后其 pipe 断开

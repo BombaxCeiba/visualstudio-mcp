@@ -163,7 +163,7 @@ namespace VsMcp
                     // ConnectAsync 从"底层 CreateFile 建连成功"到"Task 完成 return"之间有延迟，
                     // 实测经常 >2s（connectTask.Status 一直 Running），于是连接实际已建立、却被
                     // 2s 超时打断、pipe 被 Dispose，网关端 accept 到连接却读到 EOF（register 读到
-                    // EOF）→ 注册表空 → ProcessScanner 自杀网关 → 死循环。去掉人为超时让
+                    // EOF）→ 注册表空 → ProcessScanner 自动退出网关 → 死循环。去掉人为超时让
                     // ConnectAsync 自然完成；VS 退出时 ct 取消会 Dispose pipe，ConnectAsync 随之
                     // 抛异常进入下面的 catch 退出循环。
                     using (ct.Register(() => { try { pipe.Dispose(); } catch { /* 已竞态 */ } }))
