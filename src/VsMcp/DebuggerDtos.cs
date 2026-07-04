@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using System.Threading;
 using System.Threading.Tasks;
 using ModelContextProtocol;
@@ -290,18 +292,24 @@ namespace VsMcp
     /// </summary>
     public static class SafeCall
     {
+        /// <summary>工具回复日志：若设置，每次 Wrap 返回前把 CallToolResult 的文本内容
+        /// 打到这里（VS Output "VS MCP" 面板），便于即时观察 agent 实际收到的回复。由
+        /// <see cref="McpRequestProcessor"/> 构造时注入。静态：VS 进程内通常一个 processor。</summary>
+        internal static ILogger? ReplyLogger;
+
 #pragma warning disable VSTHRD200 // "Wrap" 是 REMEDIATION/PATTERNS/plan 中确立的名称；调用方把结果 Task 交给 MCP SDK 且从不直接 await，故 "Async" 后缀会误导。
         public static async Task<object> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {
+            CallToolResult result;
             try
             {
                 // 用宽松编码器把 DTO 序列化进 CallToolResult 返回，绕过 SDK 对 DTO 的
                 // 自动序列化（它用转义中文的 McpJsonUtilities.DefaultOptions）。SDK 对
                 // CallToolResult 原样透传；最外层 wire 上的合法 \uXXXX 转义由客户端 JSON
                 // 解码还原为真实字符。详见 McpJson。
-                T result = await work().ConfigureAwait(false);
-                return McpJson.ToTextResult(result);
+                T r = await work().ConfigureAwait(false);
+                result = McpJson.ToTextResult(r);
             }
             catch (OperationCanceledException)
             {
@@ -311,17 +319,17 @@ namespace VsMcp
             }
             catch (RequireBreakModeException ex)
             {
-                return new ErrorResult("not_in_break_mode", ex.Message, ex.State).ToCallToolResult();
+                result = new ErrorResult("not_in_break_mode", ex.Message, ex.State).ToCallToolResult();
             }
             catch (BreakpointNotFoundException ex)
             {
-                return new ErrorResult("breakpoint_not_found", ex.Message).ToCallToolResult();
+                result = new ErrorResult("breakpoint_not_found", ex.Message).ToCallToolResult();
             }
             catch (FileNotInSolutionException ex)
             {
                 // file_not_in_solution 同时携带所请求的文件和已加载的解决方案，
                 // 使 agent 能核对它本应引用哪个项目树，而非默默空操作。
-                return new ErrorResult(
+                result = new ErrorResult(
                     "file_not_in_solution",
                     ex.Message,
                     File: ex.File,
@@ -331,7 +339,35 @@ namespace VsMcp
             {
                 // T-05-03-01 缓解：只有 ex.Message 传给 LLM，
                 // 绝不传 StackTrace 或固定分类标签之外的内部类型名。
-                return new ErrorResult("internal_error", ex.Message).ToCallToolResult();
+                result = new ErrorResult("internal_error", ex.Message).ToCallToolResult();
+            }
+            LogReply(result);
+            return result;
+        }
+
+        /// <summary>把 CallToolResult 的 text content 打到 <see cref="ReplyLogger"/>（VS Output
+        /// 窗口 "VS MCP" 面板），方便即时观察 agent 收到的回复。超长截断（find_symbol 等
+        /// 文本回复可达数千字符），完整内容已发给 agent，面板只看摘要。打印异常绝不影响返回。</summary>
+        private static void LogReply(CallToolResult result)
+        {
+            var logger = ReplyLogger;
+            if (logger == null) return;
+            try
+            {
+                var sb = new StringBuilder();
+                foreach (var c in result.Content)
+                {
+                    if (c is TextContentBlock t && !string.IsNullOrEmpty(t.Text))
+                        sb.Append(t.Text);
+                }
+                if (sb.Length == 0) return;
+                // 原样打印，绝不截断——面板看到的必须和 agent 收到的完全一致，
+                // 否则失去"立即观察 agent 实际收到的内容"的意义。
+                logger.LogInformation("← MCP 回复：\n{text}", sb.ToString());
+            }
+            catch
+            {
+                // 打印绝不能影响工具返回路径
             }
         }
     }

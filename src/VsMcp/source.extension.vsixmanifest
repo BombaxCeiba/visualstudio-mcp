@@ -3,7 +3,7 @@
     xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"
     xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Id="VsMcp.d7a3e1f5-9b2c-4d86-a5e0-3c1f7b8e2d4a" Version="1.36" Language="en-US" Publisher="VsMcp" />
+    <Identity Id="VsMcp.d7a3e1f5-9b2c-4d86-a5e0-3c1f7b8e2d4a" Version="1.37" Language="en-US" Publisher="VsMcp" />
     <DisplayName>Visual Studio MCP</DisplayName>
     <Description>Embeds an MCP server so AI agents can drive the Visual Studio debugger</Description>
   </Metadata>

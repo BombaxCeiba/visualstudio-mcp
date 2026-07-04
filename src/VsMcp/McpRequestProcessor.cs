@@ -81,6 +81,9 @@ namespace VsMcp
             _enableEvalCsharp = enableEvalCsharp;
 #endif
             _loggerFactory = loggerFactory;
+            // 注入工具回复日志：SafeCall.Wrap 每次返回前把 CallToolResult 文本打到
+            // VS Output "VS MCP" 面板，便于即时观察 agent 实际收到的回复。
+            SafeCall.ReplyLogger = loggerFactory?.CreateLogger("McpReply");
 
             _transport = new StreamableHttpServerTransport(loggerFactory);
             _externalCts = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
