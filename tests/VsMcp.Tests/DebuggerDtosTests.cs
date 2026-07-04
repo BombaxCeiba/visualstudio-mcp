@@ -9,15 +9,14 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// COM-free snapshot tests for every typed DTO in DebuggerDtos.cs.
-    /// Asserts on the parsed JSON structure (not substrings) so the
-    /// F-14 substring-assertion weakness is resolved: if a field name
-    /// drifts or a key collapses (e.g. status->state per D-11/F-15),
-    /// these tests fail loudly with a structural diff.
+    /// DebuggerDtos.cs 中每个类型化 DTO 的无 COM 快照测试。
+    /// 断言基于解析后的 JSON 结构（而非子串），从而解决 F-14 的子串断言
+    /// 弱点：若字段名漂移或键合并（如依 D-11/F-15 的 status->state），
+    /// 这些测试会以结构差异显式失败。
     /// </summary>
     public class DebuggerDtosTests
     {
-        // --- camelCase serialization (McpJsonUtilities.DefaultOptions is Web defaults) ---
+        // --- camelCase 序列化（McpJsonUtilities.DefaultOptions 是 Web 默认值） ---
 
         [Fact]
         public void DebuggerStateResult_SerializesToCamelCaseState()
@@ -32,8 +31,8 @@ namespace VsMcp.Tests
         [Fact]
         public void ExecutionResult_UsesState_NotStatus()
         {
-            // D-11 / F-15: the inconsistent state/status/debugger_state keys
-            // collapse to a single "state" field. This is the regression guard.
+            // D-11 / F-15：不一致的 state/status/debugger_state 键合并为单个
+            // "state" 字段。这是回归守卫。
             var json = JsonSerializer.Serialize(new ExecutionResult("running", "ok"),
                                                 McpJsonUtilities.DefaultOptions);
             using var doc = JsonDocument.Parse(json);
@@ -95,10 +94,8 @@ namespace VsMcp.Tests
         [Fact]
         public void ExpressionInfo_NullValueAndHint_OmitOrSerializeAsNull()
         {
-            // RESEARCH Pitfall #4: McpJsonUtilities is Web defaults; null
-            // reference fields may be omitted. Either behavior is acceptable
-            // as long as no exception is thrown and the non-null fields
-            // survive the round-trip.
+            // RESEARCH 陷阱 #4：McpJsonUtilities 是 Web 默认值；null 引用字段
+            // 可能被省略。只要不抛异常且非 null 字段能往返，两种行为都接受。
             var dto = new ExpressionInfo(
                 Name: "x", Type: "int", Value: null, Error: false,
                 HasChildren: false, Children: new List<ExpressionInfo>(),
@@ -107,10 +104,10 @@ namespace VsMcp.Tests
             using var doc = JsonDocument.Parse(json);
             Assert.Equal("x", doc.RootElement.GetProperty("name").GetString());
             Assert.Equal("int", doc.RootElement.GetProperty("type").GetString());
-            // No exception thrown is the primary assertion here.
+            // 此处主要断言是不抛异常。
         }
 
-        // --- ErrorResult.ToCallToolResult contract (D-12) ---
+        // --- ErrorResult.ToCallToolResult 契约（D-12） ---
 
         [Fact]
         public void ErrorResult_ToCallToolResult_SetsIsError_AndSerializesErrorContract()
@@ -131,10 +128,9 @@ namespace VsMcp.Tests
         [Fact]
         public void ErrorResult_ToCallToolResult_StateNull_DoesNotThrowAndSetsIsError()
         {
-            // Default-null State (ErrorResult.State = null): the serialized
-            // JSON may omit "state" OR emit it as null (Web-default behavior).
-            // The contract assertion is: IsError is true, error field is set,
-            // and no exception propagates regardless of state presence.
+            // State 默认为 null（ErrorResult.State = null）：序列化后的 JSON
+            // 可能省略 "state" 或发为 null（Web 默认行为）。契约断言是：
+            // IsError 为 true、error 字段已设置，且无论 state 是否存在都不抛异常。
             var result = new ErrorResult("internal_error", "x").ToCallToolResult();
 
             Assert.True(result.IsError);
@@ -142,7 +138,7 @@ namespace VsMcp.Tests
             using var doc = JsonDocument.Parse(block.Text);
             Assert.Equal("internal_error", doc.RootElement.GetProperty("error").GetString());
             Assert.Equal("x", doc.RootElement.GetProperty("message").GetString());
-            // state may or may not be present — both are valid. Do not assert on it.
+            // state 可能存在也可能不存在 —— 两者都合法。不要对它断言。
         }
     }
 }

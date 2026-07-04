@@ -62,9 +62,9 @@ namespace VsMcp.Tests
         public async Task ReadFrame_Throws_OnTruncatedBody()
         {
             using var ms = new MemoryStream();
-            // Header claims 12 bytes of body...
+            // 头部声明 12 字节帧体……
             ms.Write(new byte[] { 0, 0, 0, 12 }, 0, 4);
-            // ...but only 2 are present (peer closed mid-frame).
+            // ……但只写入了 2 字节（对端在帧中途关闭）。
             ms.Write(new byte[] { (byte)'{', (byte)'}' }, 0, 2);
             ms.Position = 0;
 
@@ -74,12 +74,12 @@ namespace VsMcp.Tests
 
         [Theory]
         [InlineData(0)]
-        [InlineData(1)] // length 0 is invalid by itself; length>Max also invalid
+        [InlineData(1)] // length 为 0 本身就非法；length>Max 同样非法
         public async Task ReadFrame_Throws_OnOutOfRangeLength(int bytesOverZero)
         {
             using var ms = new MemoryStream();
-            // Encode a length just above MaxFrameBytes to trip the guard. Using the
-            // exact boundary keeps the test fast (no giant allocation).
+            // 编码一个刚好超过 MaxFrameBytes 的长度以触发越界保护。用精确
+            // 边界值可保持测试快速（无需巨大分配）。
             int len = PipeFraming.MaxFrameBytes + 1;
             ms.Write(new byte[]
             {
@@ -119,7 +119,7 @@ namespace VsMcp.Tests
             PipeFraming.WriteFrame(ms, new PipeResponseHead { Id = "h1", Status = 200 });
 
             ms.Position = 0;
-            // Synchronous WriteFrame must produce a frame the async reader accepts.
+            // 同步 WriteFrame 产生的帧必须能被异步读取端接受。
             var head = PipeFraming.ReadFrameAsync<PipeResponseHead>(ms, default).GetAwaiter().GetResult();
             Assert.NotNull(head);
             Assert.Equal("h1", head!.Id);

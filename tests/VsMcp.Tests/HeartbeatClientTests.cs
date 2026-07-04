@@ -11,10 +11,9 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// HeartbeatClient loop logic. Every timer is ms-scale (mirrors the
-    /// KeepAliveNotifierTests pattern) so each test finishes in well under a
-    /// second. The send and relaunch entry points are injected delegates, so no
-    /// real pipe or Gateway process is spawned.
+    /// HeartbeatClient 循环逻辑。每个计时器都是毫秒级（沿用 KeepAliveNotifierTests
+    /// 的模式），使每个测试在远不到一秒内完成。发送和重启入口是注入的委托，
+    /// 所以不会启动真实 pipe 或 Gateway 进程。
     /// </summary>
     public class HeartbeatClientTests
     {
@@ -62,7 +61,7 @@ namespace VsMcp.Tests
                 deadThreshold: TimeSpan.FromMilliseconds(60),
                 callerToken: done.Token);
 
-            // Block until the first relaunch fires (3 misses at 20ms = 60ms window).
+            // 阻塞直到首次重启触发（20ms 下 3 次 miss = 60ms 窗口）。
             await gate.Task.WaitForAsync(OpTimeoutMs);
             client.Dispose();
 
@@ -72,10 +71,9 @@ namespace VsMcp.Tests
         [Fact]
         public async Task Mid_Sequence_Success_Resets_Miss_Count()
         {
-            // Fail twice (below the 3-miss threshold of 60ms), then succeed. The
-            // success must reset failCount to 0 so two subsequent failures (which
-            // never happen here) would still need a full 3-miss window. No relaunch
-            // should ever fire.
+            // 失败两次（低于 60ms 的 3-miss 阈值），然后成功。成功必须把
+            // failCount 重置为 0，这样后续两次失败（此处不会发生）仍需完整
+            // 3-miss 窗口。不应触发任何重启。
             int launches = 0;
             int sends = 0;
             using var done = new CancellationTokenSource(OpTimeoutMs);
@@ -84,8 +82,8 @@ namespace VsMcp.Tests
                 sendHeartbeat: ct =>
                 {
                     int n = Interlocked.Increment(ref sends);
-                    if (n <= 2) throw new IOException("miss"); // first 2 fail
-                    return Task.CompletedTask;                  // rest succeed
+                    if (n <= 2) throw new IOException("miss"); // 前 2 次失败
+                    return Task.CompletedTask;                  // 其余成功
                 },
                 ensureGatewayRunning: ct => { Interlocked.Increment(ref launches); return Task.FromResult(true); },
                 interval: TimeSpan.FromMilliseconds(20),
@@ -117,12 +115,12 @@ namespace VsMcp.Tests
                 await Task.Delay(5);
 
             client.Dispose();
-            client.Dispose(); // idempotent — must not throw
+            client.Dispose(); // 幂等 —— 不得抛异常
 
             int snapshot = sends;
             await Task.Delay(120);
-            // At most one in-flight send may complete after Dispose (the loop
-            // observes cancellation on its next Task.Delay).
+            // Dispose 后最多一次在途发送可能完成（循环在下一次 Task.Delay
+            // 时观察到取消）。
             Assert.True(sends - snapshot <= 1, $"loop kept running after Dispose: {sends - snapshot} extra sends");
         }
 

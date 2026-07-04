@@ -16,18 +16,20 @@ using ModelContextProtocol;
 namespace VsMcp
 {
     /// <summary>
-    /// Facade over the VS debugger COM surface. All 14 public methods return
-    /// typed record DTOs (see <see cref="DebuggerDtos"/>) and throw typed
-    /// exceptions (<see cref="RequireBreakModeException"/> /
-    /// <see cref="BreakpointNotFoundException"/>) instead of building JSON
-    /// strings. The hand-rolled JSON layer (the four helpers previously
-    /// living in this file) has been removed; error routing is centralized
-    /// in <see cref="SafeCall"/>.
+    /// VS 调试器 COM 层的 Facade。全部 14 个公开方法返回
+    /// 有类型的 record DTO（见 <see cref="DebuggerDtos"/>），并抛出有类型的
+    /// 异常（<see cref="RequireBreakModeException"/> /
+    /// <see cref="BreakpointNotFoundException"/>），而非拼装 JSON
+    /// 字符串。手写的 JSON 层（原先位于本文件的四个辅助方法）
+    /// 已移除；错误路由统一集中在 <see cref="SafeCall"/>。
     /// </summary>
     public sealed class DebuggerFacade : IDisposable
     {
         private const int MaxFrames = 50;
         private const int DefaultCharBudget = 1024;
+        // list_local_variables 返回 local 数量的上限，超过则标 Truncated——
+        // 防止上千 local 的栈帧即便浅层模式也撑爆上下文。
+        private const int DefaultLocalCap = 200;
 
         private readonly AsyncPackage _package;
         private DTE2? _dte;
@@ -47,13 +49,49 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Acquires <see cref="IVsDebugger2"/> from the <c>SVsShellDebugger</c>
-        /// service. IVsDebugger2 is preferred over IVsDebugger (v1): the v1
-        /// interface's OLE marshaler is unavailable off the STA thread, causing
-        /// QI to fail with E_NOINTERFACE, whereas IVsDebugger2 (shipping since
-        /// VS 2005) has robust marshaling and QI succeeds. Re-acquired on every
-        /// call rather than cached: switching debug sessions replaces the
-        /// underlying COM object.
+        /// 读取当前解决方案的（路径、目录）。优先使用
+        /// <see cref="IVsSolution"/>（更底层的 SDK 接口，支撑
+        /// .sln、.slnx 以及 Open Folder / CMake），并以
+        /// <c>DTE.Solution.FullName</c> 作为边缘情况的兜底。DTE 的自动化
+        /// 模型对 <c>.slnx</c>（新的 XML 格式）和 Open Folder 返回空
+        /// ——这是一个已知缺口——因此 IVsSolution 必须作为权威来源。对于 Open Folder，
+        /// GetSolutionInfo 只返回目录而无解决方案文件；此时以目录
+        /// 作为路径标识。
+        /// </summary>
+        internal static (string? Path, string? Dir) ReadSolutionPaths(IVsSolution? vsSolution, DTE2? dte)
+        {
+            if (vsSolution != null)
+            {
+                try
+                {
+                    vsSolution.GetSolutionInfo(out string sDir, out string sFile, out string _);
+                    if (!string.IsNullOrWhiteSpace(sFile))
+                        return (sFile, string.IsNullOrWhiteSpace(sDir) ? null : sDir);
+                    if (!string.IsNullOrWhiteSpace(sDir))
+                        return (sDir, sDir); // Open Folder：无 .sln，以文件夹作为标识
+                }
+                catch { /* 尽力而为，忽略错误 */ }
+            }
+            if (dte != null)
+            {
+                try
+                {
+                    string full = dte.Solution?.FullName ?? "";
+                    if (!string.IsNullOrWhiteSpace(full))
+                        return (full, Path.GetDirectoryName(full));
+                }
+                catch { /* 尽力而为，忽略错误 */ }
+            }
+            return (null, null);
+        }
+
+        /// <summary>
+        /// 从 <c>SVsShellDebugger</c> 服务获取 <see cref="IVsDebugger2"/>。
+        /// 优先选用 IVsDebugger2 而非 IVsDebugger（v1）：v1
+        /// 接口的 OLE marshaler 在离开 STA 线程时不可用，会导致
+        /// QI 以 E_NOINTERFACE 失败；而 IVsDebugger2（自
+        /// VS 2005 起即存在）拥有健壮的封送，QI 可成功。每次调用都重新获取而非缓存：
+        /// 切换调试会话会替换底层的 COM 对象。
         /// </summary>
         private async Task<IVsDebugger2> GetVsDebugger2Async(CancellationToken ct)
         {
@@ -70,10 +108,9 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Surfaces the solution VS has loaded plus a best-effort debug target
-        /// so the agent knows which project tree it is operating on before
-        /// issuing breakpoint / inspection calls. Never throws on missing
-        /// solution or debug target — returns null / empty lists instead.
+        /// 暴露 VS 已加载的解决方案以及尽力而为的调试目标，
+        /// 让 agent 在发起断点/检视调用之前知道它正在操作哪个项目树。
+        /// 缺少解决方案或调试目标时绝不抛异常——而是返回 null / 空列表。
         /// </summary>
         public async Task<SessionInfoResult> GetSessionInfoAsync(CancellationToken ct)
         {
@@ -86,19 +123,22 @@ namespace VsMcp
 
             string state = await StateFromModeAsync(ct);
 
-            // Solution.FullName is "" when no solution is loaded.
-            string solutionPath = dte.Solution?.FullName ?? "";
-            string? resolvedSolutionPath = string.IsNullOrWhiteSpace(solutionPath) ? null : solutionPath;
-            string? solutionDir = null;
+            // IVsSolution 是 .sln/.slnx/Open Folder 的权威来源；DTE.Solution.FullName
+            // 对 .slnx + 文件夹为空（已知的自动化模型缺口）。
+            var vsSolution = await _package.GetServiceAsync(typeof(SVsSolution)) as IVsSolution;
+            var (resolvedSolutionPath, solutionDir) = ReadSolutionPaths(vsSolution, dte);
             var projects = new List<string>();
 
             if (resolvedSolutionPath != null)
             {
-                try { solutionDir = Path.GetDirectoryName(resolvedSolutionPath); }
-                catch { solutionDir = null; }
+                if (solutionDir == null)
+                {
+                    try { solutionDir = Path.GetDirectoryName(resolvedSolutionPath); }
+                    catch { solutionDir = null; }
+                }
 
-                // dte.Solution.Projects is a COM collection; guard against
-                // null/empty (no solution loaded) without throwing.
+                // dte.Solution.Projects 是一个 COM 集合；防范
+                // null/空（未加载解决方案）而不抛异常。
                 var dteProjects = dte.Solution?.Projects;
                 if (dteProjects != null)
                 {
@@ -107,9 +147,9 @@ namespace VsMcp
                         try
                         {
                             var project = dteProjects.Item(i);
-                            // Prefer FullName (full project path); fall back to
-                            // Name (unique project name) for solution-folder /
-                            // virtual projects where FullName is empty.
+                            // 优先用 FullName（完整项目路径）；对于解决方案文件夹 /
+                            // FullName 为空的虚拟项目，回退到
+                            // Name（唯一项目名）。
                             string id = !string.IsNullOrWhiteSpace(project.FullName)
                                 ? project.FullName
                                 : (project.Name ?? "");
@@ -118,16 +158,16 @@ namespace VsMcp
                         }
                         catch
                         {
-                            // A single unloadable project must not abort the
-                            // whole enumeration — skip it.
+                            // 单个无法加载的项目不得中止
+                            // 整个枚举——跳过它。
                         }
                     }
                 }
             }
 
-            // Best-effort debug target: CurrentProgram is only meaningful in
-            // break/run mode; in design mode it is null. Any COM hiccups are
-            // swallowed — the field is informational, not load-bearing.
+            // 尽力而为的调试目标：CurrentProgram 仅在
+            // 断点/运行模式下有意义；设计模式下为 null。任何 COM 抖动都被
+            // 吞掉——该字段是信息性的，非关键路径。
             string? debugTarget = null;
             try
             {
@@ -147,20 +187,20 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Enumerates the projects in the currently loaded solution, recursing
-        /// through Solution Folders. Each project surfaces its Name, UniqueName,
-        /// FullName (the .csproj/.vcxproj path), Kind (the project-type GUID —
-        /// lets the caller distinguish C++ vs C# etc.), whether it is the
-        /// startup project, and a best-effort <c>OutputTarget</c> (the built
-        /// executable path) so <c>start_debugging</c> has something to launch.
-        /// OutputTarget resolution is wrapped per-project in try/catch — a
-        /// single project whose properties cannot be read (C++/vcxproj,
-        /// solution folders, unloaded) contributes a null and never aborts the
-        /// whole enumeration.
+        /// 枚举当前已加载解决方案中的项目，递归遍历
+        /// Solution Folders。每个项目暴露其 Name、UniqueName、
+        /// FullName（.csproj/.vcxproj 路径）、Kind（项目类型 GUID——
+        /// 让调用方区分 C++ 还是 C# 等）、是否为
+        /// 启动项目，以及尽力而为的 <c>OutputTarget</c>（构建出的
+        /// 可执行文件路径），让 <c>start_debugging</c> 有东西可启动。
+        /// OutputTarget 解析按项目包裹在 try/catch 中——
+        /// 单个无法读取属性的项目（C++/vcxproj、
+        /// 解决方案文件夹、已卸载）贡献 null，绝不中止
+        /// 整个枚举。
         /// </summary>
-        /// <param name="query">Optional case-insensitive substring filter
-        /// applied to Name / UniqueName / FullName. Null or empty returns all
-        /// projects.</param>
+        /// <param name="query">可选的不区分大小写的子串过滤器，
+        /// 作用于 Name / UniqueName / FullName。为 null 或空时返回全部
+        /// 项目。</param>
         public async Task<ProjectSearchResult> SearchProjectsAsync(string? query, CancellationToken ct)
         {
             ThrowIfDisposed();
@@ -170,24 +210,24 @@ namespace VsMcp
             if (dte == null)
                 throw new InvalidOperationException("DTE service is not available");
 
-            // No solution loaded → empty result (distinct from a solution with
-            // zero projects, which is effectively impossible).
+            // 未加载解决方案 → 空结果（区别于
+            // 零项目的解决方案，后者实际上不可能）。
             var solution = dte.Solution;
             if (solution == null || string.IsNullOrWhiteSpace(solution.FullName))
                 return new ProjectSearchResult(new List<ProjectInfo>(), Total: 0);
 
-            // Snapshot the startup-project array once. SolutionBuild returns an
-            // object (a SAFEARRAY of VARIANTs in COM terms); cast each element
-            // to the project's UniqueName. Wrapped in try/catch because the
-            // property can throw if the solution has not finished loading its
-            // build state.
+            // 一次性快照启动项目数组。SolutionBuild 返回一个
+            // object（COM 术语中的 VARIANT SAFEARRAY）；将每个元素
+            // 转为项目的 UniqueName。包裹在 try/catch 中，因为
+            // 解决方案尚未加载完其构建状态时该
+            // 属性可能抛异常。
             var startupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 if (solution.SolutionBuild?.StartupProjects is object startArr)
                 {
-                    // The COM collection is IEnumerable; iterate it. Each entry
-                    // is the project's UniqueName (a string), not a Project.
+                    // COM 集合是 IEnumerable；直接遍历。每个条目
+                    // 是项目的 UniqueName（字符串），而非 Project。
                     foreach (var entry in (System.Collections.IEnumerable)startArr)
                     {
                         if (entry is string s && !string.IsNullOrEmpty(s))
@@ -197,29 +237,29 @@ namespace VsMcp
             }
             catch
             {
-                // Startup-projects enumeration is best-effort; a transient COM
-                // failure must not break the full project listing.
+                // 启动项目枚举是尽力而为的；偶发的 COM
+                // 失败不得破坏完整的项目列表。
             }
 
             var results = new List<ProjectInfo>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Recursive walk: Solution Folders (vsProjectKindSolutionFolder)
-            // contain child Projects via ProjectItems.SubProject. Each SubProject
-            // may itself be another folder, hence the recursion.
+            // 递归遍历：Solution Folders（vsProjectKindSolutionFolder）
+            // 通过 ProjectItems.SubProject 包含子项目。每个 SubProject
+            // 本身可能又是另一个文件夹，因此需要递归。
             void Visit(Project project)
             {
                 try
                 {
                     string? uniqueName = null;
-                    try { uniqueName = project.UniqueName; } catch { /* some project kinds throw */ }
+                    try { uniqueName = project.UniqueName; } catch { /* 某些项目类型会抛异常 */ }
                     string? name = project.Name;
                     string? fullName = null;
-                    try { fullName = project.FullName; } catch { /* FullName empty for unloaded/misc */ }
+                    try { fullName = project.FullName; } catch { /* 已卸载/杂项项目 FullName 为空 */ }
 
-                    // Dedup by UniqueName when present (a project can appear
-                    // under multiple parents in some solution shapes); fall
-                    // back to FullName/name for virtual projects without one.
+                    // 存在 UniqueName 时按其去重（某些解决方案形态下
+                    // 同一项目会出现在多个父节点下）；对于没有 UniqueName 的
+                    // 虚拟项目，回退到 FullName/name。
                     string dedupKey = !string.IsNullOrEmpty(uniqueName)
                         ? uniqueName!
                         : (!string.IsNullOrEmpty(fullName) ? fullName! : (name ?? Guid.NewGuid().ToString()));
@@ -227,7 +267,7 @@ namespace VsMcp
                         return;
 
                     string? kind = null;
-                    try { kind = project.Kind; } catch { /* leave null */ }
+                    try { kind = project.Kind; } catch { /* 留空为 null */ }
 
                     bool isStartup = uniqueName != null && startupNames.Contains(uniqueName);
                     string? outputTarget = ResolveOutputTargetInline(project);
@@ -242,11 +282,11 @@ namespace VsMcp
                 }
                 catch
                 {
-                    // A single project whose properties cannot be enumerated is
-                    // skipped — never aborts the whole walk.
+                    // 单个无法枚举属性的项目被
+                    // 跳过——绝不中止整个遍历。
                 }
 
-                // Recurse into Solution Folder children.
+                // 递归进入 Solution Folder 的子项目。
                 try
                 {
                     if (string.Equals(project.Kind, SolutionFolderKindGuid,
@@ -262,12 +302,12 @@ namespace VsMcp
                                     var sub = items.Item(i).SubProject;
                                     if (sub != null) Visit(sub);
                                 }
-                                catch { /* skip unvisitable child */ }
+                                catch { /* 跳过无法访问的子项 */ }
                             }
                         }
                     }
                 }
-                catch { /* folder recursion failure is non-fatal */ }
+                catch { /* 文件夹递归失败非致命 */ }
             }
 
             try
@@ -278,17 +318,17 @@ namespace VsMcp
                     for (int i = 1; i <= dteProjects.Count; i++)
                     {
                         try { Visit(dteProjects.Item(i)); }
-                        catch { /* skip */ }
+                        catch { /* 跳过 */ }
                     }
                 }
             }
             catch
             {
-                // Top-level enumeration failure — return whatever we collected.
+                // 顶层枚举失败——返回已收集到的内容。
             }
 
-            // Apply the optional query substring filter (case-insensitive)
-            // against Name / UniqueName / FullName.
+            // 应用可选的查询子串过滤器（不区分大小写），
+            // 作用于 Name / UniqueName / FullName。
             if (!string.IsNullOrWhiteSpace(query))
             {
                 string q = query!.Trim();
@@ -300,20 +340,20 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Best-effort resolution of a project's built executable path.
-        /// Strategy: pull ConfigurationManager.ActiveConfiguration, then read
-        /// OutputPath (a directory, possibly relative) and the project's
-        /// OutputFileName (the binary name with extension). Combine relative
-        /// to the project directory. This works for C#/VB/F# managed
-        /// projects. For C++/vcxproj and other kinds these properties either
-        /// don't exist or throw — caught here and returns null. The caller
-        /// (search_project, already on the UI thread) treats null as "no
-        /// resolvable target"; start_debugging takes an absolute exe path
-        /// directly so a null here is never fatal.
-        /// ThreadHelper.ThrowIfNotOnUIThread is the explicit main-thread
-        /// assertion the VSTHRD010 analyzer recognizes for static helpers
-        /// (the call is a no-op in practice — SearchProjectsAsync has already
-        /// switched to the UI thread before recursing into projects).
+        /// 尽力而为地解析项目构建出的可执行文件路径。
+        /// 策略：取 ConfigurationManager.ActiveConfiguration，再读取
+        /// OutputPath（一个目录，可能是相对路径）以及项目的
+        /// OutputFileName（带扩展名的二进制名）。相对于
+        /// 项目目录进行组合。这对 C#/VB/F# 托管
+        /// 项目有效。对于 C++/vcxproj 及其他类型，这些属性要么
+        /// 不存在要么会抛异常——在此捕获并返回 null。调用方
+        ///（search_project，已在 UI 线程上）将 null 视为"无可解析
+        /// 目标"；start_debugging 直接接收绝对 exe 路径，
+        /// 因此此处为 null 永远不会致命。
+        /// ThreadHelper.ThrowIfNotOnUIThread 是 VSTHRD010 分析器针对静态辅助方法
+        /// 识别的显式主线程断言
+        ///（该调用实际是空操作——SearchProjectsAsync 在递归进入项目之前
+        /// 已切换到 UI 线程）。
         /// </summary>
         private static string? ResolveOutputTargetInline(Project project)
         {
@@ -327,20 +367,20 @@ namespace VsMcp
                 var props = activeCfg.Properties;
                 if (props == null) return null;
 
-                // OutputPath is the output directory; may be relative
-                // ("bin\Release\") or absolute. OutputFileName is the binary
-                // name with extension ("MyApp.exe"). Both are 1-based COM
-                // Property items accessed by name.
+                // OutputPath 是输出目录；可能是相对路径
+                //（"bin\Release\"）或绝对路径。OutputFileName 是带扩展名的
+                // 二进制名（"MyApp.exe"）。两者都是按名称访问的、
+                // 从 1 开始计数的 COM Property 项。
                 string? outputPath = ReadProperty(props, "OutputPath");
                 string? outputFileName = null;
                 try { outputFileName = project.Properties?.Item("OutputFileName")?.Value as string; }
-                catch { /* C++/others don't expose OutputFileName */ }
+                catch { /* C++/其他类型不暴露 OutputFileName */ }
 
                 if (string.IsNullOrWhiteSpace(outputPath) || string.IsNullOrWhiteSpace(outputFileName))
                     return null;
 
-                // Resolve the output directory relative to the project
-                // directory (FullName is the .csproj path).
+                // 相对于项目目录解析输出目录
+                //（FullName 是 .csproj 路径）。
                 string? projectDir = null;
                 try { projectDir = Path.GetDirectoryName(project.FullName); } catch { }
                 if (string.IsNullOrEmpty(projectDir)) return null;
@@ -354,16 +394,16 @@ namespace VsMcp
             }
             catch
             {
-                // Any COM/EnvDTE hiccup → null. The whole point of this helper
-                // is that it must never throw (search_project invariants).
+                // 任何 COM/EnvDTE 抖动 → null。这个辅助方法的全部意义
+                // 就在于它绝不抛异常（search_project 的不变式）。
                 return null;
             }
         }
 
         /// <summary>
-        /// Reads a named property from an EnvDTE Properties COM collection,
-        /// returning null if the property does not exist or throws (some
-        /// project kinds lack OutputPath entirely).
+        /// 从 EnvDTE Properties COM 集合中读取命名属性，
+        /// 属性不存在或抛异常时返回 null（某些
+        /// 项目类型完全没有 OutputPath）。
         /// </summary>
         private static string? ReadProperty(EnvDTE.Properties props, string name)
         {
@@ -386,48 +426,48 @@ namespace VsMcp
         }
 
         // =====================================================================
-        // start_debugging — launches an arbitrary exe through VS's native
-        // IVsDebugger2.LaunchDebugTargets2 path. Does NOT touch project config,
-        // launchSettings.json, or vcxproj files. C++ defaults to the native
-        // engine; pass DebugEngine="managed" for CLR/.NET debugging, or a raw
-        // GUID string for any other engine. All params are used in-memory for
-        // this single launch call (nothing is persisted).
+        // start_debugging —— 通过 VS 原生的
+        // IVsDebugger2.LaunchDebugTargets2 路径启动任意 exe。不触碰项目配置、
+        // launchSettings.json 或 vcxproj 文件。C++ 默认使用本机
+        // 引擎；传入 DebugEngine="managed" 进行 CLR/.NET 调试，或传入原始
+        // GUID 字符串指定其他引擎。所有参数仅用于本次内存中的
+        // 单次启动调用（不持久化任何内容）。
         // =====================================================================
 
         private static readonly Guid NativeDebugEngineGuid = VSConstants.DebugEnginesGuids.NativeOnly_guid;
         private static readonly Guid ManagedDebugEngineGuid = VSConstants.DebugEnginesGuids.ManagedOnly_guid;
 
         /// <summary>
-        /// The project Kind GUID for Solution Folders (virtual containers, not
-        /// real build projects). Hardcoded because EnvDTE.Constants exposes
-        /// this under different names across versions (vsProjectKindSolutionFolder
-        /// in some, vsProjectKindSolutionItems in the Microsoft.VisualStudio.Interop
-        /// assembly this repo references) — the GUID itself is stable.
+        /// Solution Folders（虚拟容器，并非
+        /// 真正的构建项目）的项目 Kind GUID。硬编码是因为 EnvDTE.Constants 在
+        /// 不同版本下以不同名称暴露它（某些版本为 vsProjectKindSolutionFolder，
+        /// 本仓库引用的 Microsoft.VisualStudio.Interop
+        /// 程序集中为 vsProjectKindSolutionItems）——而 GUID 本身是稳定的。
         /// </summary>
         private const string SolutionFolderKindGuid = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
 
         /// <summary>
-        /// Launches an executable under the VS debugger via
-        /// <see cref="IVsDebugger2.LaunchDebugTargets2"/>. This is VS's own
-        /// "start debugging target" primitive — it feeds the exe path,
-        /// arguments, working directory, environment block, and debug engine
-        /// straight to CreateProcess + the selected engine, with zero
-        /// dependency on project/solution configuration. Same path for native
-        /// C++, managed C#, and an arbitrary standalone exe.
+        /// 通过 <see cref="IVsDebugger2.LaunchDebugTargets2"/> 在 VS 调试器下
+        /// 启动可执行文件。这是 VS 自己的
+        /// "启动调试目标"原语——它把 exe 路径、
+        /// 参数、工作目录、环境块和调试引擎
+        /// 直接送进 CreateProcess + 所选引擎，零
+        /// 依赖项目/解决方案配置。原生 C++、
+        /// 托管 C# 以及任意独立 exe 走同一路径。
         /// </summary>
-        /// <param name="startProgram">Absolute path to the exe to debug (the
-        /// "target"). Required.</param>
-        /// <param name="startArguments">Optional command-line arguments passed
-        /// to the exe.</param>
-        /// <param name="environmentVariablesJson">Optional JSON object string
-        /// of environment variables to set on the launched process
-        /// (e.g. <c>{"PATH":"...","MY_VAR":"1"}</c>). Null or empty inherits
-        /// the parent (VS) environment.</param>
-        /// <param name="workingDirectory">Optional working directory; defaults
-        /// to the exe's directory when null/empty.</param>
-        /// <param name="debugEngine">Engine selector: <c>"native"</c> (default;
-        /// the C/C++ native engine), <c>"managed"</c> (the .NET CLR engine), or
-        /// a raw debug-engine GUID string for any other engine.</param>
+        /// <param name="startProgram">要调试的 exe 的绝对路径（即
+        /// "目标"）。必填。</param>
+        /// <param name="startArguments">可选的命令行参数，传给
+        /// 该 exe。</param>
+        /// <param name="environmentVariablesJson">可选的 JSON 对象字符串，
+        /// 表示要在启动的进程上设置的环境变量
+        ///（例如 <c>{"PATH":"...","MY_VAR":"1"}</c>）。为 null 或空时
+        /// 继承父进程（VS）的环境。</param>
+        /// <param name="workingDirectory">可选的工作目录；为 null/空时
+        /// 默认为 exe 所在目录。</param>
+        /// <param name="debugEngine">引擎选择器：<c>"native"</c>（默认；
+        /// C/C++ 本机引擎）、<c>"managed"</c>（.NET CLR 引擎），或
+        /// 任意其他引擎的原始调试引擎 GUID 字符串。</param>
         public async Task<StartDebuggingResult> StartDebuggingAsync(
             string startProgram,
             string? startArguments,
@@ -444,12 +484,12 @@ namespace VsMcp
 
             var warnings = new List<string>();
 
-            // --- Parse the debug engine selection -------------------------------
+            // --- 解析调试引擎选择 -----------------------------------------------
             // "native" → VSConstants.DebugEnginesGuids.NativeOnly_guid
             //            ({3B476D35-A401-11D2-AAD4-00C04F990171})
             // "managed" → VSConstants.DebugEnginesGuids.ManagedOnly_guid
             //            ({449EC4CC-30D2-4032-9256-EE18EB41B62B})
-            // Anything else is treated as a raw GUID string and Guid.Parsed.
+            // 其他任何值都当作原始 GUID 字符串处理并 Guid.Parse。
             string engineLabel;
             Guid engineGuid;
             string? engineInput = debugEngine;
@@ -487,12 +527,12 @@ namespace VsMcp
                 }
             }
 
-            // --- Parse the environment block ------------------------------------
-            // EnvironmentVariablesJson is a JSON object of string→string. Null
-            // or empty whitespace inherits the parent environment (bstrEnv =
-            // null). Invalid JSON throws ArgumentException (surfaces via
-            // SafeCall as an internal_error — acceptable; the caller fed bad
-            // input).
+            // --- 解析环境块 ----------------------------------------------------
+            // EnvironmentVariablesJson 是一个 string→string 的 JSON 对象。Null
+            // 或空白时继承父进程环境（bstrEnv =
+            // null）。非法 JSON 抛 ArgumentException（经
+            // SafeCall 作为 internal_error 暴露——可接受；调用方喂了
+            // 错误输入）。
             Dictionary<string, string>? envVars = null;
             if (!string.IsNullOrWhiteSpace(environmentVariablesJson))
             {
@@ -512,29 +552,29 @@ namespace VsMcp
                     envVars = new Dictionary<string, string>();
             }
 
-            // --- Resolve working directory --------------------------------------
+            // --- 解析工作目录 --------------------------------------------------
             string workingDir = !string.IsNullOrWhiteSpace(workingDirectory)
                 ? workingDirectory!
                 : (Path.GetDirectoryName(startProgram) ?? string.Empty);
             if (string.IsNullOrWhiteSpace(workingDir))
             {
-                // Path.GetDirectoryName returned empty (exe at a root / bare
-                // name). Fall back to the current directory rather than crash.
+                // Path.GetDirectoryName 返回空（exe 位于根目录 / 仅为
+                // 裸文件名）。回退到当前目录而不是崩溃。
                 workingDir = Environment.CurrentDirectory;
                 warnings.Add($"WorkingDirectory defaulted to VS current directory ({workingDir}) " +
                              "because the exe path has no directory component.");
             }
 
-            // --- Acquire IVsDebugger2 -------------------------------------------
+            // --- 获取 IVsDebugger2 ---------------------------------------------
             var debugger = await GetVsDebugger2Async(ct);
 
-            // --- Build VsDebugTargetInfo2 + Launch ------------------------------
-            // LaunchDebugTargets2's managed signature takes (uint count,
-            // IntPtr pBuffer) where pBuffer points to a buffer of
-            // count contiguous VsDebugTargetInfo2 structs in unmanaged memory.
-            // We allocate the buffer, marshal the struct into it, call, and
-            // free in a finally (the struct embeds BSTR fields that
-            // DestroyStructure releases).
+            // --- 构造 VsDebugTargetInfo2 并启动 ---------------------------------
+            // LaunchDebugTargets2 的托管签名为 (uint count,
+            // IntPtr pBuffer)，其中 pBuffer 指向一块非托管内存缓冲区，
+            // 内含 count 个连续的 VsDebugTargetInfo2 结构体。
+            // 我们分配缓冲区、把结构体封送进去、调用，
+            // 并在 finally 中释放（该结构体内嵌 BSTR 字段，由
+            // DestroyStructure 释放）。
             var info = new VsDebugTargetInfo2
             {
                 cbSize = (uint)Marshal.SizeOf(typeof(VsDebugTargetInfo2)),
@@ -544,9 +584,9 @@ namespace VsMcp
                 bstrCurDir = workingDir,
                 bstrEnv = BuildEnvironmentBlock(envVars),
                 guidLaunchDebugEngine = engineGuid,
-                // guidLaunchDebugEngine alone is sufficient for a single-engine
-                // launch (per Microsoft Learn + nodejstools production code):
-                // dwDebugEngineCount stays 0 and pDebugEngines stays IntPtr.Zero.
+                // 单引擎启动时 guidLaunchDebugEngine 单独一项即可
+                //（依据 Microsoft Learn + nodejstools 生产代码）：
+                // dwDebugEngineCount 保持 0，pDebugEngines 保持 IntPtr.Zero。
                 dwDebugEngineCount = 0,
                 pDebugEngines = IntPtr.Zero,
             };
@@ -563,11 +603,11 @@ namespace VsMcp
             {
                 if (pBuffer != IntPtr.Zero)
                 {
-                    // DestroyStructure releases the embedded BSTRs (bstrExe /
-                    // bstrArg / bstrCurDir / bstrEnv). Safe even if
-                    // StructureToPtr never ran (no-op on zeroed memory).
+                    // DestroyStructure 释放内嵌的 BSTR（bstrExe /
+                    // bstrArg / bstrCurDir / bstrEnv）。即使
+                    // StructureToPtr 从未执行也安全（对清零内存是空操作）。
                     try { Marshal.DestroyStructure<VsDebugTargetInfo2>(pBuffer); }
-                    catch { /* teardown must not throw */ }
+                    catch { /* 清理阶段不得抛异常 */ }
                     Marshal.FreeCoTaskMem(pBuffer);
                 }
             }
@@ -575,10 +615,10 @@ namespace VsMcp
             bool started;
             if (hr < 0)
             {
-                // Launch failed. Surface the HRESULT to the agent and leave the
-                // debugger state as observed (likely still design). We do NOT
-                // throw — the tool reports the structured failure so the agent
-                // can decide whether to retry with a different engine / args.
+                // 启动失败。把 HRESULT 暴露给 agent，调试器
+                // 状态保持观察到的那样（很可能仍是 design）。我们不
+                // 抛异常——工具上报结构化的失败，让 agent
+                // 可以决定是否换用其他引擎/参数重试。
                 started = false;
                 string hrMsg;
                 try
@@ -597,11 +637,11 @@ namespace VsMcp
                 started = true;
             }
 
-            // Read the resulting debugger mode. In run mode the call has
-            // engaged the debugger and the process is executing; in break
-            // mode a startup breakpoint was hit immediately; in design mode
-            // the launch did not actually attach (e.g. bad engine for the exe
-            // type, exe missing). StateFromModeAsync is the canonical mapper.
+            // 读取启动后的调试器模式。run 模式表示调用已
+            // 接入调试器、进程正在执行；break 模式表示
+            // 启动断点立即命中；design 模式表示
+            // 启动并未真正附加（例如引擎与 exe
+            // 类型不匹配、exe 缺失）。StateFromModeAsync 是规范的映射器。
             string state;
             try
             {
@@ -624,36 +664,37 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Builds the double-null-terminated multi-string environment block
-        /// that VsDebugTargetInfo2.bstrEnv expects (the raw lpEnvironment
-        /// CreateProcess takes). Format: <c>KEY=VALUE\0KEY2=VALUE2\0\0</c>.
-        /// Returns null when <paramref name="env"/> is null or empty so the
-        /// launched process inherits the parent (VS) environment — the common
-        /// case for start_debugging. We assign the result directly to the
-        /// bstrEnv field; the COM interop marshaller will allocate a BSTR via
-        /// SysAllocStringLen (which uses the explicit length, so embedded \0
-        /// survive). This works because we construct the C# string WITH the
-        /// embedded nulls and trailing terminator; the marshaller copies the
-        /// full Length, not up to the first null.
+        /// 构造双 null 结尾的多字符串环境块，
+        /// 即 VsDebugTargetInfo2.bstrEnv 所期望的格式（也就是
+        /// CreateProcess 接收的原始 lpEnvironment）。
+        /// 格式：<c>KEY=VALUE\0KEY2=VALUE2\0\0</c>。
+        /// 当 <paramref name="env"/> 为 null 或空时返回 null，让
+        /// 启动的进程继承父进程（VS）环境——start_debugging 的常见
+        /// 情形。我们把结果直接赋给
+        /// bstrEnv 字段；COM 互操作封送器会通过
+        /// SysAllocStringLen 分配 BSTR（它使用显式长度，因此内嵌的 \0
+        /// 得以保留）。这之所以可行，是因为我们构造 C# 字符串时就把
+        /// 内嵌 null 和结尾终止符一并放入；封送器复制的是
+        /// 完整 Length，而非到第一个 null 为止。
         /// </summary>
         private static string? BuildEnvironmentBlock(Dictionary<string, string>? env)
         {
             if (env == null || env.Count == 0)
                 return null;
 
-            // StringBuilder can't carry embedded \0 cleanly (it does, but the
-            // Length-based allocations are clearer with a char[] / List<char>).
+            // StringBuilder 不能干净地承载内嵌 \0（其实可以，但
+            // 用 char[] / List<char> 时基于 Length 的分配更清晰）。
             var chars = new List<char>(capacity: env.Count * 32);
             foreach (var kv in env)
             {
                 if (string.IsNullOrEmpty(kv.Key))
-                    continue; // a null/empty key is invalid in an env block
+                    continue; // 环境块中 null/空键是非法的
                 foreach (char c in kv.Key) chars.Add(c);
                 chars.Add('=');
                 foreach (char c in kv.Value ?? "") chars.Add(c);
                 chars.Add('\0');
             }
-            // Trailing extra \0 marks the end of the block (double-null term).
+            // 结尾额外的 \0 标记块结束（双 null 结尾）。
             chars.Add('\0');
             return new string(chars.ToArray());
         }
@@ -672,12 +713,12 @@ namespace VsMcp
             if (dte == null)
                 throw new InvalidOperationException("DTE service is not available");
 
-            // Guard: when a solution IS loaded, refuse to silently no-op on a
-            // file that is not part of it. If NO solution is loaded, skip the
-            // guard and let VS handle it (get_session_info surfaces the null
-            // state separately). The normalization collapses .. / mixed-
-            // separator / drive-letter-casing variants so FindProjectItem
-            // matches the path VS indexes the item under.
+            // 守卫：当确实加载了解决方案时，对于不属于它的
+            // 文件，拒绝静默无操作。若未加载解决方案，则跳过
+            // 守卫交给 VS 处理（get_session_info 单独暴露 null
+            // 状态）。规范化会折叠 .. / 混合
+            // 分隔符 / 盘符大小写变体，使 FindProjectItem
+            // 能匹配 VS 索引该项目时所用的路径。
             string loadedSolution = dte.Solution?.FullName ?? "";
             if (!string.IsNullOrWhiteSpace(loadedSolution))
             {
@@ -689,10 +730,10 @@ namespace VsMcp
                 }
                 catch
                 {
-                    // FindProjectItem should not throw for a missing item, but
-                    // a transient COM failure must not turn a guard miss into a
-                    // hard tool failure — treat as "not found" and let the
-                    // Breakpoints.Add path below surface a real error if any.
+                    // FindProjectItem 对缺失项不应抛异常，但
+                    // 偶发的 COM 失败不得把守卫未命中变成
+                    // 工具硬故障——按"未找到"处理，让下方
+                    // Breakpoints.Add 路径在确有错误时再暴露。
                     item = null;
                 }
                 if (item == null)
@@ -788,9 +829,9 @@ namespace VsMcp
 
             if (!confirm)
             {
-                // Dry-run: report what WOULD be deleted without touching
-                // anything. Forces a second call with confirm=true after the
-                // agent reviews the count, preventing accidental bulk delete.
+                // 干跑：报告"将要删除什么"而不触碰
+                // 任何内容。强制 agent 审核计数后再用 confirm=true 发起
+                // 第二次调用，防止误批量删除。
                 return new BreakpointClearResult(
                     Deleted: 0,
                     WasDryRun: true,
@@ -813,13 +854,13 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Triggers a full solution build via
-        /// <c>DTE.Solution.SolutionBuild.Build(WaitForBuildToFinish: true)</c>.
-        /// Blocks until the build completes — the MCP Streamable HTTP transport
-        /// keeps the SSE response stream open during the wait (no client
-        /// timeout), and the single-session request gate stays held (the agent
-        /// is awaiting this result anyway). Returns the active configuration
-        /// name and the failed-project count (0 == success).
+        /// 通过 <c>DTE.Solution.SolutionBuild.Build(WaitForBuildToFinish: true)</c>
+        /// 触发整个解决方案构建。
+        /// 阻塞直到构建完成——MCP Streamable HTTP 传输在
+        /// 等待期间保持 SSE 响应流开启（无客户端
+        /// 超时），单会话请求闸门保持持有（agent
+        /// 反正也在等待这个结果）。返回活动配置
+        /// 名称和失败项目数（0 == 成功）。
         /// </summary>
         public async Task<BuildSolutionResult> BuildSolutionAsync(CancellationToken ct)
         {
@@ -840,15 +881,15 @@ namespace VsMcp
 
             string configuration = "Unknown";
             try { configuration = solutionBuild.ActiveConfiguration?.Name ?? "Unknown"; }
-            catch { /* ActiveConfiguration can throw for odd solution states */ }
+            catch { /* 异常解决方案状态下 ActiveConfiguration 可能抛异常 */ }
 
-            // Build asynchronously: Build(false) returns immediately without
-            // blocking the UI thread. OnBuildDone fires on the UI thread when
-            // the build completes; a TaskCompletionSource bridges it to
-            // async/await so this method yields the UI thread while VS builds
-            // — VS stays fully responsive. Build(true) is avoided: it freezes
-            // the UI for the whole build and has a known deadlock bug
-            // (TcUnit-Runner issue #5).
+            // 异步构建：Build(false) 立即返回，不
+            // 阻塞 UI 线程。构建完成时 OnBuildDone 在 UI 线程上触发；
+            // 一个 TaskCompletionSource 把它桥接到
+            // async/await，使本方法在 VS 构建期间让出 UI 线程
+            // —— VS 保持完全响应。避免使用 Build(true)：它会
+            // 在整个构建期间冻结 UI，并且存在已知的死锁 bug
+            //（TcUnit-Runner issue #5）。
             var buildEvents = dte.Events.BuildEvents;
             var tcs = new TaskCompletionSource<bool>();
 
@@ -880,12 +921,12 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Reads the VS Output window's Build pane and returns a sliced view.
-        /// The agent uses this after <see cref="BuildSolutionAsync"/> to inspect
-        /// compiler diagnostics straight from the build log (more trustworthy
-        /// than the Error List, which mixes in stale squiggles). <paramref name="tail"/>
-        /// = true reads the most recent <paramref name="maxLines"/> lines (the
-        /// errors at the end); false reads the first <paramref name="maxLines"/>.
+        /// 读取 VS 输出窗口的 Build 窗格并返回切片视图。
+        /// agent 在 <see cref="BuildSolutionAsync"/> 之后用它直接从
+        /// 构建日志检视编译诊断（比错误列表更可信，后者混有
+        /// 过时的波浪线）。<paramref name="tail"/>
+        /// = true 读取最近的 <paramref name="maxLines"/> 行
+        ///（末尾的错误）；false 读取前 <paramref name="maxLines"/> 行。
         /// </summary>
         public async Task<BuildOutputResult> GetBuildOutputAsync(int maxLines, bool tail, CancellationToken ct)
         {
@@ -941,8 +982,8 @@ namespace VsMcp
 
             var outputWindow = dte.ToolWindows.OutputWindow;
 
-            // The Build pane name is localized ("Build"/"生成"/"构建"/"組建"),
-            // so match loosely rather than by exact string.
+            // Build 窗格名称是本地化的（"Build"/"生成"/"构建"/"組建"），
+            // 所以按模糊匹配而非精确字符串匹配。
             OutputWindowPane? buildPane = null;
             try
             {
@@ -959,12 +1000,12 @@ namespace VsMcp
                     }
                 }
             }
-            catch { /* enumeration is best-effort */ }
+            catch { /* 枚举是尽力而为的 */ }
 
             if (buildPane == null)
                 throw new InvalidOperationException("Build output pane not found in the Output window");
 
-            // Read full text via EditPoint — does not touch the user's selection.
+            // 通过 EditPoint 读取全文——不会触碰用户的选择。
             string allText = "";
             try
             {
@@ -983,10 +1024,11 @@ namespace VsMcp
 
         private async Task<DBGMODE> GetDebuggerModeAsync(CancellationToken ct)
         {
-            // IVsDebugger2 (not v1): the v1 interface's OLE marshaler fails QI
-            // with E_NOINTERFACE when the cast lands off the STA thread, whereas
-            // IVsDebugger2.GetInternalDebugMode marshals robustly. Same DBGMODE
-            // contract, same array-out signature.
+            // IVsDebugger2（而非 v1）：v1 接口的 OLE marshaler 在
+            // 转换落到 STA 线程之外时 QI 会以
+            // E_NOINTERFACE 失败，而
+            // IVsDebugger2.GetInternalDebugMode 封送健壮。相同的 DBGMODE
+            // 契约，相同的数组输出签名。
             var debugger = await GetVsDebugger2Async(ct);
             var mode = new DBGMODE[1];
             int hr = debugger.GetInternalDebugMode(mode);
@@ -996,10 +1038,10 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Acquires the DTE while guaranteeing the debugger is in break mode.
-        /// Throws <see cref="RequireBreakModeException"/> (carrying the current
-        /// state string) on any non-break mode so SafeCall can populate
-        /// ErrorResult.State.
+        /// 获取 DTE，同时保证调试器处于断点模式。
+        /// 在任何非断点模式下抛出 <see cref="RequireBreakModeException"/>（携带当前
+        /// 状态字符串），以便 SafeCall 填充
+        /// ErrorResult.State。
         /// </summary>
         private async Task<DTE2> RequireBreakModeAsync(CancellationToken ct)
         {
@@ -1028,30 +1070,30 @@ namespace VsMcp
                     return;
                 await Task.Delay(200, ct);
             }
-            // Final poll to let any state change settle.
+            // 最后再轮询一次，让任何状态变更稳定下来。
             await GetDebuggerModeAsync(ct);
         }
 
         /// <summary>
-        /// Continues execution from the current breakpoint.
+        /// 从当前断点继续执行。
         ///
-        /// <para><b>wait_for_break=false (default)</b>: fire-and-forget. Calls
-        /// <c>Go(false)</c> and returns immediately with <c>state="running"</c>.
-        /// The agent can poll <c>get_debugger_state</c> afterwards to detect
-        /// the next break.</para>
+        /// <para><b>wait_for_break=false（默认）</b>：即发即忘。调用
+        /// <c>Go(false)</c> 并立即返回 <c>state="running"</c>。
+        /// agent 之后可轮询 <c>get_debugger_state</c> 来检测
+        /// 下一次中断。</para>
         ///
-        /// <para><b>wait_for_break=true</b>: waits for the next break/stop
-        /// event via <c>DebuggerEvents.OnEnterBreakMode</c> /
-        /// <c>OnEnterDesignMode</c>, bridged to async with a
-        /// <see cref="TaskCompletionSource{TResult}"/>. The HTTP response stays
-        /// open as long as needed; KeepAliveNotifier periodically emits MCP
-        /// logging notifications over the in-flight response stream to keep
-        /// the connection alive while a tool is awaiting a break event.</para>
+        /// <para><b>wait_for_break=true</b>：通过 <c>DebuggerEvents.OnEnterBreakMode</c> /
+        /// <c>OnEnterDesignMode</c> 等待下一次中断/停止
+        /// 事件，并用
+        /// <see cref="TaskCompletionSource{TResult}"/> 桥接到 async。HTTP 响应
+        /// 按需保持开启；KeepAliveNotifier 周期性地在途响应流上发送 MCP
+        /// logging 通知，在工具等待中断事件期间保持
+        /// 连接存活。</para>
         ///
-        /// <para><c>timeout_seconds</c> (only meaningful with wait_for_break=true):
-        /// <c>0</c> (default) = wait indefinitely (relies on SSE keep-alive);
-        /// <c>N&gt;0</c> = wait at most N seconds, returning the current
-        /// state + a message on timeout (NOT an error — agent can retry).</para>
+        /// <para><c>timeout_seconds</c>（仅在 wait_for_break=true 时有意义）：
+        /// <c>0</c>（默认）= 无限等待（依赖 SSE 心跳保活）；
+        /// <c>N&gt;0</c> = 至多等待 N 秒，超时时返回当前
+        /// 状态 + 一条消息（不是错误——agent 可重试）。</para>
         /// </summary>
         public async Task<ExecutionResult> ContinueExecutionAsync(
             bool waitForBreak,
@@ -1176,10 +1218,11 @@ namespace VsMcp
             return new ExecutionResult(State: "stopped", Message: "Debugging stopped");
         }
 
-        public async Task<LocalsResult> GetLocalVariablesAsync(int maxChars, CancellationToken ct)
+        public async Task<LocalsResult> ListLocalVariablesAsync(int maxLocals, int maxChars, CancellationToken ct)
         {
             ThrowIfDisposed();
             int budget = maxChars > 0 ? maxChars : DefaultCharBudget;
+            int cap = maxLocals > 0 ? maxLocals : DefaultLocalCap;
             var dte = await RequireBreakModeAsync(ct);
 
             var frame = dte.Debugger.CurrentStackFrame;
@@ -1188,27 +1231,32 @@ namespace VsMcp
                     Locals: new List<ExpressionInfo>(), Total: 0, Returned: 0, Truncated: false);
 
             var locals = frame.Locals;
-            var list = new List<ExpressionInfo>(locals.Count);
+            int total = locals.Count;
+            int limit = Math.Min(total, cap);
+            var list = new List<ExpressionInfo>(limit);
             int consumed = 0;
-            bool truncated = false;
+            bool budgetTruncated = false;
 
-            for (int i = 1; i <= locals.Count; i++)
+            // depth 0 = 只顶层（name/type/value/hasChildren，不展开 children）。
+            // 让 list_local_variables 保持浅层，local 多或对象深的栈帧也不会爆上下文——
+            // agent 用 get_variable_detail 下钻特定变量。
+            for (int i = 1; i <= limit; i++)
             {
                 var local = locals.Item(i);
-                // Estimate this local's serialized footprint before committing.
                 int estimate = EstimateExpressionFootprint(local);
                 if (consumed + estimate > budget && list.Count > 0)
                 {
-                    truncated = true;
+                    budgetTruncated = true;
                     break;
                 }
-                var info = ToExpressionInfo(local, budget - consumed, out int actual);
+                var info = ToExpressionInfo(local, budget - consumed, depth: 0, out int actual);
                 consumed += actual;
                 list.Add(info);
             }
 
             return new LocalsResult(
-                Locals: list, Total: locals.Count, Returned: list.Count, Truncated: truncated);
+                Locals: list, Total: total, Returned: list.Count,
+                Truncated: budgetTruncated || total > cap);
         }
 
         public async Task<CallStackResult> GetCallStackAsync(CancellationToken ct)
@@ -1259,48 +1307,62 @@ namespace VsMcp
                     Hint: "Expression could not be evaluated"));
             }
 
-            return new ExpressionResult(ToExpressionInfo(result, budget, out _));
+            return new ExpressionResult(ToExpressionInfo(result, budget, int.MaxValue, out _));
         }
 
-        public async Task<ExpressionResult> GetVariableDetailAsync(string variableName, int maxChars, CancellationToken ct)
+        public async Task<VariableDetailResult> GetVariableDetailAsync(string[] expressions, int depth, int maxChars, CancellationToken ct)
         {
             ThrowIfDisposed();
-            if (string.IsNullOrWhiteSpace(variableName))
-                throw new ArgumentException("variableName is required", nameof(variableName));
+            if (expressions == null || expressions.Length == 0)
+                throw new ArgumentException("expressions is required and must be non-empty", nameof(expressions));
             int budget = maxChars > 0 ? maxChars : DefaultCharBudget;
+            // depth 1 = 节点 + 直接 children（浅）；每加一层 depth 多展开一层。
+            // 下限 1，传 0/负数也至少返回一层。
+            int d = depth > 0 ? depth : 1;
             var dte = await RequireBreakModeAsync(ct);
 
-            var frame = dte.Debugger.CurrentStackFrame;
-            if (frame?.Locals != null)
+            var details = new List<ExpressionInfo>(expressions.Length);
+            // 每个表达式由调试引擎独立求值——它接受任意 C++/C# 表达式
+            //（obj.member、arr[3]、ptr->next），所以工具里不自己造路径语法。
+            foreach (var expression in expressions)
             {
-                for (int i = 1; i <= frame.Locals.Count; i++)
+                if (string.IsNullOrWhiteSpace(expression))
                 {
-                    var local = frame.Locals.Item(i);
-                    if (string.Equals(local.Name, variableName, StringComparison.OrdinalIgnoreCase))
-                        return new ExpressionResult(ToExpressionInfo(local, budget, out _));
+                    details.Add(new ExpressionInfo(
+                        Name: expression ?? "", Type: "", Value: null, Error: true,
+                        HasChildren: false, Children: new List<ExpressionInfo>(),
+                        Truncated: false, Hint: "empty expression"));
+                    continue;
                 }
+
+                var result = dte.Debugger.GetExpression(expression, false, 5000);
+                if (result == null || !result.IsValidValue)
+                {
+                    details.Add(new ExpressionInfo(
+                        Name: expression, Type: result?.Type ?? "", Value: null, Error: true,
+                        HasChildren: false, Children: new List<ExpressionInfo>(),
+                        Truncated: false, Hint: "Expression could not be evaluated"));
+                    continue;
+                }
+
+                details.Add(ToExpressionInfo(result, budget, d, out _));
             }
 
-            var result = dte.Debugger.GetExpression(variableName, false, 5000);
-            if (result != null && result.IsValidValue)
-                return new ExpressionResult(ToExpressionInfo(result, budget, out _));
-
-            throw new BreakpointNotFoundException($"Variable '{variableName}' not found in current scope");
+            return new VariableDetailResult(details);
         }
 
-        // --- DTO assembly helpers (char-budget truncation moved out of the
-        //     deleted expression-serializer helper; the BFS + truncation +
-        //     Hint semantics are preserved per CONTEXT Claude's Discretion). ---
+        // --- DTO 装配辅助方法（字符预算截断逻辑已从
+        //     已删除的表达式序列化辅助方法中移出；BFS + 截断 +
+        //     Hint 语义按 CONTEXT Claude 的 Discretion 保留）。---
 
         /// <summary>
-        /// Converts an EnvDTE <see cref="Expression"/> into an
-        /// <see cref="ExpressionInfo"/> tree, honoring a char budget. Children
-        /// are expanded greedily; when the budget is hit the remaining
-        /// children are dropped and <see cref="ExpressionInfo.Truncated"/> +
-        /// a drill-down hint is set so the LLM knows to call
-        /// <c>get_variable_detail</c>.
+        /// 把 EnvDTE <see cref="Expression"/> 转成 <see cref="ExpressionInfo"/> 树。
+        /// 受 char budget 和 depth 双重限制：展开到第 depth 层就停（更深层标
+        /// hasChildren 不展开）；budget 耗尽则该层剩余 children 丢弃并置
+        /// <see cref="ExpressionInfo.Truncated"/> + 下钻提示，提示 LLM 调
+        /// <c>get_variable_detail</c>。
         /// </summary>
-        private static ExpressionInfo ToExpressionInfo(Expression expr, int budget, out int consumed)
+        private static ExpressionInfo ToExpressionInfo(Expression expr, int budget, int depth, out int consumed)
         {
             string name = expr.Name ?? "";
             string type = expr.Type ?? "";
@@ -1315,17 +1377,24 @@ namespace VsMcp
             }
 
             string value = expr.Value ?? "";
-            // Reserve room for the top-level fields themselves.
+            // 为顶层字段自身预留空间。
             int used = name.Length + type.Length + value.Length + 48;
             consumed = used;
 
             var children = expr.DataMembers;
-            if (children == null || children.Count == 0)
+            bool hasChildren = children != null && children.Count > 0;
+
+            // depth <= 0：停止展开。返回 hasChildren 让调用方知道可下钻，但不返回
+            // children——这是 list_local_variables 的浅层模式（depth 0），也是
+            // get_variable_detail 的展开底线（每层 depth-1，所以 depth 1 的 children
+            // 在 depth 0 = 浅，不再有 grandchildren）。
+            if (depth <= 0 || !hasChildren)
             {
                 return new ExpressionInfo(
                     Name: name, Type: type, Value: value, Error: false,
-                    HasChildren: false, Children: new List<ExpressionInfo>(),
-                    Truncated: false, Hint: null);
+                    HasChildren: hasChildren, Children: new List<ExpressionInfo>(),
+                    Truncated: false,
+                    Hint: hasChildren ? "Use get_variable_detail to expand" : null);
             }
 
             var childList = new List<ExpressionInfo>();
@@ -1340,7 +1409,7 @@ namespace VsMcp
                     break;
                 }
 
-                var childInfo = ToExpressionInfo(child, budget - used, out int childActual);
+                var childInfo = ToExpressionInfo(child, budget - used, depth - 1, out int childActual);
                 used += childActual;
                 childList.Add(childInfo);
             }
@@ -1353,9 +1422,9 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Cheap footprint estimate (name + type + value + framing) used to
-        /// decide whether a child fits the budget before the recursive
-        /// expansion pays for it.
+        /// 廉价的足迹估算（name + type + value + 框架开销），用于
+        /// 在付出递归展开代价之前判断
+        /// 某个子项是否还在预算之内。
         /// </summary>
         private static int EstimateExpressionFootprint(Expression expr)
         {
@@ -1384,20 +1453,21 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Canonicalizes a file path for membership checks: <see cref="Path.GetFullPath"/>
-        /// resolves <c>..\</c>-relative segments and normalizes separators, then the
-        /// forward-slash pass + <see cref="string.ToUpperInvariant"/> collapse the
-        /// remaining case/separator differences (Windows paths are case-insensitive;
-        /// <c>DTE.Solution.FindProjectItem</c> matches against a backslash path it
-        /// indexes). Extracted as pure so it can be unit-tested without a live VS.
+        /// 将文件路径规范化用于成员判定：<see cref="Path.GetFullPath"/>
+        /// 解析 <c>..\</c> 相对段并规范化分隔符，随后正斜杠处理 +
+        /// <see cref="string.ToUpperInvariant"/> 折叠掉
+        /// 剩余的大小写/分隔符差异（Windows 路径不区分大小写；
+        /// <c>DTE.Solution.FindProjectItem</c> 按它所索引的
+        /// 反斜杠路径匹配）。提取为纯方法，便于脱离真实 VS
+        /// 进行单元测试。
         /// </summary>
         public static string NormalizeFilePath(string file)
         {
             if (string.IsNullOrWhiteSpace(file))
                 return file;
             string full = Path.GetFullPath(file);
-            // Replace any alt-separator with backslashes so FindProjectItem's
-            // index (backslash-only) matches regardless of caller convention.
+            // 将任何其他分隔符替换为反斜杠，使 FindProjectItem 的
+            // 索引（仅反斜杠）无论调用方约定如何都能匹配。
             return full.Replace('/', '\\').ToUpperInvariant();
         }
 

@@ -7,27 +7,26 @@ using Microsoft.Extensions.Logging;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
+using VsMcp.Common;
 using VsMcp.Logging;
 using Task = System.Threading.Tasks.Task;
 
 namespace VsMcp
 {
     /// <summary>
-    /// VSIX package entry point. Under the multi-instance architecture this VS instance
-    /// no longer binds an HTTP port — it opens a NamedPipe (<c>\\.\pipe\vs-mcp-{PID}</c>)
-    /// and hands the tool surface to a standalone VsMcpGateway.exe that owns :43210 and
-    /// routes MCP clients to the right instance over the pipe. The same
-    /// <see cref="McpRequestProcessor"/> backs the pipe path, so the tool set, error
-    /// semantics, and keep-alive behavior are identical to the former direct-HTTP path.
+    /// VSIX package 入口。在多实例架构下，本 VS 实例不再绑定 HTTP 端口 —— 它打开
+    /// 一个 NamedPipe（<c>\\.\pipe\vs-mcp-{PID}</c>），把工具面交给独占 :43210 的
+    /// 独立 VsMcpGateway.exe，由后者经 pipe 把 MCP 客户端路由到正确实例。同一条
+    /// pipe 路径背后是同一个 <see cref="McpRequestProcessor"/>，因此工具集、错误语义
+    /// 与保活行为都与早先的直连 HTTP 路径完全一致。
     ///
-    /// Auto-loads via UIContextGuids80.NoSolution (active whenever NO .sln is loaded —
-    /// i.e. at startup AND when an "Open Folder"/CMake project is open). We previously
-    /// tried SolutionExists, but CMake projects opened via File &gt; Open &gt; CMake do
-    /// NOT load a .sln, so SolutionExists never fired and the server never started for
-    /// the C++ workflow — the core use case. NoSolution covers CMake/folder projects;
-    /// the trade-off is the server also starts at bare VS startup (WakaTime-style),
-    /// which is acceptable because C++ debugger control needs the server up without a
-    /// .sln. A VS package loads once and does not unload, so it stays available.
+    /// 通过 UIContextGuids80.NoSolution 自动加载（只要没有加载 .sln 即激活 —— 即启动
+    /// 时以及“打开文件夹”/CMake 项目打开时）。我们之前试过 SolutionExists，但通过
+    /// File &gt; Open &gt; CMake 打开的 CMake 项目并不加载 .sln，因此 SolutionExists 永不
+    /// 触发，C++ 工作流（核心用例）下服务器永远起不来。NoSolution 覆盖 CMake/文件夹
+    /// 项目；代价是服务器在 VS 裸启动时也会启动（WakaTime 式），这可以接受，因为
+    /// C++ 调试器控制需要在没有 .sln 的情况下让服务器就绪。VS package 加载一次且不会
+    /// 卸载，所以它始终保持可用。
     /// </summary>
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
     [ProvideAutoLoad(UIContextGuids80.NoSolution, PackageAutoLoadFlags.BackgroundLoad)]
@@ -39,6 +38,9 @@ namespace VsMcp
         private HeartbeatClient? _heartbeat;
         private DebuggerFacade? _facade;
         private SymbolFacade? _symbolFacade;
+#if EVAL_CSHARP
+        private EvalCsharpFacade? _evalFacade;
+#endif
         private SolutionEventsSubscriber? _solutionSubscriber;
 
         protected override async Task InitializeAsync(
@@ -47,44 +49,57 @@ namespace VsMcp
         {
             await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
 
-            // Build the ILoggerFactory once. D-04: the provider writes to the
-            // VS Output Window pane 'VS MCP' (Information+, D-05/D-07
-            // fixed Information for Phase 5) and additionally to IVsActivityLog
-            // (Error/Critical, D-06).
+            // 一次性构建 ILoggerFactory。D-04：该 provider 写入 VS 输出窗口的
+            // 'VS MCP' 窗格（Information+，D-05/D-07 为 Phase 5 固定了 Information），
+            // 并额外写入 IVsActivityLog（Error/Critical，D-06）。
             //
-            // Uses the local SimpleLoggerFactory rather than Microsoft.Extensions
-            // .Logging.LoggerFactory: the concrete LoggerFactory lives in a
-            // NuGet package that the project does not reference, and this
-            // extension only ever wires a single provider, so a minimal factory
-            // covers the contract without adding a dependency.
+            // 使用本地 SimpleLoggerFactory 而非 Microsoft.Extensions.Logging.LoggerFactory：
+            // 具体的 LoggerFactory 位于本项目未引用的 NuGet 包中，而本扩展只接一个
+            // provider，因此一个最小化 factory 就能覆盖契约，无需新增依赖。
             var loggerFactory = new SimpleLoggerFactory(
                 new VsOutputWindowLoggerProvider(this),
                 LogLevel.Information);
 
             _facade = new DebuggerFacade(this);
             _symbolFacade = new SymbolFacade(this);
+#if EVAL_CSHARP
+            _evalFacade = new EvalCsharpFacade(this, loggerFactory.CreateLogger<EvalCsharpFacade>());
+#endif
 
-            // Read opt-in tool settings from Tools → Options. GetDialogPage
-            // requires the UI thread (we're on it after the switch above).
-            // Settings are read once at startup; changing them needs a VS restart.
+            // 从 Tools → Options 读取 opt-in 工具设置。GetDialogPage 需要 UI 线程
+            // （在上面的切换之后我们已在 UI 线程上）。设置只在启动时读一次；改动后
+            // 需重启 VS 才生效。
             bool enableGoToDefinition = false;
             try { enableGoToDefinition = ((McpOptionsPage)GetDialogPage(typeof(McpOptionsPage))).EnableGoToDefinition; } catch { }
 
-            // Open the per-instance connection to the Gateway. PipeMcpServer now
-            // (Wave 2) dials the Gateway's "vs-mcp-gateway" pipe as a client and
-            // sends a register frame; the Gateway multiplexes MCP clients onto it.
-            // PipeMcpServer.StartAsync returns once the connect loop is armed (the
-            // loop runs in the background), so this await does not block
-            // InitializeAsync past the VS package-load timeout.
+#if EVAL_CSHARP
+            bool enableEvalCsharp = false;
+            try { enableEvalCsharp = ((McpOptionsPage)GetDialogPage(typeof(McpOptionsPage))).EnableEvalCsharp; } catch { }
+#endif
+
+            // 打开到 Gateway 的每实例连接。PipeMcpServer 现在（Wave 2）以客户端身份
+            // 拨入 Gateway 的 "vs-mcp-gateway" pipe 并发送一帧 register；Gateway 把
+            // MCP 客户端多路复用到它上面。PipeMcpServer.StartAsync 在连接循环就绪后
+            // 即返回（循环在后台运行），所以这次 await 不会让 InitializeAsync 阻塞
+            // 超过 VS package 加载超时。
             int pid = Process.GetCurrentProcess().Id;
             _pipeServer = new PipeMcpServer(
-                pid, _facade, _symbolFacade, enableGoToDefinition, loggerFactory, this.DisposalToken);
+                pid, _facade, _symbolFacade,
+#if EVAL_CSHARP
+                _evalFacade,
+#endif
+                enableGoToDefinition,
+#if EVAL_CSHARP
+                enableEvalCsharp,
+#endif
+                loggerFactory, this.DisposalToken);
 
-            // Best-effort: make sure the standalone Gateway exe is up before the
-            // pipe client starts, so the first connect attempt lands. Fire-and-
-            // forget — if the Gateway can't be launched (exe not on disk yet, Wave 5
-            // will ship it in the VSIX), the pipe client keeps retrying connect.
+            // 尽力而为：在 pipe 客户端启动前确保独立 Gateway exe 已起来，使首次连接
+            // 尝试能命中。fire-and-forget —— 若 Gateway 无法启动（exe 还未随 Wave 5
+            // 打入 VSIX 上盘），pipe 客户端会持续重试连接。
             var pkgLogger = loggerFactory.CreateLogger<VsMcpPackage>();
+            // 第一行打版本号，方便排查日志对应哪个版本。
+            pkgLogger.LogInformation($"VS MCP 扩展 v{ExtensionVersion.Current} 已加载");
             _ = Task.Run(async () =>
             {
                 try
@@ -97,6 +112,15 @@ namespace VsMcp
                 }
             });
 
+            // 构造 solution-events 订阅者，并在启动 pipe server 之前接好它的
+            // onConnected 回调。首帧 register 会触发 onConnected，重新推送当前
+            // solution —— 既填补 open-before-connect 竞态（OnAfterOpenSolution 在
+            // pipe 为 null 时触发而被丢弃），也在 Gateway 重连后重新同步。
+            // IVsSolution 的 Advise 本身在下面 StartAsync 之后 fire-and-forget 执行。
+            _solutionSubscriber = new SolutionEventsSubscriber(
+                this, _pipeServer, this.DisposalToken, loggerFactory.CreateLogger<SolutionEventsSubscriber>());
+            _pipeServer.SetOnConnected(token => _solutionSubscriber.PushCurrentSolutionAsync(token));
+
             try
             {
                 await _pipeServer.StartAsync(this.DisposalToken).ConfigureAwait(false);
@@ -106,13 +130,11 @@ namespace VsMcp
                 pkgLogger.LogError(ex, "MCP pipe server failed to start: {Message}", ex.Message);
             }
 
-            // Heartbeat: periodically probe the Gateway's liveness by writing a
-            // heartbeat frame through the pipe. A sustained miss window (Gateway
-            // crashed / taskkilled) triggers a preemptive relaunch so VS self-heals
-            // without user intervention (设计文档 §抢占式 Gateway 拉起). The loop
-            // starts in the constructor and stops on Dispose; it never blocks VS
-            // exit (HeartbeatClient.Dispose is synchronous + non-blocking, cloning
-            // KeepAliveNotifier's teardown pattern).
+            // 心跳：通过 pipe 周期性写入一帧 heartbeat 来探测 Gateway 的存活。持续的
+            // miss 窗口（Gateway 崩溃 / 被 taskkill）会触发抢占式重新拉起，让 VS 无需
+            // 用户介入即可自愈（设计文档 §抢占式 Gateway 拉起）。该循环在构造函数里
+            // 启动、在 Dispose 时停止；它从不阻塞 VS 退出（HeartbeatClient.Dispose 是
+            // 同步且非阻塞的，克隆自 KeepAliveNotifier 的停机模式）。
             _heartbeat = new HeartbeatClient(
                 pid,
                 sendHeartbeat: ct => _pipeServer.SendHeartbeatAsync(ct),
@@ -120,13 +142,10 @@ namespace VsMcp
                 callerToken: this.DisposalToken,
                 logger: loggerFactory.CreateLogger<HeartbeatClient>());
 
-            // Subscribe to solution open/close so the Gateway's routing table
-            // (SolutionDir used by the ① Header tier + list_vs_instances) stays
-            // live as the user opens/closes solutions after VS startup. Runs on
-            // the UI thread (needs IVsSolution + DTE services); fire-and-forget
-            // so a slow service query never blocks package load.
-            _solutionSubscriber = new SolutionEventsSubscriber(
-                this, _pipeServer, this.DisposalToken, loggerFactory.CreateLogger<SolutionEventsSubscriber>());
+            // 订阅 solution 的打开/关闭，使 Gateway 的路由表（① Header 层 +
+            // list_vs_instances 用的 SolutionDir）在 VS 启动后用户打开/关闭解决方案时
+            // 保持最新。在 UI 线程运行（需要 IVsSolution + DTE 服务）；fire-and-forget，
+            // 这样一次缓慢的 service 查询绝不会阻塞 package 加载。
             _ = Task.Run(async () =>
             {
                 try
@@ -141,38 +160,42 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Path B of the F-3 A+B hybrid teardown (RESEARCH Open Question #1).
-        /// Best-effort, NON-blocking. PipeMcpServer.Dispose() is synchronous and
-        /// non-blocking (cancels the accept loop and fire-and-forgets the processor's
-        /// async teardown), so calling it here cannot deadlock VS exit. Idempotent
-        /// (PipeMcpServer guards its _disposed flag).
+        /// F-3 A+B 混合停机的 Path B（RESEARCH Open Question #1）。尽力而为、非阻塞。
+        /// PipeMcpServer.Dispose() 是同步且非阻塞的（取消 accept 循环并对处理器的异步
+        /// 停机 fire-and-forget），所以在这里调用它不会死锁 VS 退出。幂等
+        /// （PipeMcpServer 守护了自身的 _disposed 标志）。
         /// </summary>
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
-                try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
-                try { _heartbeat?.Dispose(); } catch { /* teardown must never throw */ }
-                try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
+                try { _solutionSubscriber?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
+                try { _heartbeat?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
+                try { _pipeServer?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
                 _facade?.Dispose();
                 _symbolFacade?.Dispose();
+#if EVAL_CSHARP
+                _evalFacade?.Dispose();
+#endif
             }
             base.Dispose(disposing);
         }
 
         /// <summary>
-        /// Path A of the F-3 A+B hybrid teardown (RESEARCH Pitfall #1 +
-        /// Open Question #1). Explicit-interface implementation of
-        /// IVsPackage.Close() — VS invokes this on exit. Same idempotent
-        /// non-blocking teardown as Dispose(bool).
+        /// F-3 A+B 混合停机的 Path A（RESEARCH Pitfall #1 + Open Question #1）。
+        /// IVsPackage.Close() 的显式接口实现 —— VS 在退出时调用它。与 Dispose(bool)
+        /// 相同的幂等非阻塞停机。
         /// </summary>
         int Microsoft.VisualStudio.Shell.Interop.IVsPackage.Close()
         {
-            try { _solutionSubscriber?.Dispose(); } catch { /* teardown must never throw */ }
-            try { _heartbeat?.Dispose(); } catch { /* teardown must never throw */ }
-            try { _pipeServer?.Dispose(); } catch { /* teardown must never throw */ }
+            try { _solutionSubscriber?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
+            try { _heartbeat?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
+            try { _pipeServer?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
             _facade?.Dispose();
             _symbolFacade?.Dispose();
+#if EVAL_CSHARP
+            _evalFacade?.Dispose();
+#endif
             return VSConstants.S_OK;
         }
     }

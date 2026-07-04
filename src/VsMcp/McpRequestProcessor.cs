@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
@@ -29,7 +30,13 @@ namespace VsMcp
         private readonly Task _serverRunTask;
         private readonly DebuggerFacade? _facade;
         private readonly SymbolFacade? _symbolFacade;
+#if EVAL_CSHARP
+        private readonly EvalCsharpFacade? _evalFacade;
+#endif
         private readonly bool _enableGoToDefinition;
+#if EVAL_CSHARP
+        private readonly bool _enableEvalCsharp;
+#endif
         private readonly ILoggerFactory? _loggerFactory;
 
         // D-01: 处理器拥有自己的 linked CTS —— 取消调用方 token（VS package
@@ -43,18 +50,36 @@ namespace VsMcp
         /// 取消时传播到 SDK RunAsync 循环。</param>
         /// <param name="facade">调试器 facade；为 null 则不注册调试工具。</param>
         /// <param name="symbolFacade">符号 facade；为 null 则不注册符号工具。</param>
+#if EVAL_CSHARP
+        /// <param name="evalFacade">eval_csharp facade；为 null 或 <paramref name="enableEvalCsharp"/>=false 则不注册。</param>
+#endif
         /// <param name="enableGoToDefinition">是否注册 go_to_definition（有副作用，opt-in）。</param>
+#if EVAL_CSHARP
+        /// <param name="enableEvalCsharp">是否注册 eval_csharp（任意代码执行，opt-in）。</param>
+#endif
         /// <param name="loggerFactory">可选日志工厂。</param>
         public McpRequestProcessor(
             CancellationToken callerToken,
             DebuggerFacade? facade,
             SymbolFacade? symbolFacade,
+#if EVAL_CSHARP
+            EvalCsharpFacade? evalFacade,
+#endif
             bool enableGoToDefinition,
+#if EVAL_CSHARP
+            bool enableEvalCsharp,
+#endif
             ILoggerFactory? loggerFactory)
         {
             _facade = facade;
             _symbolFacade = symbolFacade;
+#if EVAL_CSHARP
+            _evalFacade = evalFacade;
+#endif
             _enableGoToDefinition = enableGoToDefinition;
+#if EVAL_CSHARP
+            _enableEvalCsharp = enableEvalCsharp;
+#endif
             _loggerFactory = loggerFactory;
 
             _transport = new StreamableHttpServerTransport(loggerFactory);
@@ -90,12 +115,11 @@ namespace VsMcp
 
             if (_facade != null)
             {
-                // F-6 / D-10: every facade-calling lambda is wrapped via
-                // SafeCall.Wrap so a facade exception becomes a
-                // CallToolResult{IsError=true} + ErrorResult (D-12). The
-                // Name/Description/ReadOnly/Destructive flags and the
-                // delegate input parameters are UNCHANGED so the MCP SDK's
-                // derived input schemas stay byte-identical.
+                // F-6 / D-10：每个调用 facade 的 lambda 都经 SafeCall.Wrap 包装，
+                // 这样 facade 抛出的异常会变成 CallToolResult{IsError=true} +
+                // ErrorResult (D-12)。Name/Description/ReadOnly/Destructive 标志
+                // 以及 delegate 的输入参数保持不变，使 MCP SDK 派生出的输入
+                // schema 在字节级保持完全一致。
                 tools.Add(McpServerTool.Create(
                     (CancellationToken ct) => SafeCall.Wrap(() => _facade.GetDebuggerStateAsync(ct), ct),
                     new McpServerToolCreateOptions
@@ -120,7 +144,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string? query, CancellationToken ct) => SafeCall.Wrap(() => _facade.SearchProjectsAsync(query, ct), ct),
+                    SearchProjectToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "search_project",
@@ -129,16 +153,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string startProgram,
-                     string? startArguments,
-                     string? environmentVariablesJson,
-                     string? workingDirectory,
-                     string? debugEngine,
-                     CancellationToken ct) => SafeCall.Wrap(
-                        () => _facade.StartDebuggingAsync(
-                            startProgram, startArguments, environmentVariablesJson,
-                            workingDirectory, debugEngine, ct),
-                        ct),
+                    StartDebuggingToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "start_debugging",
@@ -175,7 +190,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (bool confirm, CancellationToken ct) => SafeCall.Wrap(() => _facade.ClearAllBreakpointsAsync(confirm, ct), ct),
+                    ClearAllBreakpointsToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "clear_all_breakpoints",
@@ -193,7 +208,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (int maxLines, bool tail, CancellationToken ct) => SafeCall.Wrap(() => _facade.GetBuildOutputAsync(maxLines > 0 ? maxLines : 200, tail, ct), ct),
+                    GetBuildOutputToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "get_build_output",
@@ -202,8 +217,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (bool waitForBreak, int timeoutSeconds, McpServer server, CancellationToken ct) => SafeCall.Wrap(
-                        () => RunContinueWithKeepAliveAsync(waitForBreak, timeoutSeconds, server, ct), ct),
+                    ContinueExecutionToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "continue_execution",
@@ -250,11 +264,11 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (int maxChars, CancellationToken ct) => SafeCall.Wrap(() => _facade.GetLocalVariablesAsync(maxChars > 0 ? maxChars : 1024, ct), ct),
+                    ListLocalVariablesToolAsync,
                     new McpServerToolCreateOptions
                     {
-                        Name = "get_local_variables",
-                        Description = "Returns all local variables at the current stack frame with names, types, and values. Output may be truncated if total size exceeds maxChars (default 1024) — drill into a specific variable with get_variable_detail when hasChildren=true. Prerequisite: break mode (returns not_in_break_mode otherwise).",
+                        Name = "list_local_variables",
+                        Description = "Lists all local variables at the current stack frame, SHALLOW: each entry shows name/type/value/hasChildren only, children are NOT expanded. Use get_variable_detail to drill into any with hasChildren=true. maxLocals (default 200) and maxChars (default 4096) cap the output so a frame with many/deep locals can't blow up the context. Prerequisite: break mode (returns not_in_break_mode otherwise).",
                         ReadOnly = true
                     }));
 
@@ -268,7 +282,7 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string expression, int maxChars, CancellationToken ct) => SafeCall.Wrap(() => _facade.EvaluateExpressionAsync(expression, maxChars > 0 ? maxChars : 1024, ct), ct),
+                    EvaluateExpressionToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "evaluate_expression",
@@ -277,23 +291,27 @@ namespace VsMcp
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string variableName, int maxChars, CancellationToken ct) => SafeCall.Wrap(() => _facade.GetVariableDetailAsync(variableName, maxChars > 0 ? maxChars : 1024, ct), ct),
+                    GetVariableDetailToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "get_variable_detail",
-                        Description = "Drills into a specific variable's children/properties. Use when get_local_variables shows truncated output (hasChildren: true). Prerequisite: break mode (returns not_in_break_mode otherwise).",
+                        Description = "Expands one or more variables/expressions to a limited depth, tree-style. 'expressions' is an array of debugger expressions — each can be a local name OR any C++/C# expression (obj.member, arr[3], ptr->next), evaluated by the debug engine. 'depth' (default 1) controls how many layers of children are expanded; deeper layers stay hasChildren=true for follow-up calls, keeping each response bounded. Use after list_local_variables to drill into hasChildren=true entries. Prerequisite: break mode (returns not_in_break_mode otherwise).",
                         ReadOnly = true
                     }));
             }
 
             if (_symbolFacade != null)
             {
+                // find_symbol 注册到具名方法（而非 lambda）上，这样 maxResults 就能
+                // 带 C# 默认值 —— MCP SDK 通过反射方法的 ParameterInfo.HasDefaultValue
+                // 在 schema 中将其标为可选。lambda 的参数无法声明默认值，因此会被
+                // 强制设为必填（早先的 int? 尝试已证明这点）。
                 tools.Add(McpServerTool.Create(
-                    (string query, int maxResults, CancellationToken ct) => SafeCall.Wrap(() => _symbolFacade.FindSymbolAsync(query, maxResults > 0 ? maxResults : 200, ct), ct),
+                    FindSymbolToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "find_symbol",
-                        Description = "Searches all loaded language libraries (C#, VB, C++) for symbols whose name contains the query (case-insensitive substring). Returns matches with source file path and line number when available; column is never available. Far more accurate than grep because it uses the language services' semantic model, not text matching.",
+                        Description = "Searches symbols across every language (C#, VB, C++) via NavigateTo — VS's 'Go To All' (Ctrl+T) backend — so accuracy matches in-IDE symbol search, including for C++ (served by the VC Language Server over LSP workspace/symbol). Returns the most relevant matches: default 16, capped by the optional maxResults. Each match carries source file path, 1-based line, and column when the provider reports it, plus the symbol kind and language. Far more accurate than grep because it uses the language services' semantic model, not text matching.",
                         ReadOnly = true
                     }));
 
@@ -319,8 +337,103 @@ namespace VsMcp
                 }
             }
 
+#if EVAL_CSHARP
+            if (_enableEvalCsharp && _evalFacade != null)
+            {
+                // eval_csharp：VS 进程内动态执行 C#（Roslyn scripting）。装一次扩展后
+                // 零编译探查 VS 内部状态，把过去"改探查点→编 vsix→卸载→装→重启→读日志"
+                // 的数分钟循环压成一次 MCP 调用。任意代码执行，安全敏感 —— 仅 Tools→Options
+                // 开启 EnableEvalCsharp 时注册（默认关，对 agent 不可见）。
+                tools.Add(McpServerTool.Create(
+                    EvalCsharpToolAsync,
+                    new McpServerToolCreateOptions
+                    {
+                        Name = "eval_csharp",
+                        Description = "在 VS 进程内用 Roslyn scripting 动态执行一段 C# 脚本（顶层语句 + await），用于实时探查/操作 VS 内部状态。脚本经注入的 globals 访问 VS：Package(AsyncPackage)、JTF(JoinableTaskFactory) —— 用 `await JTF.SwitchToMainThreadAsync()` 切 UI 线程，用 `await Package.GetServiceAsync(typeof(...))` 拿任意 VS 服务，可反射读非 public 字段。用 `Log(obj)` 记录输出；末尾 `return` 一个值。返回 Output(Log 累计) + ResultJson(return 值的 JSON) + Error(编译/运行/超时错误，非 null 表示失败)。任意代码执行，仅在 Tools→Options 开启 EnableEvalCsharp 时可用。",
+                        Destructive = true
+                    }));
+            }
+#endif
+
             return tools;
         }
+
+        /// <summary>
+        /// 下面的工具处理器都是具名方法（而非 lambda），这样它们的“可选”参数就能
+        /// 带 C# 默认值 —— MCP SDK 读取 ParameterInfo.HasDefaultValue 来在 schema 中
+        /// 把参数标为可选。lambda 的参数无法声明默认值，所以用 lambda 注册工具会把
+        /// 每个参数都强制设为必填，与文档声明的默认值相矛盾。CancellationToken（以及
+        /// McpServer）由 SDK 注入，不出现在 schema 中。
+        /// </summary>
+#pragma warning disable VSTHRD200 // 作为工具处理器交给 MCP SDK；从不按名字 await
+        public async Task<object> FindSymbolToolAsync(string query, int maxResults = 16, int maxChars = 8000, CancellationToken ct = default)
+        {
+            try
+            {
+                string text = await _symbolFacade!.FindSymbolAsync(query, maxResults > 0 ? maxResults : 16, maxChars > 0 ? maxChars : 8000, ct).ConfigureAwait(false);
+                // 纯文本输出（不经 JSON 序列化）：find_symbol 返回的是带行号的源码上下文，
+                // JSON 包裹既费 token 又把换行转义成 \n。手动构造 CallToolResult 直接透传文本。
+                return new CallToolResult
+                {
+                    Content = new List<ContentBlock> { new TextContentBlock { Text = text } }
+                };
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                SymbolFacade.ProbeLog($"find_symbol failed: {ex.GetType().Name}: {ex.Message}");
+                return new ErrorResult("internal_error", ex.Message).ToCallToolResult();
+            }
+        }
+
+        public Task<object> SearchProjectToolAsync(string? query = null, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.SearchProjectsAsync(query, ct), ct);
+
+        public Task<object> StartDebuggingToolAsync(
+            string startProgram,
+            string? startArguments = null,
+            string? environmentVariablesJson = null,
+            string? workingDirectory = null,
+            string? debugEngine = null,
+            CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.StartDebuggingAsync(
+                startProgram, startArguments, environmentVariablesJson, workingDirectory, debugEngine, ct), ct);
+
+        public Task<object> ClearAllBreakpointsToolAsync(bool confirm = false, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.ClearAllBreakpointsAsync(confirm, ct), ct);
+
+        public Task<object> GetBuildOutputToolAsync(int maxLines = 200, bool tail = true, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.GetBuildOutputAsync(maxLines > 0 ? maxLines : 200, tail, ct), ct);
+
+        // McpServer（同 CancellationToken 一样）由 SDK 注入，不在 schema 中；
+        // 真正的可选 schema 参数是 waitForBreak / timeoutSeconds。server 必须排在
+        // 它们前面，因为它没有默认值。
+        public Task<object> ContinueExecutionToolAsync(McpServer server, bool waitForBreak = false, int timeoutSeconds = 0, CancellationToken ct = default)
+            => SafeCall.Wrap(() => RunContinueWithKeepAliveAsync(waitForBreak, timeoutSeconds, server, ct), ct);
+
+        // list_local_variables：浅列当前栈帧所有 local（只顶层 name/type/value/hasChildren，
+        // 不展开 children）。maxLocals/maxChars 双保险防 local 极多爆上下文。
+        public Task<object> ListLocalVariablesToolAsync(int maxLocals = 200, int maxChars = 4096, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.ListLocalVariablesAsync(maxLocals, maxChars, ct), ct);
+
+        public Task<object> EvaluateExpressionToolAsync(string expression, int maxChars = 1024, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.EvaluateExpressionAsync(expression, maxChars > 0 ? maxChars : 1024, ct), ct);
+
+#if EVAL_CSHARP
+        // eval_csharp：动态执行 C# 脚本。timeoutSeconds 默认 30（防死循环；<=0 不限）。
+        // 经 SafeCall.Wrap —— 成功路径 EvalCsharpResult 走 McpJson.ReadableOptions 序列化
+        // （中文不转义）。脚本编译/运行/超时错误封装进 EvalCsharpResult.Error 正常返回
+        // （非 IsError），把详情透给 agent 而非笼统 internal_error；仅 VS 关停级取消透明重抛。
+        public Task<object> EvalCsharpToolAsync(string code, int timeoutSeconds = 30, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _evalFacade!.EvalAsync(code, timeoutSeconds, ct), ct);
+#endif
+
+        // get_variable_detail：按一组调试器表达式批量取变量详情，每个展开 depth 层。
+        // expressions 元素是任意 C++/C# 表达式（local 名、obj.member、arr[3]、ptr->next），
+        // 由调试引擎求值，工具里不造路径语法。depth=1 默认只展开直接 children，防爆上下文。
+        public Task<object> GetVariableDetailToolAsync(string[] expressions, int depth = 1, int maxChars = 4096, CancellationToken ct = default)
+            => SafeCall.Wrap(() => _facade!.GetVariableDetailAsync(expressions, depth, maxChars, ct), ct);
+#pragma warning restore VSTHRD200
 
         /// <summary>
         /// build_solution 的保活包装：构建期间每 2 秒把 Build pane 的新增日志行
@@ -420,11 +533,11 @@ namespace VsMcp
 
                 if (_serverRunTask != null)
                 {
-                    // SDK run loop; cancellation-safe — SDK self-disposes in finally
+                    // SDK run 循环；可安全取消 —— SDK 在 finally 中自行释放
 #pragma warning disable VSTHRD003
                     try { await _serverRunTask.ConfigureAwait(false); }
                     catch (OperationCanceledException) { }
-                    catch { /* teardown must not throw */ }
+                    catch { /* 停机期间绝不能抛异常 */ }
 #pragma warning restore VSTHRD003
                 }
 
@@ -451,7 +564,7 @@ namespace VsMcp
             }
             catch
             {
-                // Observed — never crash the process via unobserved exception.
+                // 已观察 —— 绝不让 unobserved exception 崩溃进程。
             }
         }
     }

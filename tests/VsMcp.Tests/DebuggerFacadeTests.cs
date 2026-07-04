@@ -8,27 +8,25 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// DTO-shape tests for the records <see cref="DebuggerFacade"/>
-    /// produces. The prior version asserted on the now-deleted hand-rolled
-    /// JSON string builders (F-6 removed both); this rewrite asserts on the
-    /// parsed JSON structure of each DTO the facade now returns, which is
-    /// the F-14 fix (no substring matching on hand-built JSON).
+    /// <see cref="DebuggerFacade"/> 产生的 record 的 DTO 形态测试。旧版本
+    /// 断言已删除的手工 JSON 字符串构建器（F-6 移除了两者）；此重写断言
+    /// facade 现在每个 DTO 返回的解析后 JSON 结构，即 F-14 修复（不对
+    /// 手工 JSON 做子串匹配）。
     ///
-    /// The facade itself requires a concrete AsyncPackage (VS SDK runtime)
-    /// and is exercised in the plan 05-04 VS experimental-hive smoke
-    /// test; these COM-free tests cover only the DTO shapes the facade
-    /// emits — same surface, no VS dependency.
+    /// facade 本身需要具体的 AsyncPackage（VS SDK 运行时），在 plan 05-04
+    /// VS 实验 hive 冒烟测试中演练；这些无 COM 测试只覆盖 facade 发出的
+    /// DTO 形态 —— 同样的表面，无 VS 依赖。
     /// </summary>
     public class DebuggerFacadeTests
     {
-        // --- state field (D-11 / F-15 collapse) ---
+        // --- state 字段（D-11 / F-15 合并） ---
 
         [Fact]
         public void DebuggerStateResult_ProducesStateKeyInCamelCase()
         {
-            // Facade returns DebuggerStateResult for get_debugger_state.
-            // The serialized JSON must carry the normalized "state" key
-            // (not "State", "status", or "debugger_state").
+            // Facade 为 get_debugger_state 返回 DebuggerStateResult。
+            // 序列化后的 JSON 必须带规范化的 "state" 键
+            // （而非 "State"、"status" 或 "debugger_state"）。
             var dto = new DebuggerStateResult("break");
             var json = JsonSerializer.Serialize(dto, McpJsonUtilities.DefaultOptions);
 
@@ -42,8 +40,8 @@ namespace VsMcp.Tests
         [Fact]
         public void ExecutionResult_UsesStateKey_NotStatus()
         {
-            // continue_execution / step_* / stop_debugging return ExecutionResult.
-            // D-11: the field is "state", killing the prior status/state split.
+            // continue_execution / step_* / stop_debugging 返回 ExecutionResult。
+            // D-11：字段是 "state"，消除此前的 status/state 分裂。
             var dto = new ExecutionResult("running", "Execution continued");
             var json = JsonSerializer.Serialize(dto, McpJsonUtilities.DefaultOptions);
 
@@ -53,7 +51,7 @@ namespace VsMcp.Tests
             Assert.False(doc.RootElement.TryGetProperty("status", out _));
         }
 
-        // --- breakpoint DTOs ---
+        // --- 断点 DTO ---
 
         [Fact]
         public void BreakpointSetResult_SerializesAllFieldsCamelCase()
@@ -106,7 +104,7 @@ namespace VsMcp.Tests
             Assert.Equal(3, doc.RootElement.GetProperty("deleted").GetInt32());
         }
 
-        // --- call stack DTOs ---
+        // --- 调用栈 DTO ---
 
         [Fact]
         public void CallStackResult_SerializesFramesAndCounts()
@@ -122,7 +120,7 @@ namespace VsMcp.Tests
             Assert.Equal(1, doc.RootElement.GetProperty("frames").GetArrayLength());
         }
 
-        // --- locals / expression DTOs ---
+        // --- 局部变量 / 表达式 DTO ---
 
         [Fact]
         public void LocalsResult_SerializesTruncationFlag()
@@ -151,7 +149,7 @@ namespace VsMcp.Tests
             Assert.Equal("obj", doc.RootElement.GetProperty("expression").GetProperty("name").GetString());
         }
 
-        // --- session info DTO (get_session_info) ---
+        // --- session 信息 DTO（get_session_info） ---
 
         [Fact]
         public void SessionInfoResult_SerializesAllFieldsCamelCase()
@@ -188,15 +186,13 @@ namespace VsMcp.Tests
 
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            // Null reference fields may be omitted OR null under Web-default
-            // serialization — both are valid; the only hard assertion is that
-            // the empty projects array survives as an array and no exception
-            // is thrown.
+            // Null 引用字段在 Web 默认序列化下可能被省略或为 null —— 两者都
+            // 合法；唯一的硬断言是空 projects 数组仍以数组形式存活且不抛异常。
             Assert.Equal("design", root.GetProperty("state").GetString());
             Assert.Equal(0, root.GetProperty("projects").GetArrayLength());
         }
 
-        // --- NormalizeFilePath (pure helper extracted from SetBreakpointAsync) ---
+        // --- NormalizeFilePath（从 SetBreakpointAsync 提取的纯辅助方法） ---
 
         [Theory]
         [InlineData(@"C:\src\app.cs", @"C:\SRC\APP.CS")]

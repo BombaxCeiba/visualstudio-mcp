@@ -13,28 +13,26 @@ using Microsoft.VisualStudio.Shell.Interop;
 namespace VsMcp
 {
     /// <summary>
-    /// Subscribes to <see cref="IVsSolutionEvents"/> and forwards open/close
-    /// transitions to the Gateway as <c>solution-changed</c> pipe pushes (设计文档
-    /// §Solution 信息动态更新). Without this, the Gateway's routing table would
-    /// keep the solution path captured at register time forever, so the ① Header
-    /// tier and list_vs_instances would go stale whenever the user opens/closes a
-    /// solution after VS startup.
+    /// 订阅 <see cref="IVsSolutionEvents"/> 并把打开/关闭转换以
+    /// <c>solution-changed</c> pipe 推送转发给 Gateway（设计文档
+    /// §Solution 信息动态更新）。若没有它，Gateway 的路由表会永远保留注册时
+    /// 捕获的解决方案路径，故一旦用户在 VS 启动后打开/关闭解决方案，① Header
+    /// 层与 list_vs_instances 就会变陈旧。
     ///
-    /// Subscription uses the COM connection-point pattern
-    /// (<see cref="IConnectionPointContainer"/>/<see cref="IConnectionPoint"/>)
-    /// rather than the SDK's <c>SolutionEvents</c> helper: IVsSolutionEvents
-    /// fires reliably for both .sln and folder/CMake opens, whereas the EnvDTE
-    /// <c>DTE.Events.SolutionEvents</c> is brittle for folder projects (the core
-    /// C++ use case — see the package's NoSolution autoload rationale).
+    /// 订阅使用 COM 连接点模式
+    /// （<see cref="IConnectionPointContainer"/>/<see cref="IConnectionPoint"/>）
+    /// 而非 SDK 的 <c>SolutionEvents</c> 助手：IVsSolutionEvents 对 .sln 与
+    /// folder/CMake 打开都能可靠触发，而 EnvDTE 的
+    /// <c>DTE.Events.SolutionEvents</c> 对 folder 项目不稳定（核心 C++ 用例——
+    /// 见 package 的 NoSolution autoload 缘由）。
     ///
-    /// The COM callbacks arrive on the UI thread. We read
-    /// <c>DTE.Solution.FullName</c> inline (safe on the UI thread, no thread hop
-    /// — avoids reentering <see cref="DebuggerFacade.GetSessionInfoAsync"/> which
-    /// would itself switch to the UI thread) and then hand the resolved path to
-    /// a fire-and-forget task that writes the pipe frame. The pipe write swallows
-    /// its own errors, so a transient Gateway disconnect never crashes the UI.
+    /// COM 回调抵达 UI 线程。我们内联读 <c>DTE.Solution.FullName</c>（在 UI
+    /// 线程上安全，无线程跳转——避免重入
+    /// <see cref="DebuggerFacade.GetSessionInfoAsync"/>，后者本身也会切到 UI
+    /// 线程），然后把解析到的路径交给一个 fire-and-forget 任务去写 pipe 帧。
+    /// pipe 写入吞掉自己的错误，故瞬态 Gateway 断开绝不会崩 UI。
     /// </summary>
-    internal sealed class SolutionEventsSubscriber : IVsSolutionEvents, IDisposable
+    internal sealed class SolutionEventsSubscriber : IVsSolutionEvents, IVsSolutionEvents7, IDisposable
     {
         private readonly AsyncPackage _package;
         private readonly PipeMcpServer _pipe;
@@ -43,10 +41,11 @@ namespace VsMcp
 
         private DTE2? _dte;
         private IVsSolution? _solution;
-        private IConnectionPoint? _connectionPoint;
-        // VSCOOKIE_NIL is 0; System.Runtime.InteropServices.ComTypes.Advise/Unadvise
-        // use int cookies on this surface, so we track an int and treat 0 as "no advise".
-        private int _cookie;
+        // IVsSolution.AdviseSolutionEvents 返回一个 uint cookie（VSCOOKIE）；0 表示
+        // "未订阅"。之前的 IConnectionPointContainer 路径静默失败，因为
+        // IVsSolution RCW 在 net48 下不 QI 到 IConnectionPointContainer，
+        // 故 Advise 实际从未运行——OnAfterOpenSolution 从未触发。
+        private uint _cookie;
 
         public SolutionEventsSubscriber(AsyncPackage package, PipeMcpServer pipe, CancellationToken callerToken, ILogger? logger)
         {
@@ -57,17 +56,17 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Acquire <see cref="IVsSolution"/> + <see cref="DTE2"/> on the UI
-        /// thread and advise the solution-events connection point. Idempotent
-        /// and best-effort: if the services are unavailable, the subscriber
-        /// stays inert (the register frame + reconnects still keep the Gateway
-        /// roughly correct; this just makes it live).
+        /// 在 UI 线程上获取 <see cref="IVsSolution"/> + <see cref="DTE2"/> 并
+        /// 注册 solution-events 连接点。幂等且尽力而为：若服务不可用，订阅者
+        /// 保持惰性（register 帧 + 重连仍能让 Gateway 大致正确；此处只是让它
+        /// 变实时）。
         /// </summary>
         public async Task InitializeAsync(CancellationToken ct)
         {
-            // SwitchToMainThreadAsync returns MainThreadAwaitable which has no
-            // ConfigureAwait — await it directly (DebuggerFacade uses the same form).
+            // SwitchToMainThreadAsync 返回的 MainThreadAwaitable 没有
+            // ConfigureAwait——直接 await（DebuggerFacade 用同样形式）。
             await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
+            _logger?.LogInformation("SolutionEventsSubscriber.InitializeAsync: on UI thread, acquiring DTE + IVsSolution");
 
             try
             {
@@ -75,7 +74,7 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
-                _logger?.LogDebug(ex, "Failed to acquire DTE for solution-events subscription");
+                _logger?.LogInformation("InitializeAsync: DTE acquire threw: {Message}", ex.Message);
             }
 
             try
@@ -84,44 +83,57 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
-                _logger?.LogDebug(ex, "Failed to acquire IVsSolution for solution-events subscription");
+                _logger?.LogInformation("InitializeAsync: IVsSolution acquire threw: {Message}", ex.Message);
             }
 
-            if (_solution == null) return;
-
-            // Cast the RCW to the COM connection-point container and find the
-            // outbound interface for IVsSolutionEvents. Advise registers `this`
-            // as the sink (the runtime builds a CCW exposing IVsSolutionEvents).
-            if (_solution is IConnectionPointContainer cpc)
+            _logger?.LogInformation(
+                "InitializeAsync: dte_acquired={Dte} solution_acquired={Sol}",
+                _dte != null, _solution != null);
+            if (_solution == null)
             {
-                Guid iid = typeof(IVsSolutionEvents).GUID;
-                try
-                {
-                    cpc.FindConnectionPoint(ref iid, out _connectionPoint);
-                    if (_connectionPoint != null)
-                        _connectionPoint.Advise(this, out _cookie);
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogDebug(ex, "IVsSolutionEvents Advise failed; solution-changed push disabled");
-                }
+                _logger?.LogInformation(
+                    "InitializeAsync: IVsSolution is null — subscription aborted, OnAfterOpenSolution will NOT fire");
+                return;
+            }
+
+            // 经 IVsSolution.AdviseSolutionEvents（接口自身的方法）订阅——
+            // 而非 IConnectionPointContainer。IVsSolution RCW 在 net48 下不 QI 到
+            // IConnectionPointContainer，故 COM 连接点方式静默地从不订阅。
+            // AdviseSolutionEvents 是受支持的路径，对 .sln / .slnx / Open Folder
+            // 都会触发。
+            try
+            {
+                int hr = _solution.AdviseSolutionEvents(this, out _cookie);
+                if (hr == VSConstants.S_OK && _cookie != 0)
+                    _logger?.LogInformation(
+                        "InitializeAsync: AdviseSolutionEvents succeeded, cookie={Cookie} — OnAfterOpenSolution/Close WILL fire",
+                        _cookie);
+                else
+                    _logger?.LogInformation(
+                        "InitializeAsync: AdviseSolutionEvents failed hr=0x{Hr:X8} cookie={Cookie}", hr, _cookie);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogInformation("InitializeAsync: AdviseSolutionEvents threw: {Message}", ex.Message);
             }
         }
 
         // ───────────────────────── IVsSolutionEvents ──────────────────────────
         //
-        // Only the two open/close solution transitions trigger a push. Every
-        // other callback returns S_OK so VS proceeds with its default behavior.
+        // 仅打开/关闭解决方案这两个转换触发推送。其余每个回调都返回 S_OK，
+        // 让 VS 按其默认行为继续。
 
         int IVsSolutionEvents.OnAfterOpenSolution(object pUnkReserved, int fNewSolution)
         {
+            _logger?.LogInformation("OnAfterOpenSolution triggered — pushing current solution");
             PushCurrentSolution();
             return VSConstants.S_OK;
         }
 
         int IVsSolutionEvents.OnAfterCloseSolution(object pUnkReserved)
         {
-            // Solution is gone → push nulls so the Gateway renders "(no solution)".
+            _logger?.LogInformation("OnAfterCloseSolution triggered — pushing null solution");
+            // 解决方案已没了 → 推送 null，让 Gateway 渲染"(no solution)"。
             PushSolutionValues(solutionPath: null, solutionDir: null, solutionName: null);
             return VSConstants.S_OK;
         }
@@ -135,39 +147,84 @@ namespace VsMcp
         int IVsSolutionEvents.OnQueryCloseSolution(object pUnkReserved, ref int pfCancel) => VSConstants.S_OK;
         int IVsSolutionEvents.OnBeforeCloseSolution(object pUnkReserved) => VSConstants.S_OK;
 
+        // ───────────────────────── IVsSolutionEvents7 (folder mode) ──────────────
+        // Open Folder（CMake / 轻量打开）不触发
+        // IVsSolutionEvents.OnAfterOpenSolution——它用 IVsSolutionEvents7
+        // （VS 2017+）。同一个 AdviseSolutionEvents 订阅会送达这些回调：
+        // VS 把 sink RCW QI 到 IVsSolutionEvents7 并为 folder 模式加载调用
+        // folder 方法。folderPath 是打开的文件夹；把它同时作为解决方案路径
+        // 与其目录（没有 .sln）。
+        void IVsSolutionEvents7.OnAfterOpenFolder(string folderPath)
+        {
+            _logger?.LogInformation("IVsSolutionEvents7.OnAfterOpenFolder: {Folder}", folderPath ?? "(null)");
+            if (!string.IsNullOrWhiteSpace(folderPath))
+            {
+                string name = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                PushSolutionValues(folderPath, folderPath, name);
+            }
+        }
+
+        void IVsSolutionEvents7.OnBeforeCloseFolder(string folderPath) { }
+
+        void IVsSolutionEvents7.OnQueryCloseFolder(string folderPath, ref int pfCancel) { pfCancel = 0; }
+
+        void IVsSolutionEvents7.OnAfterCloseFolder(string folderPath)
+        {
+            _logger?.LogInformation("IVsSolutionEvents7.OnAfterCloseFolder: {Folder}", folderPath ?? "(null)");
+            PushSolutionValues(solutionPath: null, solutionDir: null, solutionName: null);
+        }
+
+        void IVsSolutionEvents7.OnAfterLoadAllDeferredProjects() { }
+
         /// <summary>
-        /// Read the current solution path inline (we're on the UI thread — the COM
-        /// event delivered us here) and hand it to the fire-and-forget push. This
-        /// avoids any thread hop to read the path: reentering
-        /// <see cref="DebuggerFacade.GetSessionInfoAsync"/> from the callback would
-        /// switch to the UI thread we're already on and do extra work (project
-        /// enumeration) we don't need.
+        /// 在 UI 线程上重新读取当前解决方案并推送给 Gateway。由 PipeMcpServer 在
+        /// 每次成功 register 后调用，以弥合"连接前已打开"的时序缺口
+        /// （OnAfterOpenSolution 在 pipe 为 null 时触发，那次推送被丢弃），并在
+        /// Gateway 重连后重新同步。自行跳到 UI 线程，故调用方（一个后台
+        /// connect-loop 任务）不必在 UI 线程上。
+        /// </summary>
+        public async Task PushCurrentSolutionAsync(CancellationToken ct)
+        {
+            try
+            {
+                // SwitchToMainThreadAsync 返回的 MainThreadAwaitable 没有
+                // ConfigureAwait——直接 await（与 InitializeAsync 同形式）。
+                await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
+                PushCurrentSolution();
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { /* 关停 */ }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "PushCurrentSolutionAsync failed");
+            }
+        }
+
+        /// <summary>
+        /// 内联读取当前解决方案路径（我们在 UI 线程上——COM 事件把我们送到
+        /// 这里）并交给 fire-and-forget 推送。这避免了为读路径做任何线程跳转：
+        /// 从回调重入 <see cref="DebuggerFacade.GetSessionInfoAsync"/> 会切到
+        /// 我们已在的 UI 线程，并做我们不需要的额外工作（项目枚举）。
         /// </summary>
         private void PushCurrentSolution()
         {
-            string? path = null, dir = null, name = null;
-            try
+            // IVsSolution 对 .sln/.slnx/Open Folder 是权威；DTE.Solution.FullName
+            // 对 .slnx + folder 为空（已知的自动化模型缺口）。
+            var (path, dir) = DebuggerFacade.ReadSolutionPaths(_solution, _dte);
+            string? name = null;
+            if (path != null)
             {
-                string fullName = _dte?.Solution?.FullName ?? "";
-                if (!string.IsNullOrWhiteSpace(fullName))
-                {
-                    path = fullName;
-                    try { dir = Path.GetDirectoryName(fullName); } catch { }
-                    try { name = Path.GetFileName(fullName); } catch { }
-                }
+                try { name = Path.GetFileName(path); } catch { }
             }
-            catch (Exception ex)
-            {
-                _logger?.LogDebug(ex, "Failed to read DTE.Solution.FullName in solution-event callback");
-            }
+            _logger?.LogInformation(
+                "PushCurrentSolution: path={Path} dir={Dir} name={Name}",
+                path ?? "(null)", dir ?? "(null)", name ?? "(null)");
             PushSolutionValues(path, dir, name);
         }
 
         /// <summary>
-        /// Fire-and-forget the pipe push. The COM callback must return promptly,
-        /// so the actual frame write runs on a background task. SendSolutionChanged
-        /// swallows IO errors; a missed push self-heals on the next reconnect via
-        /// the register frame.
+        /// fire-and-forget 地推送 pipe。COM 回调必须及时返回，故实际的帧写入
+        /// 在后台任务上运行。SendSolutionChanged 吞掉 IO 错误；漏掉的推送会在
+        /// 下次重连时经 register 帧自愈。
         /// </summary>
         private void PushSolutionValues(string? solutionPath, string? solutionDir, string? solutionName)
         {
@@ -187,12 +244,11 @@ namespace VsMcp
 
         public void Dispose()
         {
-            if (_connectionPoint != null && _cookie != 0)
+            if (_solution != null && _cookie != 0)
             {
-                try { _connectionPoint.Unadvise(_cookie); } catch { /* best-effort */ }
+                try { _solution.UnadviseSolutionEvents(_cookie); } catch { /* 尽力而为 */ }
             }
             _cookie = 0;
-            _connectionPoint = null;
         }
     }
 }

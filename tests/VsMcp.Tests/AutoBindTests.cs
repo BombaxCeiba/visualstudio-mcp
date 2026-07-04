@@ -9,17 +9,17 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// ③ Auto-bind tier + hint injection (设计文档 §③). Covers:
-    ///   - single instance, no header, no session → ResolveTarget returns the
-    ///     instance PID with HintJustAutoBound, and the new binding is armed
-    ///   - InjectHintIntoToolResultSse prepends a text block to result.content
-    ///     on a tools/call SSE, leaves notification/error envelopes untouched
-    ///   - one-shot: clearing HintPending (as HandleForwardAsync does) means a
-    ///     second resolve via ② no longer reports hint
+    /// ③ Auto-bind 层 + hint 注入（设计文档 §③）。覆盖：
+    ///   - 单实例、无 header、无 session → ResolveTarget 返回实例 PID 且
+    ///     HintJustAutoBound=true，新绑定已装填
+    ///   - InjectHintIntoToolResultSse 在 tools/call SSE 上向 result.content
+    ///     前插一个文本块，notification/error 信封原样透传
+    ///   - 一次性：清掉 HintPending（如 HandleForwardAsync 所做）后，经 ② 的
+    ///     第二次解析不再上报 hint
     /// </summary>
     public class AutoBindTests
     {
-        /// <summary>Build a registry holding one instance with a live VsSessionId.</summary>
+        /// <summary>构造一个持有单个实例（带有效 VsSessionId）的 registry。</summary>
         private static (InstanceRegistry registry, InstanceEntry entry) SingleInstanceRegistry(
             int pid = 1234, string? solutionPath = "D:\\p\\MyApp.sln", string? solutionDir = "D:\\p")
         {
@@ -48,7 +48,7 @@ namespace VsMcp.Tests
             Assert.Equal("vs-sess-1", res.VsSessionId);
             Assert.True(res.HintJustAutoBound);
             Assert.NotNull(res.Binding);
-            Assert.True(res.Binding!.HintPending); // armed for the one-shot hint
+            Assert.True(res.Binding!.HintPending); // 已装填一次性 hint
             Assert.Equal("auto", res.Binding.Source);
             Assert.StartsWith("sess-", res.Binding.ClientSessionId);
         }
@@ -60,7 +60,7 @@ namespace VsMcp.Tests
             var sessions = new SessionTable();
 
             var res = BindingResolver.ResolveTarget(null, null, sessions, registry);
-            // The minted client session id is now resolvable via ② next time.
+            // 铸造的 client session id 下次可经 ② 解析。
             Assert.True(sessions.TryGet(res.Binding!.ClientSessionId, out var stored));
             Assert.Equal(1234, stored.Pid);
         }
@@ -68,7 +68,7 @@ namespace VsMcp.Tests
         [Fact]
         public void ResolveTarget_StatelessHeaderTier_DoesNotArmHint()
         {
-            // ① Header tier returns Success but no binding → no hint injection.
+            // ① Header 层返回 Success 但无绑定 → 不注入 hint。
             var (registry, _) = SingleInstanceRegistry();
             var sessions = new SessionTable();
 
@@ -77,22 +77,22 @@ namespace VsMcp.Tests
             Assert.Equal(1234, res.Pid);
             Assert.False(res.HintJustAutoBound);
             Assert.Null(res.Binding);
-            // Session table untouched (stateless — decision MI-06).
+            // Session 表未改动（无状态 —— 决策 MI-06）。
             Assert.Equal(0, sessions.Count);
         }
 
         [Fact]
         public void ResolveTarget_SessionTier_DoesNotRearmHint_AfterClear()
         {
-            // ③ auto-binds and arms; after the forwarder clears HintPending, a
-            // second request via ② finds HintPending=false → no hint.
+            // ③ 自动绑定并装填；转发器清掉 HintPending 后，经 ② 的第二次请求
+            // 发现 HintPending=false → 无 hint。
             var (registry, _) = SingleInstanceRegistry();
             var sessions = new SessionTable();
 
             var first = BindingResolver.ResolveTarget(null, null, sessions, registry);
             Assert.True(first.Binding!.HintPending);
 
-            // Simulate HandleForwardAsync's one-shot clear after injecting.
+            // 模拟 HandleForwardAsync 注入后的一次性清除。
             first.Binding.HintPending = false;
 
             var second = BindingResolver.ResolveTarget(null, first.Binding.ClientSessionId, sessions, registry);
@@ -118,14 +118,14 @@ namespace VsMcp.Tests
             Assert.Equal(2, content.GetArrayLength());
             Assert.Equal("HINT TEXT", content[0].GetProperty("text").GetString());
             Assert.Equal("text", content[0].GetProperty("type").GetString());
-            // Original block preserved after the hint.
+            // 原始块在 hint 之后保留。
             Assert.Equal("break", content[1].GetProperty("text").GetString());
         }
 
         [Fact]
         public void InjectHintIntoToolResultSse_PassesThrough_NonContentResult()
         {
-            // A notification / error envelope has no content array → no injection.
+            // notification / error 信封没有 content 数组 → 不注入。
             string sse =
                 "event: message\n" +
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";

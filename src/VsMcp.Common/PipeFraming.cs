@@ -31,10 +31,10 @@ namespace VsMcp.Common
         // TryGetProperty("type")）一致。不设此项时 System.Text.Json 默认保留属性原名
         // （"Type"），与解析端的小写 "type" 不匹配，帧被静默跳过、读到 end 永不命中
         // —— 曾表现为 ForwardAsync 死循环卡死。
-        // Public so callers that hold a raw frame JSON string (e.g. PipeMcpServer
-        // after dispatching on "type" via JsonDocument) can deserialize a DTO with
-        // the identical policy — a bare JsonSerializer.Deserialize<T>(json) would
-        // fall back to PascalCase and silently bind nothing on camelCase frames.
+        // 公开此字段，便于持有原始帧 JSON 文本的调用方（例如 PipeMcpServer 在用
+        // JsonDocument 按 "type" 分派后）能用同一套策略反序列化 DTO —— 直接
+        // JsonSerializer.Deserialize<T>(json) 会回退到 PascalCase，在 camelCase
+        // 帧上什么都绑定不到。
         public static readonly JsonSerializerOptions Options = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -129,7 +129,7 @@ namespace VsMcp.Common
             byte[] header = new byte[HeaderBytes];
             int headerRead = await ReadAtMostAsync(stream, header, HeaderBytes, ct).ConfigureAwait(false);
             if (headerRead == 0)
-                return null; // clean EOF before any frame byte
+                return null; // 帧字节尚未开始，对端干净关闭
             if (headerRead < HeaderBytes)
                 throw new EndOfStreamException(
                     $"Frame header truncated: read {headerRead} of {HeaderBytes} bytes.");
@@ -159,7 +159,7 @@ namespace VsMcp.Common
             {
                 int read = await stream.ReadAsync(buffer, offset, count - offset, ct).ConfigureAwait(false);
                 if (read == 0)
-                    break; // peer closed mid-frame
+                    break; // 对端在帧中途关闭
                 offset += read;
             }
             return offset;
@@ -176,7 +176,7 @@ namespace VsMcp.Common
             {
                 int read = await stream.ReadAsync(buffer, offset, count - offset, ct).ConfigureAwait(false);
                 if (read == 0)
-                    return offset; // EOF at whatever we have so far (0 on first call)
+                    return offset; // 返回此前已读到的字节（首次调用即为 0）
                 offset += read;
             }
             return offset;

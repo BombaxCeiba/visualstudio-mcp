@@ -15,19 +15,18 @@ using Xunit.Abstractions;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// Wave 2 Gateway routing tests. Each simulated VS is a NamedPipeServerStream
-    /// that the static <see cref="PipeRouter.ConnectAsync"/> factory dials into
-    /// (VS-as-server direction is simulated; the Gateway's main register-accept
-    /// path is symmetric). Tests cover:
-    ///   - multi-VS registration (InstanceRegistry)
-    ///   - session binding via initialize with _meta.vsPid (SessionTable)
-    ///   - single-instance fallback when initialize omits vsPid
-    ///   - gateway tools (list_vs_instances / select_vs_instance) handled locally,
-    ///     never forwarded to a simulated VS
-    ///   - tools/list SSE injection
-    ///   - select_vs_instance rebind
+    /// Wave 2 Gateway 路由测试。每个模拟 VS 是一个 NamedPipeServerStream，由静态
+    /// <see cref="PipeRouter.ConnectAsync"/> 工厂拨入（VS 作为 server 的方向是
+    /// 模拟的；Gateway 的主 register-accept 路径对称）。测试覆盖：
+    ///   - 多 VS 注册（InstanceRegistry）
+    ///   - 经 initialize 携带 _meta.vsPid 的 session 绑定（SessionTable）
+    ///   - initialize 省略 vsPid 时的单实例回退
+    ///   - gateway 工具（list_vs_instances / select_vs_instance）本地处理，
+    ///     绝不转发给模拟 VS
+    ///   - tools/list SSE 注入
+    ///   - select_vs_instance 重绑
     ///
-    /// All async ops carry an 8s CancellationTokenSource — a hang fails fast.
+    /// 所有异步操作带 8s CancellationTokenSource —— 挂起即快速失败。
     /// </summary>
     public class GatewayRoutingTests
     {
@@ -39,9 +38,9 @@ namespace VsMcp.Tests
         private static string NewPipeName() => "vs-mcp-gw-test-" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
         /// <summary>
-        /// Stand up a simulated VS: a NamedPipeServerStream that accepts one
-        /// router connection, then the test body drives it via the returned
-        /// server stream. The PipeRouter owns the client end and its read loop.
+        /// 搭建一个模拟 VS：一个 NamedPipeServerStream 接受一次 router 连接，
+        /// 随后测试主体通过返回的 server stream 驱动它。PipeRouter 拥有 client
+        /// 端及其读循环。
         /// </summary>
         private async Task<(NamedPipeServerStream server, PipeRouter router)> ConnectSimulatedVsAsync(
             string pipeName, CancellationToken ct)
@@ -53,7 +52,7 @@ namespace VsMcp.Tests
 
             await Task.Run(() =>
             {
-                using (ct.Register(() => { try { server.Dispose(); } catch { /* raced */ } }))
+                using (ct.Register(() => { try { server.Dispose(); } catch { /* 已竞态 */ } }))
                 {
                     server.WaitForConnection();
                 }
@@ -64,8 +63,8 @@ namespace VsMcp.Tests
         }
 
         /// <summary>
-        /// Helper: simulate a VS handling one request — read a PipeRequest frame,
-        /// write back head (with optional Mcp-Session-Id) + data + end.
+        /// 辅助方法：模拟 VS 处理一个请求 —— 读取一个 PipeRequest 帧，
+        /// 回写 head（可选带 Mcp-Session-Id）+ data + end。
         /// </summary>
         private static async Task ServeOneRequestAsync(
             Stream server,
@@ -100,10 +99,10 @@ namespace VsMcp.Tests
             var info1 = new PipeRegister { Pid = 1001, SolutionPath = "A.sln" };
             var info2 = new PipeRegister { Pid = 1002, SolutionPath = "B.sln" };
 
-            // PipeRouter needs a live stream; but Snapshot only reads Info, so we
-            // can use a MemoryStream-backed router via the internal ctor. Since
-            // that ctor starts a read loop, we use a disposed-dummy stream that
-            // immediately EOFs — the read loop exits, router still holds metadata.
+            // PipeRouter 需要活跃 stream；但 Snapshot 只读 Info，所以可以用
+            // 内部 ctor 构造 MemoryStream 支撑的 router。由于该 ctor 会启动
+            // 读循环，我们用一个立即 EOF 的 dummy stream —— 读循环退出，
+            // router 仍持有元数据。
             using var dummyA = new MemoryStream();
             using var dummyB = new MemoryStream();
             var r1 = new PipeRouter(dummyA, ownsStream: false);
@@ -167,7 +166,7 @@ namespace VsMcp.Tests
 
             Assert.True(table.TryGet(id, out var got));
             Assert.Equal(22, got!.Pid);
-            Assert.Null(got.VsSessionId); // cleared → forces re-initialize
+            Assert.Null(got.VsSessionId); // 已清除 → 强制重新 initialize
             Assert.Equal("select", got.Source);
         }
 
@@ -203,7 +202,7 @@ namespace VsMcp.Tests
         [Fact]
         public void GatewayTools_InjectIntoToolsListSse_PrependsGatewayTools()
         {
-            // A realistic tools/list SSE frame from VS (one VS-provided tool).
+            // 来自 VS 的一个真实 tools/list SSE 帧（一个 VS 提供的工具）。
             string originalSse =
                 "event: message\n" +
                 "data: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"tools\":[{\"name\":\"get_debugger_state\",\"readOnly\":true}]}}\n\n";
@@ -217,17 +216,17 @@ namespace VsMcp.Tests
             using var doc = JsonDocument.Parse(payload!);
             var tools = doc.RootElement.GetProperty("result").GetProperty("tools");
             Assert.Equal(3, tools.GetArrayLength());
-            // Gateway tools prepended.
+            // Gateway 工具已前插。
             Assert.Equal("list_vs_instances", tools[0].GetProperty("name").GetString());
             Assert.Equal("select_vs_instance", tools[1].GetProperty("name").GetString());
-            // Original VS tool preserved verbatim after.
+            // 原始 VS 工具在后面原样保留。
             Assert.Equal("get_debugger_state", tools[2].GetProperty("name").GetString());
         }
 
         [Fact]
         public void GatewayTools_InjectIntoToolsListSse_PassesThroughNonToolsResult()
         {
-            // An error envelope has no result.tools — must be passed through unchanged.
+            // error 信封没有 result.tools —— 必须原样透传。
             string originalSse =
                 "event: message\n" +
                 "data: {\"jsonrpc\":\"2.0\",\"id\":42,\"error\":{\"code\":-32601,\"message\":\"nope\"}}\n\n";
@@ -253,13 +252,12 @@ namespace VsMcp.Tests
             return parts.Count == 0 ? null : string.Join("\n", parts);
         }
 
-        // ────────────────── Initialize target resolution (Program) ──────────────
+        // ────────────────── Initialize 目标解析（Program） ──────────────
 
         [Fact]
         public void ResolveInitializeTarget_MetaVsPid_PrebindsExplicitly()
         {
-            // Scenario 2 (pre-bind via _meta.vsPid): explicit pid wins even when
-            // other instances are connected.
+            // 场景 2（经 _meta.vsPid 预绑）：即使有其他实例已连接，显式 pid 仍胜出。
             int? pid = Program.ResolveInitializeTarget(metaVsPid: 5555, connectedCount: 3, singlePid: () => 1111);
             Assert.Equal(5555, pid);
         }
@@ -267,8 +265,8 @@ namespace VsMcp.Tests
         [Fact]
         public void ResolveInitializeTarget_SingleInstanceFallback_BindsToTheOne()
         {
-            // Scenario 3 (single-instance fallback): no vsPid, exactly 1 instance
-            // → bind to it (Wave 2 form: no hint injection, that's Wave 3).
+            // 场景 3（单实例回退）：无 vsPid，恰好 1 个实例 → 绑定它
+            // （Wave 2 形态：不注入 hint，那是 Wave 3）。
             int? pid = Program.ResolveInitializeTarget(metaVsPid: null, connectedCount: 1, singlePid: () => 9999);
             Assert.Equal(9999, pid);
         }
@@ -276,19 +274,18 @@ namespace VsMcp.Tests
         [Fact]
         public void ResolveInitializeTarget_ZeroOrManyInstances_ReturnsNull()
         {
-            // 0 instances → can't bind (null).
+            // 0 个实例 → 无法绑定（null）。
             Assert.Null(Program.ResolveInitializeTarget(null, 0, () => throw new InvalidOperationException()));
-            // ≥2 instances, no explicit pid → ambiguous (null).
+            // ≥2 个实例，无显式 pid → 歧义（null）。
             Assert.Null(Program.ResolveInitializeTarget(null, 2, () => throw new InvalidOperationException()));
         }
 
-        // ───────────────────── End-to-end demux forward ──────────────────────
+        // ───────────────────── 端到端 demux 转发 ──────────────────────
 
         /// <summary>
-        /// A simulated VS responds to a forwarded initialize with a VS-assigned
-        /// Mcp-Session-Id in the head; PipeRouter.ForwardAsync surfaces it via
-        /// ForwardResult.Headers (the property the Gateway's initialize handler
-        /// relies on to record the vs↔client session mapping).
+        /// 模拟 VS 用 head 中 VS 分配的 Mcp-Session-Id 响应转发的 initialize；
+        /// PipeRouter.ForwardAsync 通过 ForwardResult.Headers 暴露它（Gateway 的
+        /// initialize 处理器依赖此属性记录 vs↔client session 映射）。
         /// </summary>
         [Fact]
         public async Task Forward_CapturesVsSessionId_FromHead()
@@ -316,10 +313,8 @@ namespace VsMcp.Tests
         }
 
         /// <summary>
-        /// Concurrent forwards over one pipe demux correctly by id: two
-        /// in-flight requests, VS interleaves responses, each lands on the
-        /// right caller. This is the Wave 2 capability Wave 1's serial
-        /// router could not provide.
+        /// 单 pipe 上的并发转发按 id 正确分派：两个在途请求，VS 交错响应，
+        /// 每个落到正确调用方。这是 Wave 1 串行 router 无法提供的 Wave 2 能力。
         /// </summary>
         [Fact]
         public async Task Forward_ConcurrentRequests_DemuxById()
@@ -332,7 +327,7 @@ namespace VsMcp.Tests
             {
                 var vsTask = Task.Run(async () =>
                 {
-                    // Read both requests, respond out of order (req2 first).
+                    // 读取两个请求，乱序响应（req2 先）。
                     var req1 = await PipeFraming.ReadFrameAsync<PipeRequest>(server, cts.Token);
                     var req2 = await PipeFraming.ReadFrameAsync<PipeRequest>(server, cts.Token);
                     Assert.NotNull(req1);
@@ -363,7 +358,7 @@ namespace VsMcp.Tests
                 var resB = await fwdB;
                 await vsTask;
 
-                // Each caller got its OWN status + body, despite interleaving.
+                // 每个调用方拿到各自的状态 + body，尽管响应是交错的。
                 Assert.Equal(201, resA.Status);
                 Assert.Equal("first", Encoding.UTF8.GetString(outA.ToArray()));
                 Assert.Equal(202, resB.Status);

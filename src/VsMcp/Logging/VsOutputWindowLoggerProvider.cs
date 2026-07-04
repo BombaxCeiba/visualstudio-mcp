@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.VisualStudio.Shell;
@@ -7,35 +8,31 @@ using Microsoft.VisualStudio.Shell.Interop;
 namespace VsMcp.Logging
 {
     /// <summary>
-    /// <see cref="ILoggerProvider"/> that writes log events to the Visual Studio
-    /// Output Window pane named <see cref="PaneName"/> ("VS MCP") for
-    /// <see cref="LogLevel.Information"/> and above, and additionally records
-    /// <see cref="LogLevel.Error"/> and <see cref="LogLevel.Critical"/> events
-    /// to <see cref="IVsActivityLog"/> (the durable Activity Log that VS only
-    /// populates when launched with the <c>/log</c> switch; otherwise it is a
-    /// silent no-op).
+    /// <see cref="ILoggerProvider"/>，把日志事件写入名为 <see cref="PaneName"/>
+    /// （"VS MCP"）的 Visual Studio Output Window 面板（<see cref="LogLevel.Information"/>
+    /// 及以上），并把 <see cref="LogLevel.Error"/> 与 <see cref="LogLevel.Critical"/>
+    /// 事件额外记录到 <see cref="IVsActivityLog"/>（持久化的 Activity Log，VS 仅
+    /// 在以 <c>/log</c> 开关启动时才写入；否则为静默空操作）。
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The pane and the Activity Log service are acquired lazily on the UI
-    /// thread on the first log write (mirroring the acquire-on-demand pattern
-    /// used by <c>DebuggerFacade.GetVsDebuggerAsync</c>). Once acquired they
-    /// are cached, so subsequent writes incur no thread hops.
+    /// 面板与 Activity Log 服务在首次日志写入时于 UI 线程惰性获取（镜像
+    /// <c>DebuggerFacade.GetVsDebuggerAsync</c> 用的按需获取模式）。一旦获取即
+    /// 缓存，故后续写入不产生线程跳转。
     /// </para>
     /// <para>
-    /// Per D-06: <see cref="IVsActivityLog"/> only persists to disk when VS is
-    /// started with <c>/log</c>; without that switch its <see cref="IVsActivityLog.LogEntry"/>
-    /// calls are silent. Real-time diagnostics always go to the Output Window
-    /// pane; the Activity Log is purely a forensic channel.
+    /// 按 D-06：<see cref="IVsActivityLog"/> 仅在 VS 以 <c>/log</c> 启动时持久化
+    /// 到磁盘；无该开关时其 <see cref="IVsActivityLog.LogEntry"/> 调用静默。实时
+    /// 诊断总是去 Output Window 面板；Activity Log 纯粹是取证通道。
     /// </para>
     /// </remarks>
     internal sealed class VsOutputWindowLoggerProvider : ILoggerProvider
     {
-        // Typed as AsyncPackage (not IAsyncServiceProvider) so we can reach
-        // JoinableTaskFactory.SwitchToMainThreadAsync, mirroring the
-        // DebuggerFacade.GetDteAsync acquire-on-UI-thread pattern exactly.
-        // AsyncPackage implements IAsyncServiceProvider, so the package passes
-        // itself ("this") directly.
+        // 类型为 AsyncPackage（而非 IAsyncServiceProvider），以便能拿到
+        // JoinableTaskFactory.SwitchToMainThreadAsync，精确镜像
+        // DebuggerFacade.GetDteAsync 的 UI 线程获取模式。
+        // AsyncPackage 实现 IAsyncServiceProvider，故 package 把自身
+        // （"this"）直接传入。
         private readonly AsyncPackage _package;
 
         private IVsOutputWindowPane? _pane;
@@ -43,13 +40,13 @@ namespace VsMcp.Logging
         private bool _paneAcquired;
 
         /// <summary>
-        /// Name of the Output Window pane this provider writes to. Visible to
-        /// the user in the VS Output Window pane picker.
+        /// 本 provider 写入的 Output Window 面板名。在 VS Output Window 面板
+        /// 选择器中对用户可见。
         /// </summary>
         internal const string PaneName = "VS MCP";
 
         /// <summary>
-        /// Source string recorded against each <see cref="IVsActivityLog"/> entry.
+        /// 记录在每个 <see cref="IVsActivityLog"/> 条目上的 source 字符串。
         /// </summary>
         internal const string ActivityLogSource = "VSDebuggerMcp";
 
@@ -61,19 +58,18 @@ namespace VsMcp.Logging
         public ILogger CreateLogger(string name) => new PaneLogger(this, name);
 
         /// <summary>
-        /// Lazily acquires <see cref="IVsOutputWindow"/> (creating the pane) and
-        /// <see cref="IVsActivityLog"/> on the UI thread. Idempotent: the first
-        /// caller does the work; subsequent callers return immediately.
+        /// 在 UI 线程上惰性获取 <see cref="IVsOutputWindow"/>（创建面板）与
+        /// <see cref="IVsActivityLog"/>。幂等：首个调用者干活；后续调用者立即
+        /// 返回。
         /// </summary>
         private async ValueTask EnsureAcquiredAsync()
         {
             if (_paneAcquired)
                 return;
 
-            // Mark acquired BEFORE awaiting so reentrant log writes do not
-            // re-enter this method while the first caller is on the UI thread
-            // awaiting GetServiceAsync. Any write that arrives mid-acquire
-            // will observe _pane/_activityLog possibly null and safely no-op.
+            // 在 await 之前标记已获取，使重入的日志写入不会在首个调用者于
+            // UI 线程 await GetServiceAsync 时重入本方法。获取中途到达的任何
+            // 写入会观察到 _pane/_activityLog 可能为 null 并安全地空操作。
             _paneAcquired = true;
 
             await _package.JoinableTaskFactory.SwitchToMainThreadAsync();
@@ -84,37 +80,36 @@ namespace VsMcp.Logging
                 try
                 {
                     var paneGuid = Guid.NewGuid();
-                    // fInitVisible=1 (visible), fClearWithSolution=0 (persist across solution loads)
+                    // fInitVisible=1（可见），fClearWithSolution=0（跨解决方案加载持久化）
                     outputWindow.CreatePane(ref paneGuid, PaneName, 1, 0);
                     outputWindow.GetPane(ref paneGuid, out _pane);
                 }
                 catch
                 {
-                    // Pane creation failure must never crash logging.
+                    // 面板创建失败绝不能搞垮日志。
                     _pane = null;
                 }
             }
 
             _activityLog = await _package.GetServiceAsync(typeof(SVsActivityLog)) as IVsActivityLog;
-            // _activityLog is non-null even without /log; LogEntry is a silent
-            // no-op in that case (D-06).
+            // _activityLog 即使没有 /log 也非 null；此时 LogEntry 为静默
+            // 空操作（D-06）。
         }
 
         /// <summary>
-        /// No-op. The Output Window pane is VS-owned and outlives this provider;
-        /// the Activity Log has no handle to release.
+        /// 空操作。Output Window 面板为 VS 拥有，比本 provider 长寿；
+        /// Activity Log 没有可释放的句柄。
         /// </summary>
         public void Dispose()
         {
-            // Intentionally empty: pane + Activity Log are VS-owned services.
+            // 刻意为空：pane + Activity Log 是 VS 拥有的服务。
         }
 
         /// <summary>
-        /// <see cref="ILogger"/> implementation that formats each event and
-        /// routes it to the Output Window pane (Information+) and, for Error+,
-        /// also to the Activity Log. Writes happen off the UI thread via a
-        /// continuation; the only UI-thread work is the one-time service
-        /// acquisition in <see cref="EnsureAcquiredAsync"/>.
+        /// <see cref="ILogger"/> 实现，格式化每个事件并路由到 Output Window
+        /// 面板（Information+），Error+ 还额外去 Activity Log。写入经
+        /// continuation 在 UI 线程之外发生；唯一的 UI 线程工作是
+        /// <see cref="EnsureAcquiredAsync"/> 中的一次性服务获取。
         /// </summary>
         private sealed class PaneLogger : ILogger
         {
@@ -137,16 +132,17 @@ namespace VsMcp.Logging
                 if (!IsEnabled(logLevel))
                     return;
 
-                // Format eagerly so the off-thread continuation only does IO.
-                string message = $"[{_category}] {logLevel}: {formatter(state, exception)}";
+                // 及早格式化，使离线程 continuation 只做 IO。
+                // 本地时间 + thread-id 前缀镜像 gateway.log 的 [tN]，故同一事件
+                // 的 VS Output Window 行与 gateway.log 行在两个面上对齐。
+                string message = $"{DateTime.Now:HH:mm:ss.fff} [t{Thread.CurrentThread.ManagedThreadId}] [{_category}] {logLevel}: {formatter(state, exception)}";
                 if (exception != null)
                 {
                     message += Environment.NewLine + exception.GetType().FullName + ": " + exception.Message;
                 }
 
-                // Acquire-on-demand then write off-thread. Never block the
-                // caller (loggers are called from request hot paths and from
-                // the SDK transport).
+                // 按需获取然后离线程写入。绝不阻塞调用方（logger 从请求热路径
+                // 与 SDK transport 调用）。
                 _ = _owner.EnsureAcquiredAsync().AsTask().ContinueWith(
                     _ =>
                     {
@@ -156,23 +152,23 @@ namespace VsMcp.Logging
                         }
                         catch
                         {
-                            // Pane write failure (disposed, race) must never throw.
+                            // 面板写入失败（已释放、竞态）绝不能抛。
                         }
 
                         if (logLevel >= LogLevel.Error && _owner._activityLog != null)
                         {
                             try
                             {
-                                // Verified signature (Microsoft.VisualStudio.Interop.dll,
-                                // VS2022 17.0.0.0): LogEntry(uint actType, string, string).
-                                // ALE_ERROR = 1; both Error and Critical map to ALE_ERROR
-                                // (no dedicated critical entry type).
+                                // 已验证签名（Microsoft.VisualStudio.Interop.dll，
+                                // VS2022 17.0.0.0）：LogEntry(uint actType, string, string)。
+                                // ALE_ERROR = 1；Error 与 Critical 都映射到 ALE_ERROR
+                                // （没有专门的 critical 条目类型）。
                                 const uint ALE_ERROR = (uint)__ACTIVITYLOG_ENTRYTYPE.ALE_ERROR;
                                 _owner._activityLog.LogEntry(ALE_ERROR, ActivityLogSource, message);
                             }
                             catch
                             {
-                                // Activity Log write failure must never throw.
+                                // Activity Log 写入失败绝不能抛。
                             }
                         }
                     },
@@ -187,10 +183,9 @@ namespace VsMcp.Logging
     }
 
     /// <summary>
-    /// Empty disposable scope. Logging scopes are not surfaced in the Output
-    /// Window, so all <c>BeginScope</c> calls in this extension return this
-    /// shared no-op instance. Lives at namespace level so multiple logger
-    /// implementations (provider, factory wrapper) can share it.
+    /// 空的可释放 scope。日志 scope 不在 Output Window 中呈现，故本扩展中所有
+    /// <c>BeginScope</c> 调用都返回此共享空操作实例。位于命名空间级别，使多个
+    /// logger 实现（provider、factory 包装）能共享它。
     /// </summary>
     internal sealed class NullScope : IDisposable
     {
@@ -198,6 +193,6 @@ namespace VsMcp.Logging
 
         private NullScope() { }
 
-        public void Dispose() { /* no-op */ }
+        public void Dispose() { /* 空操作 */ }
     }
 }

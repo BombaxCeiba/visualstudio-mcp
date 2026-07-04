@@ -9,11 +9,10 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// Unit tests for the SafeCall.Wrap error-routing contract.
-    /// SafeCall is the single boundary that converts typed facade
-    /// exceptions into MCP-spec CallToolResult{IsError=true}+ErrorResult
-    /// responses, and transparently rethrows OperationCanceledException
-    /// (shutdown must not be swallowed into an error response).
+    /// SafeCall.Wrap 错误路由契约的单元测试。
+    /// SafeCall 是唯一边界，把类型化 facade 异常转换为符合 MCP 规范的
+    /// CallToolResult{IsError=true}+ErrorResult 响应，并透明地重新抛出
+    /// OperationCanceledException（关闭不得被吞成错误响应）。
     /// </summary>
     public class SafeCallTests
     {
@@ -46,7 +45,7 @@ namespace VsMcp.Tests
             Assert.Equal("breakpoint_not_found", ExtractErrorField(ctr));
         }
 
-        // --- FileNotInSolutionException -> file_not_in_solution (+ context fields) ---
+        // --- FileNotInSolutionException -> file_not_in_solution（+ 上下文字段） ---
 
         [Fact]
         public async Task Wrap_FileNotInSolutionException_MapsToFileNotInSolutionError()
@@ -63,7 +62,7 @@ namespace VsMcp.Tests
             Assert.Equal(@"C:\src\App.sln", ExtractField(ctr, "loadedSolution"));
         }
 
-        // --- Generic Exception -> internal_error ---
+        // --- 通用 Exception -> internal_error ---
 
         [Fact]
         public async Task Wrap_GenericException_MapsToInternalError()
@@ -78,7 +77,7 @@ namespace VsMcp.Tests
             Assert.Equal("boom", ExtractMessageField(ctr));
         }
 
-        // --- OperationCanceledException is rethrown (shutdown transparency) ---
+        // --- OperationCanceledException 被重新抛出（关闭透明性） ---
 
         [Fact]
         public async Task Wrap_OperationCanceledException_IsRethrownNotSwallowed()
@@ -88,28 +87,27 @@ namespace VsMcp.Tests
                               CancellationToken.None));
         }
 
-        // --- Success path returns the DTO value unchanged ---
+        // --- 成功路径原样返回 DTO 值 ---
 
         [Fact]
         public async Task Wrap_Success_ReturnsFacadeValueAsReadableJson()
         {
-            // The success path wraps the DTO via McpJson.ToTextResult so the LLM
-            // sees readable (unescaped) JSON rather than the SDK's Chinese-
-            // escaping default. The return is a CallToolResult whose text content
-            // carries the serialized DTO; the state value must round-trip.
+            // 成功路径经 McpJson.ToTextResult 包装 DTO，使 LLM 看到可读（未转义）
+            // 的 JSON，而非 SDK 默认的中文转义。返回的是一个 CallToolResult，其
+            // 文本内容承载序列化后的 DTO；state 值必须能往返。
             object result = await SafeCall.Wrap(
                 () => Task.FromResult<object>(new DebuggerStateResult("break")),
                 CancellationToken.None);
 
             var ctr = Assert.IsType<CallToolResult>(result);
-            // Success path leaves IsError unset (null) — distinct from the error
-            // path's explicit true. `!= true` accepts both null and false.
+            // 成功路径让 IsError 保持未设置（null）—— 区别于错误路径的显式 true。
+            // `!= true` 同时接受 null 和 false。
             Assert.True(ctr.IsError != true);
             var block = Assert.IsType<TextContentBlock>(ctr.Content[0]);
             Assert.Contains("break", block.Text);
         }
 
-        // --- helpers: parse the TextContentBlock JSON for an ErrorResult field ---
+        // --- 辅助方法：解析 TextContentBlock JSON 取 ErrorResult 字段 ---
 
         private static string ExtractErrorField(CallToolResult ctr)
         {

@@ -50,6 +50,16 @@
     <DefineConstants>TRACE</DefineConstants>
   </PropertyGroup>
 
+  <!-- eval_csharp 编译开关：本地开发默认启用（动态 C# 执行，调试利器）；
+       GitHub 发布管线（.github/workflows/release.yml）用 /p:EvalCsharpEnabled=false
+       显式关闭，发布版 VSIX 完全不含 eval_csharp 代码（任意代码执行，不应进生产）。
+       EvalCsharpFacade / eval_csharp 工具注册 / EnableEvalCsharp 开关 / 参数链路
+       全部 #if EVAL_CSHARP 包裹。 -->
+  <PropertyGroup>
+    <EvalCsharpEnabled Condition=" '$(EvalCsharpEnabled)' == '' ">true</EvalCsharpEnabled>
+    <DefineConstants Condition=" '$(EvalCsharpEnabled)' == 'true' ">$(DefineConstants);EVAL_CSHARP</DefineConstants>
+  </PropertyGroup>
+
   <!-- NuGet Package References.
        System.Text.Json is pinned explicitly (not left to MCP's transitive
        resolution) so VsMcp.dll's compile-time reference matches the version
@@ -133,7 +143,58 @@
        evaluated at reference-resolution time, not at csproj load time. -->
   <Target Name="ResolveVsSdkReferences" BeforeTargets="ResolveAssemblyReferences"
           DependsOnTargets="ResolveVsSdkPath;ResolveThreadingReference">
+    <PropertyGroup>
+      <!-- Common7\IDE root. NavigateTo.Interfaces and ComponentModelHost ship
+           under CommonExtensions (not PublicAssemblies), so they need their own
+           HintPath. Derived from the vswhere-resolved install, or — when the
+           default VS2022 PublicAssemblies was used as-is — by stripping the
+           trailing \PublicAssemblies off VsSdkAssembliesPath. -->
+      <_VsIdePath Condition=" '$(_VsInstallPath)' != '' ">$(_VsInstallPath)\Common7\IDE</_VsIdePath>
+      <_VsIdePath Condition=" '$(_VsIdePath)' == '' ">$(VsSdkAssembliesPath.Replace('\PublicAssemblies',''))</_VsIdePath>
+    </PropertyGroup>
     <ItemGroup>
+      <!-- NavigateTo (Ctrl+T / "Go To All") contract — powers find_symbol via
+           INavigateToItemProviderFactory. C++ symbols are served through the VC
+           Language Server's LSP workspace/symbol, aggregated by the same
+           RemoteLanguageNavigateToItemProviderFactory VS itself uses. -->
+      <Reference Include="Microsoft.VisualStudio.Language.NavigateTo.Interfaces">
+        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\NavigateTo\Microsoft.VisualStudio.Language.NavigateTo.Interfaces.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- LSP client 契约 —— find_symbol 经 ILanguageServiceBroker2 直接对 VC Language
+           Server 发 workspace/symbol。公共 RequestAllAsync 路径内部会包含
+           DisableUserExperience(true) 的 C++ 客户端（经典 NavigateTo v1 适配器会把它
+           过滤掉，导致 0 结果），所以走 LSP 才能拿到 C++ 符号。 -->
+      <Reference Include="Microsoft.VisualStudio.LanguageServer.Client">
+        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Client.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.LanguageServer.Client.Implementation">
+        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Client.Implementation.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.LanguageServer.Protocol">
+        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Protocol.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- VC 原生 CodeStore —— find_symbol 经 IVCNavigateToFactory 查 C++ 符号
+           （Ctrl+T / SymbolScanner 的真正后端，in-proc COM，不经 LSP broker；
+           LSP RequestAllAsync 对 C++ 永远 0，因为 C++ 不注册 broker client）。
+           Private=false：VS host 自带，VSIX 不重复打包。 -->
+      <Reference Include="Microsoft.VisualStudio.CppSvc.Internal">
+        <HintPath>$(_VsIdePath)\PrivateAssemblies\Microsoft.VisualStudio.CppSvc.Internal.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Microsoft.VisualStudio.CodeStore.Internal">
+        <HintPath>$(_VsIdePath)\PrivateAssemblies\Microsoft.VisualStudio.CodeStore.Internal.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- MEF composition host — IComponentModel (SComponentModel) is the way to
+           reach MEF exports (the NavigateTo factories) from an AsyncPackage. -->
+      <Reference Include="Microsoft.VisualStudio.ComponentModelHost">
+        <HintPath>$(_VsIdePath)\CommonExtensions\Platform\MefHosting\Microsoft.VisualStudio.ComponentModelHost.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <Reference Include="Microsoft.VisualStudio.Shell.15.0">
         <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll</HintPath>
         <Private>false</Private>
@@ -175,6 +236,7 @@
   <ItemGroup>
     <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
     <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
+    <Compile Include="..\VsMcp.Common\ExtensionVersion.cs" Link="Common\ExtensionVersion.cs" />
   </ItemGroup>
 
   <!-- VsMcpGateway.exe is a separate WinExe process that owns :43210 and

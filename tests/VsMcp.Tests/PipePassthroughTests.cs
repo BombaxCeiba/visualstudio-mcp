@@ -35,17 +35,16 @@ namespace VsMcp.Tests
             var server = new NamedPipeServerStream(
                 pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.None);
 
-            // Static factory owns the connect retry loop and returns a router
-            // already running its read loop. The semantic the tests assert —
-            // "server writes head/data/end, PipeRouter reassembles" — is unchanged;
-            // only the construction path moved from instance ctor to factory.
+            // 静态工厂拥有连接重试循环，返回一个已在运行读循环的 router。
+            // 测试断言的语义 —— "server 写 head/data/end，PipeRouter 重组" ——
+            // 未变；只是构造路径从实例 ctor 移到了工厂。
             var connectTask = PipeRouter.ConnectAsync(pipeName, ct);
 
             // 同步 WaitForConnection() 是 .NET Framework 4.x 全版本确定可用的 API；
             // 在 Task.Run 中异步化，ct 取消时 Dispose server 解除其阻塞。
             await Task.Run(() =>
             {
-                using (ct.Register(() => { try { server.Dispose(); } catch { /* raced */ } }))
+                using (ct.Register(() => { try { server.Dispose(); } catch { /* 已竞态 */ } }))
                 {
                     server.WaitForConnection();
                 }

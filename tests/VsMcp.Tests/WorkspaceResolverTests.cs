@@ -6,13 +6,13 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// Pure-function tests for the ① Header tier's folder-level prefix matcher
-    /// (设计文档 §①). Zero dependencies — no pipe / no HTTP.
+    /// ① Header 层文件夹级前缀匹配器的纯函数测试（设计文档 §①）。
+    /// 零依赖 —— 无 pipe / 无 HTTP。
     /// </summary>
     public class WorkspaceResolverTests
     {
-        // (Pid, SolutionDir) tuples are the only shape the resolver consumes, so
-        // tests feed them directly without constructing PipeRouter/InstanceEntry.
+        // 解析器只消费 (Pid, SolutionDir) 元组，所以测试直接喂入元组，
+        // 无需构造 PipeRouter/InstanceEntry。
         private static readonly (int, string?)[] One = new[] { (1234, (string?)"D:\\projects\\MyApp") };
 
         [Fact]
@@ -27,7 +27,7 @@ namespace VsMcp.Tests
         [Fact]
         public void SubPathMatch_ReturnsSingle()
         {
-            // Header is a descendant of SolutionDir → match (设计文档 §①).
+            // Header 是 SolutionDir 的后代 → 匹配（设计文档 §①）。
             var m = WorkspaceResolver.Resolve("D:\\projects\\MyApp\\src", One);
             Assert.Equal(WorkspaceMatchKind.Single, m.Kind);
             Assert.Equal(1234, m.Pid);
@@ -36,7 +36,7 @@ namespace VsMcp.Tests
         [Fact]
         public void SlnFilePath_ExtractsDirectory_AndMatches()
         {
-            // A .sln header is equivalent to its containing folder.
+            // .sln header 等价于其所在文件夹。
             var m = WorkspaceResolver.Resolve("D:\\projects\\MyApp\\MyApp.sln", One);
             Assert.Equal(WorkspaceMatchKind.Single, m.Kind);
             Assert.Equal(1234, m.Pid);
@@ -66,8 +66,8 @@ namespace VsMcp.Tests
         [Fact]
         public void BoundaryCheck_RejectsSiblingPrefix()
         {
-            // D:\projects\MyApp must NOT match D:\projects\MyAppOther — the char
-            // after the prefix is 'O', not a separator (设计文档 boundary check).
+            // D:\projects\MyApp 必须不匹配 D:\projects\MyAppOther —— 前缀后的
+            // 字符是 'O'，不是分隔符（设计文档 boundary check）。
             var m = WorkspaceResolver.Resolve("D:\\projects\\MyAppOther", One);
             Assert.Equal(WorkspaceMatchKind.None, m.Kind);
         }
@@ -75,8 +75,8 @@ namespace VsMcp.Tests
         [Fact]
         public void BoundaryCheck_RejectsPartialSegmentPrefix()
         {
-            // SolutionDir "D:\MyApp" vs header "D:\MyAp" (shorter, no full segment)
-            // — header must be SolutionDir-or-descendant, never an ancestor.
+            // SolutionDir "D:\MyApp" 对比 header "D:\MyAp"（更短，无完整段）
+            // —— header 必须是 SolutionDir 或其后代，绝不能是祖先。
             var instances = new[] { (1, (string?)"D:\\MyApp") };
             var m = WorkspaceResolver.Resolve("D:\\MyAp", instances);
             Assert.Equal(WorkspaceMatchKind.None, m.Kind);
@@ -97,19 +97,18 @@ namespace VsMcp.Tests
             var instances = new[]
             {
                 (1234, (string?)"D:\\projects\\MyApp"),
-                (5678, (string?)"D:\\projects\\MyApp\\sub"), // descendant also matches the header dir
+                (5678, (string?)"D:\\projects\\MyApp\\sub"), // 后代也匹配 header 目录
             };
-            // Header = D:\projects\MyApp. Both SolutionDirs are at-or-under it:
-            // 1234 exact, 5678 is... wait 5678's dir is UNDER the header, so the
-            // header is NOT a prefix of 5678's dir (the header is shorter). The
-            // rule is "header is SolutionDir or a descendant" — so 5678's dir
-            // being deeper means header != dir and header is not a descendant.
-            // Ambiguity needs two SolutionDirs that BOTH contain the header.
-            // Build that case instead:
+            // Header = D:\projects\MyApp。两个 SolutionDir 都等于或在它之下：
+            // 1234 精确，5678 是……等等 5678 的目录在 header 之下，所以
+            // header 不是 5678 目录的前缀（header 更短）。规则是"header 是
+            // SolutionDir 或后代"——5678 目录更深意味着 header != 目录且 header
+            // 不是后代。歧义需要两个 SolutionDir 都包含 header。
+            // 改用下面的用例：
             var instances2 = new[]
             {
-                (1234, (string?)"D:\\projects"),          // header D:\projects\MyApp is a child
-                (5678, (string?)"D:\\projects\\MyApp"),   // header == dir
+                (1234, (string?)"D:\\projects"),          // header D:\projects\MyApp 是子目录
+                (5678, (string?)"D:\\projects\\MyApp"),   // header == 目录
             };
             var m = WorkspaceResolver.Resolve("D:\\projects\\MyApp", instances2);
             Assert.Equal(WorkspaceMatchKind.Ambiguous, m.Kind);
@@ -118,7 +117,7 @@ namespace VsMcp.Tests
             Assert.Contains(1234, m.MatchedPids);
             Assert.Contains(5678, m.MatchedPids);
 
-            // Sanity: the first "instances" set (one exact, one deeper) is Single.
+            // 校验：第一组 "instances"（一个精确、一个更深）结果是 Single。
             var single = WorkspaceResolver.Resolve("D:\\projects\\MyApp", instances);
             Assert.Equal(WorkspaceMatchKind.Single, single.Kind);
         }
@@ -128,8 +127,8 @@ namespace VsMcp.Tests
         {
             var instances = new[]
             {
-                (1234, (string?)null),                 // no solution open — not matchable
-                (1234, (string?)""),                    // empty ditto
+                (1234, (string?)null),                 // 未打开 solution —— 不可匹配
+                (1234, (string?)""),                    // 空字符串同上
                 (9999, (string?)"D:\\projects\\MyApp"),
             };
             var m = WorkspaceResolver.Resolve("D:\\projects\\MyApp", instances);

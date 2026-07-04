@@ -7,9 +7,9 @@ using System.Threading.Tasks;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 
-// net48 polyfill: the C# compiler needs System.Runtime.CompilerServices.IsExternalInit
-// to synthesize record init-only property setters. .NET Framework 4.8 does not ship it;
-// define it here so `record` types compile without adding a runtime package.
+// net48 polyfill：C# 编译器需要 System.Runtime.CompilerServices.IsExternalInit
+// 来合成 record 的 init-only 属性 setter。.NET Framework 4.8 不附带它；
+// 在此定义，使 `record` 类型无需添加运行时包即可编译。
 namespace System.Runtime.CompilerServices
 {
     internal static class IsExternalInit { }
@@ -23,8 +23,8 @@ namespace VsMcp
     // 错误结果（ErrorResult）同样走 ReadableOptions。不再使用 SDK 的
     // McpJsonUtilities.DefaultOptions —— 其 Encoder 为 null，会把中文等非 ASCII
     // 转义成 \uXXXX，模型最终收到的是字面转义串而非可读文本。
-    // The previous hand-built JSON layer (EscapeJson/SerializeError/etc.) is
-    // deleted in DebuggerFacade.cs — these records replace it wholesale.
+    // 之前手写的 JSON 层（EscapeJson/SerializeError 等）已在 DebuggerFacade.cs
+    // 中删除——这些 record 全盘取代了它。
     // ===========================================================================
 
     /// <summary>
@@ -61,50 +61,49 @@ namespace VsMcp
         };
     }
 
-    /// <summary>Result of <c>get_debugger_state</c>.</summary>
+    /// <summary><c>get_debugger_state</c> 的结果。</summary>
     public sealed record DebuggerStateResult(string State);
 
-    /// <summary>Result of <c>set_breakpoint</c>.</summary>
+    /// <summary><c>set_breakpoint</c> 的结果。</summary>
     public sealed record BreakpointSetResult(string File, int Line, bool Enabled, string Condition, string Name);
 
-    /// <summary>A single breakpoint in <c>list_breakpoints</c>.</summary>
+    /// <summary><c>list_breakpoints</c> 中的单个断点。</summary>
     public sealed record BreakpointInfo(string File, int Line, int Column, bool Enabled, string Condition, string Name);
 
-    /// <summary>Result of <c>list_breakpoints</c>.</summary>
+    /// <summary><c>list_breakpoints</c> 的结果。</summary>
     public sealed record BreakpointListResult(IReadOnlyList<BreakpointInfo> Breakpoints, int Total);
 
-    /// <summary>Result of <c>delete_breakpoint</c>.</summary>
+    /// <summary><c>delete_breakpoint</c> 的结果。</summary>
     public sealed record BreakpointDeleteResult(bool Deleted, string File, int Line);
 
     /// <summary>
-    /// Result of <c>clear_all_breakpoints</c>. Default (confirm=false) is a
-    /// dry run: Deleted=0, WasDryRun=true, WouldDelete=N. Pass confirm=true
-    /// to actually delete.
+    /// <c>clear_all_breakpoints</c> 的结果。默认（confirm=false）为干跑：
+    /// Deleted=0、WasDryRun=true、WouldDelete=N。传 confirm=true
+    /// 才真正删除。
     /// </summary>
     public sealed record BreakpointClearResult(int Deleted, bool WasDryRun, int WouldDelete, string Message);
 
-    /// <summary>Result of <c>build_solution</c>.</summary>
+    /// <summary><c>build_solution</c> 的结果。</summary>
     public sealed record BuildSolutionResult(string Configuration, int FailedProjects, bool Succeeded);
 
     /// <summary>
-    /// Result of <c>continue_execution</c>, <c>step_into/over/out</c>,
-    /// and <c>stop_debugging</c>. D-11 / F-15: the field is <c>State</c>
-    /// (serializes to <c>state</c>) — NEVER <c>Status</c>. This collapses
-    /// the prior state/status/debugger_state three-key inconsistency.
+    /// <c>continue_execution</c>、<c>step_into/over/out</c>、
+    /// <c>stop_debugging</c> 的结果。D-11 / F-15：该字段是 <c>State</c>
+    /// （序列化为 <c>state</c>）——绝不是 <c>Status</c>。这合并了
+    /// 之前 state/status/debugger_state 三键不一致的问题。
     /// </summary>
     public sealed record ExecutionResult(string State, string Message);
 
-    /// <summary>A single frame in <c>get_call_stack</c>.</summary>
+    /// <summary><c>get_call_stack</c> 中的单个栈帧。</summary>
     public sealed record StackFrameInfo(int FrameIndex, string FunctionName, string Module, string ReturnType);
 
-    /// <summary>Result of <c>get_call_stack</c>.</summary>
+    /// <summary><c>get_call_stack</c> 的结果。</summary>
     public sealed record CallStackResult(IReadOnlyList<StackFrameInfo> Frames, int Total, int Returned);
 
     /// <summary>
-    /// A single evaluated expression or local variable. Recursively
-    /// expandable via <see cref="Children"/> (drilled by
-    /// <c>get_variable_detail</c>). <see cref="Truncated"/> + <see cref="Hint"/>
-    /// guide the LLM to drill when the char budget is hit.
+    /// 单个已求值的表达式或局部变量。可经 <see cref="Children"/> 递归展开
+    /// （由 <c>get_variable_detail</c> 下钻）。<see cref="Truncated"/> +
+    /// <see cref="Hint"/> 在命中字符预算时引导 LLM 下钻。
     /// </summary>
     public sealed record ExpressionInfo(
         string Name,
@@ -116,22 +115,25 @@ namespace VsMcp
         bool Truncated,
         string? Hint);
 
-    /// <summary>Result of <c>get_local_variables</c>.</summary>
+    /// <summary><c>list_local_variables</c> 的结果：当前栈帧所有 local 的浅列表
+    ///（只顶层字段，children 不展开；看 <see cref="ExpressionInfo.HasChildren"/>，
+    /// 需要下钻用 <c>get_variable_detail</c>）。</summary>
     public sealed record LocalsResult(IReadOnlyList<ExpressionInfo> Locals, int Total, int Returned, bool Truncated);
 
-    /// <summary>
-    /// Result of <c>evaluate_expression</c> and <c>get_variable_detail</c>.
-    /// Wrapper so both tools share a stable top-level shape carrying a single
-    /// <see cref="Expression"/>.
-    /// </summary>
+    /// <summary><c>evaluate_expression</c> 的结果：单个表达式求值后的
+    /// <see cref="ExpressionInfo"/> 树。</summary>
     public sealed record ExpressionResult(ExpressionInfo Expression);
 
+    /// <summary><c>get_variable_detail</c> 的结果：每个请求表达式对应一个
+    /// <see cref="ExpressionInfo"/>（顺序与输入 <c>expressions</c> 一致）。
+    /// 求值失败的表达式对应条目 <see cref="ExpressionInfo.Error"/> = true。</summary>
+    public sealed record VariableDetailResult(IReadOnlyList<ExpressionInfo> Details);
+
     /// <summary>
-    /// Result of <c>get_session_info</c>. Surfaces the solution VS has loaded
-    /// (so the agent knows which project tree it is operating on), the
-    /// projects inside it, and a best-effort debug target. Every field except
-    /// <see cref="State"/> is nullable / may be empty when no solution is
-    /// loaded or when the debug target cannot be resolved.
+    /// <c>get_session_info</c> 的结果。暴露 VS 已加载的解决方案（让 agent
+    /// 知道它在操作哪个项目树）、其中的项目、以及一个尽力而为的调试目标。
+    /// 除 <see cref="State"/> 外每个字段都可空 / 在未加载解决方案或无法解析
+    /// 调试目标时可能为空。
     /// </summary>
     public sealed record SessionInfoResult(
         string? SolutionPath,
@@ -141,21 +143,19 @@ namespace VsMcp
         string State);
 
     // ===========================================================================
-    // search_project / start_debugging tool DTOs. These two tools form a pair:
-    // search_project enumerates the loaded solution so the agent can locate the
-    // project that owns the executable it wants to debug (and read back the
-    // best-effort OutputTarget), then start_debugging launches that exe through
-    // VS's native IVsDebugger2.LaunchDebugTargets2 path (no project config or
-    // launchSettings.json touched).
+    // search_project / start_debugging 工具 DTO。这两个工具成对：
+    // search_project 枚举已加载的解决方案，让 agent 定位拥有它要调试的
+    // 可执行文件的项目（并读回尽力而为的 OutputTarget），然后 start_debugging
+    // 经 VS 原生 IVsDebugger2.LaunchDebugTargets2 路径启动该 exe（不碰项目配置
+    // 或 launchSettings.json）。
     // ===========================================================================
 
     /// <summary>
-    /// A single project surfaced by <c>search_project</c>. OutputTarget is a
-    /// best-effort resolved path to the project's built executable (for C#
-    /// projects, derived from ConfigurationManager + OutputFileName); null when
-    /// the project type does not expose those properties (C++/vcxproj, solution
-    /// folders, misc) — start_debugging takes an absolute exe path directly so
-    /// a null here is non-fatal, just informational.
+    /// <c>search_project</c> 暴露的单个项目。OutputTarget 是尽力解析到的
+    /// 项目已构建可执行文件路径（C# 项目下来自 ConfigurationManager +
+    /// OutputFileName）；当项目类型不暴露这些属性时（C++/vcxproj、解决方案
+    /// 文件夹、杂项）为 null——start_debugging 直接接收绝对 exe 路径，
+    /// 故此处为 null 非致命，仅作信息。
     /// </summary>
     public sealed record ProjectInfo(
         string Name,
@@ -165,18 +165,16 @@ namespace VsMcp
         bool IsStartupProject,
         string? OutputTarget);
 
-    /// <summary>Result of <c>search_project</c>.</summary>
+    /// <summary><c>search_project</c> 的结果。</summary>
     public sealed record ProjectSearchResult(IReadOnlyList<ProjectInfo> Projects, int Total);
 
     /// <summary>
-    /// Result of <c>start_debugging</c>. Started is true only when
-    /// LaunchDebugTargets2 returned a success HRESULT. State is the debugger
-    /// mode observed right after the launch call (typically "running" or
-    /// "break" if a startup breakpoint was hit; "design" if the launch did not
-    /// actually engage the debugger). EnvironmentVariables echoes the effective
-    /// env that was passed to CreateProcess (the parsed dictionary when the
-    /// JSON-string form was used, or the original map). Warnings carries
-    /// non-fatal advisories (e.g. default engine fallback, env-block notes).
+    /// <c>start_debugging</c> 的结果。仅当 LaunchDebugTargets2 返回成功 HRESULT
+    /// 时 Started 为 true。State 是发起调用后立即观测到的调试器模式（通常为
+    /// "running"；若命中启动断点则为 "break"；若发起并未真正接入调试器则为
+    /// "design"）。EnvironmentVariables 回传给 CreateProcess 的有效 env（使用
+    /// JSON 字符串形式时为解析后的字典，否则为原始 map）。Warnings 携带
+    /// 非致命告警（如默认引擎兜底、env-block 说明）。
     /// </summary>
     public sealed record StartDebuggingResult(
         bool Started,
@@ -189,20 +187,18 @@ namespace VsMcp
         IReadOnlyList<string>? Warnings);
 
     // ===========================================================================
-    // D-12 error contract. A single ErrorResult type carries the structured
-    // error (classification, human message, optional debugger state) and
-    // serializes itself into a TextContentBlock on a CallToolResult flagged
-    // IsError=true — the MCP-spec-correct way to signal a tool failure the
-    // LLM can recover from (vs the old 200-OK-with-error-JSON).
+    // D-12 错误契约。单个 ErrorResult 类型携带结构化错误（分类、人类可读
+    // 消息、可选调试器状态），并自行序列化进一个标记 IsError=true 的
+    // CallToolResult 的 TextContentBlock——这是 MCP 规范正确的方式来表示
+    // LLM 可恢复的工具失败（对比旧的 200-OK-with-error-JSON）。
     // ===========================================================================
 
     /// <summary>
-    /// Structured tool error. <see cref="State"/> is populated only when the
-    /// error is state-related (D-11 normalization); it is null otherwise and
-    /// may be omitted or null in the serialized JSON (Web-default behavior).
-    /// <see cref="File"/> / <see cref="LoadedSolution"/> are populated only by
-    /// <c>file_not_in_solution</c> so the agent receives the actionable
-    /// context (which file it asked for vs. which solution is loaded).
+    /// 结构化工具错误。<see cref="State"/> 仅在与状态相关的错误时填充
+    /// （D-11 规范化）；否则为 null，在序列化 JSON 中可省略或为 null
+    /// （Web 默认行为）。<see cref="File"/> / <see cref="LoadedSolution"/>
+    /// 仅由 <c>file_not_in_solution</c> 填充，使 agent 收到可操作的上下文
+    /// （它要的是哪个文件 vs. 加载的是哪个解决方案）。
     /// </summary>
     public sealed record ErrorResult(
         string Error,
@@ -212,10 +208,10 @@ namespace VsMcp
         string? LoadedSolution = null)
     {
         /// <summary>
-        /// Builds an MCP-spec <see cref="CallToolResult"/> with
-        /// <see cref="CallToolResult.IsError"/> = true and a single
-        /// <see cref="TextContentBlock"/> whose text is this ErrorResult
-        /// serialized via <see cref="McpJson.ReadableOptions"/>.
+        /// 构建一个 MCP 规范的 <see cref="CallToolResult"/>，其
+        /// <see cref="CallToolResult.IsError"/> = true，含单个
+        /// <see cref="TextContentBlock"/>，文本为该 ErrorResult 经
+        /// <see cref="McpJson.ReadableOptions"/> 序列化的结果。
         /// </summary>
         public CallToolResult ToCallToolResult() => new()
         {
@@ -231,14 +227,14 @@ namespace VsMcp
     }
 
     // ===========================================================================
-    // Typed exceptions. The facade throws these instead of building
-    /// SerializeError strings; SafeCall converts them to ErrorResult.
+    // 类型化异常。facade 抛出它们而非构造
+    /// SerializeError 字符串；SafeCall 把它们转换为 ErrorResult。
     // ===========================================================================
 
     /// <summary>
-    /// Thrown when a tool requires the debugger to be in break mode but it
-    /// is in design/run mode. Carries the current state string so SafeCall
-    /// can populate <see cref="ErrorResult.State"/>.
+    /// 当工具要求调试器处于 break 模式但它处于 design/run 模式时抛出。
+    /// 携带当前状态字符串，使 SafeCall 能填充
+    /// <see cref="ErrorResult.State"/>。
     /// </summary>
     public sealed class RequireBreakModeException : Exception
     {
@@ -251,8 +247,7 @@ namespace VsMcp
     }
 
     /// <summary>
-    /// Thrown when <c>delete_breakpoint</c> (or similar) cannot locate the
-    /// referenced breakpoint.
+    /// 当 <c>delete_breakpoint</c>（或类似工具）找不到所引用的断点时抛出。
     /// </summary>
     public sealed class BreakpointNotFoundException : Exception
     {
@@ -260,11 +255,10 @@ namespace VsMcp
     }
 
     /// <summary>
-    /// Thrown by <c>set_breakpoint</c> when a solution IS loaded in VS but the
-    /// requested file is not a member of it. Carries the requested file path
-    /// and the loaded solution path so SafeCall can populate
+    /// <c>set_breakpoint</c> 在 VS 已加载解决方案但所请求文件不属于它时抛出。
+    /// 携带所请求的文件路径和已加载的解决方案路径，使 SafeCall 能填充
     /// <see cref="ErrorResult.File"/> + <see cref="ErrorResult.LoadedSolution"/>
-    /// for actionable agent context.
+    /// 以提供可操作的 agent 上下文。
     /// </summary>
     public sealed class FileNotInSolutionException : Exception
     {
@@ -280,25 +274,23 @@ namespace VsMcp
     }
 
     // ===========================================================================
-    // SafeCall — the single error-routing boundary. Every facade-calling
-    // tool lambda registered with the MCP SDK is wrapped here so a facade
-    // exception becomes a CallToolResult{IsError=true}+ErrorResult.
-    // OperationCanceledException is rethrown unchanged: it signals shutdown
-    // and must NEVER be swallowed into an error response.
+    // SafeCall——唯一的错误路由边界。每个调用 facade 的工具 lambda 注册到
+    // MCP SDK 时都经此包装，使 facade 异常成为
+    // CallToolResult{IsError=true}+ErrorResult。
+    // OperationCanceledException 原样重抛：它表示关停，绝不能被吞进错误响应。
     // ===========================================================================
 
     /// <summary>
-    /// Routes facade exceptions into the D-12 structured-error contract, and
-    /// wraps every success result via <see cref="McpJson.ToTextResult"/> so the
-    /// LLM sees readable (unescaped) JSON. The widened <c>Task&lt;object&gt;</c>
-    /// return type satisfies the MCP SDK's tool-invocation contract: success and
-    /// error paths both yield a <see cref="CallToolResult"/>, which the SDK
-    /// returns verbatim (REMEDIATION fact #7) instead of re-serializing it via
-    /// the Chinese-escaping <c>McpJsonUtilities.DefaultOptions</c>.
+    /// 将 facade 异常路由进 D-12 结构化错误契约，并经
+    /// <see cref="McpJson.ToTextResult"/> 包装每个成功结果，使 LLM 看到可读的
+    /// （未转义的）JSON。放宽的 <c>Task&lt;object&gt;</c> 返回类型满足 MCP SDK
+    /// 的工具调用契约：成功与错误路径都产出 <see cref="CallToolResult"/>，SDK
+    /// 原样返回（REMEDIATION fact #7），而非经转义中文的
+    /// <c>McpJsonUtilities.DefaultOptions</c> 重新序列化。
     /// </summary>
     public static class SafeCall
     {
-#pragma warning disable VSTHRD200 // "Wrap" is the established name across REMEDIATION/PATTERNS/plan; callers hand the resulting Task to the MCP SDK and never await it directly, so the "Async" suffix would mislead.
+#pragma warning disable VSTHRD200 // "Wrap" 是 REMEDIATION/PATTERNS/plan 中确立的名称；调用方把结果 Task 交给 MCP SDK 且从不直接 await，故 "Async" 后缀会误导。
         public static async Task<object> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {
@@ -313,9 +305,8 @@ namespace VsMcp
             }
             catch (OperationCanceledException)
             {
-                // Shutdown signal — transparent rethrow. Must NOT be
-                // converted to an ErrorResult (would mask cancellation
-                // as a tool failure and confuse the SDK teardown path).
+                // 关停信号——透明重抛。绝不能转为 ErrorResult
+                // （会把取消掩盖为工具失败，并混淆 SDK 的拆除路径）。
                 throw;
             }
             catch (RequireBreakModeException ex)
@@ -328,9 +319,8 @@ namespace VsMcp
             }
             catch (FileNotInSolutionException ex)
             {
-                // file_not_in_solution carries both the requested file and the
-                // loaded solution so the agent can reconcile which project tree
-                // it should be referencing instead of silently no-op'ing.
+                // file_not_in_solution 同时携带所请求的文件和已加载的解决方案，
+                // 使 agent 能核对它本应引用哪个项目树，而非默默空操作。
                 return new ErrorResult(
                     "file_not_in_solution",
                     ex.Message,
@@ -339,9 +329,8 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
-                // T-05-03-01 mitigation: only ex.Message crosses to the LLM,
-                // never the StackTrace or internal type names beyond the
-                // fixed classification label.
+                // T-05-03-01 缓解：只有 ex.Message 传给 LLM，
+                // 绝不传 StackTrace 或固定分类标签之外的内部类型名。
                 return new ErrorResult("internal_error", ex.Message).ToCallToolResult();
             }
         }

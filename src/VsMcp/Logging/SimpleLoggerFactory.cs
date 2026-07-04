@@ -5,25 +5,23 @@ using Microsoft.Extensions.Logging;
 namespace VsMcp.Logging
 {
     /// <summary>
-    /// Minimal <see cref="ILoggerFactory"/> implementation that routes all
-    /// created loggers through a single <see cref="ILoggerProvider"/> with a
-    /// configured minimum level.
+    /// 最小化的 <see cref="ILoggerFactory"/> 实现，把所有创建的 logger 经单一
+    /// <see cref="ILoggerProvider"/> 路由，并带一个配置的最小级别。
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This stands in for <c>Microsoft.Extensions.Logging.LoggerFactory</c>,
-    /// which lives in the concrete <c>Microsoft.Extensions.Logging</c> NuGet
-    /// package. That package is not currently referenced by the project and
-    /// bringing it in is unnecessary for this extension's logging needs: the
-    /// consumers are the VS package + PipeMcpServer + GatewayLauncher (each of
-    /// which takes an <see cref="ILoggerFactory"/> and forwards it to the MCP
-    /// SDK), and the only provider is <see cref="VsOutputWindowLoggerProvider"/>.
-    /// A 20-line factory covers the contract with zero new dependencies.
+    /// 它代替 <c>Microsoft.Extensions.Logging.LoggerFactory</c>——后者位于
+    /// 具体的 <c>Microsoft.Extensions.Logging</c> NuGet 包中。该项目当前未引用
+    /// 该包，且为本扩展的日志需求引入它没必要：消费者是 VS package +
+    /// PipeMcpServer + GatewayLauncher（每个都接收 <see cref="ILoggerFactory"/>
+    /// 并转发给 MCP SDK），唯一 provider 是
+    /// <see cref="VsOutputWindowLoggerProvider"/>。20 行的工厂以零新依赖覆盖该
+    /// 契约。
     /// </para>
     /// <para>
-    /// Created loggers cache the underlying provider logger by category name;
-    /// <see cref="ILogger"/> instances from a single provider are stateless
-    /// beyond the provider reference, so the cache is safe to share.
+    /// 创建的 logger 按 category 名缓存底层 provider logger；来自单一 provider
+    /// 的 <see cref="ILogger"/> 实例除 provider 引用外无状态，故缓存共享是
+    /// 安全的。
     /// </para>
     /// </remarks>
     internal sealed class SimpleLoggerFactory : ILoggerFactory
@@ -61,8 +59,8 @@ namespace VsMcp.Logging
 
         public void AddProvider(ILoggerProvider provider)
         {
-            // Single-provider factory; additional providers are ignored. The
-            // extension only ever wires one provider (VsOutputWindowLoggerProvider).
+            // 单 provider 工厂；额外的 provider 被忽略。本扩展只接一个
+            // provider（VsOutputWindowLoggerProvider）。
             if (provider == null)
                 throw new ArgumentNullException(nameof(provider));
         }
@@ -80,11 +78,10 @@ namespace VsMcp.Logging
         }
 
         /// <summary>
-        /// Wraps a provider logger so that events below the configured minimum
-        /// level are filtered before reaching the provider. The provider's own
-        /// <c>IsEnabled</c> also gates at Information (D-07); this filter is
-        /// the factory-level control surface so callers can tighten the level
-        /// without touching the provider.
+        /// 包装一个 provider logger，使低于所配置最小级别的事件在到达 provider
+        /// 前被过滤。provider 自身的 <c>IsEnabled</c> 也在 Information 处把关
+        /// （D-07）；该过滤器是工厂级控制面，使调用方无需改 provider 即可收紧
+        /// 级别。
         /// </summary>
         private sealed class MinimumLevelFilteringLogger : ILogger
         {

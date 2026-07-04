@@ -8,10 +8,9 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// Agent-facing intercept messages (设计文档 §①/§④). Verifies the error
-    /// text the Gateway hands back to the agent contains the guidance + the
-    /// available-instances list + the .mcp.json example, so the agent can relay
-    /// it to the user.
+    /// 面向 Agent 的 intercept 消息（设计文档 §①/§④）。校验 Gateway 回给
+    /// Agent 的错误文本包含引导文案 + 可用实例列表 + .mcp.json 示例，
+    /// 以便 Agent 转达给用户。
     /// </summary>
     public class InterceptTests
     {
@@ -44,7 +43,7 @@ namespace VsMcp.Tests
             Assert.False(res.Success);
             Assert.Equal(TargetErrorKind.Intercept, res.ErrorKind);
             Assert.NotNull(res.ErrorText);
-            // The full §④ guidance is present: instance list + .mcp.json example.
+            // 完整的 §④ 引导文案都在：实例列表 + .mcp.json 示例。
             Assert.Contains("Multiple VS instances are running", res.ErrorText);
             Assert.Contains("PID 1234", res.ErrorText);
             Assert.Contains("PID 5678", res.ErrorText);
@@ -65,7 +64,7 @@ namespace VsMcp.Tests
             Assert.Contains("No VS instance connected", res.ErrorText!);
         }
 
-        // ─────────────────────────── ① Header miss ──────────────────────────
+        // ─────────────────────────── ① Header 未命中 ──────────────────────────
 
         [Fact]
         public void ResolveTarget_HeaderZeroMatches_ReturnsWorkspaceMiss()
@@ -79,12 +78,12 @@ namespace VsMcp.Tests
             Assert.Equal(TargetErrorKind.WorkspaceMiss, res.ErrorKind);
             Assert.Contains("No VS instance found for workspace", res.ErrorText!);
             Assert.Contains("D:\\projects\\MyApp", res.ErrorText);
-            // The available-instances list lets the agent tell the user what's open.
+            // 可用实例列表让 Agent 能告知用户当前打开了哪些。
             Assert.Contains("PID 5678", res.ErrorText);
             Assert.Contains("D:\\projects\\Other\\Other.sln", res.ErrorText);
         }
 
-        // ───────────────────────── ① Header ambiguity ───────────────────────
+        // ───────────────────────── ① Header 歧义 ───────────────────────
 
         [Fact]
         public void ResolveTarget_HeaderMultiMatches_ReturnsAmbiguous()
@@ -92,7 +91,7 @@ namespace VsMcp.Tests
             var registry = BuildRegistry(
                 (1234, "D:\\projects\\MyApp\\MyApp.sln", "D:\\projects\\MyApp"),
                 (5678, "D:\\projects\\MyApp\\Other.sln", "D:\\projects\\MyApp"));
-            // Two SolutionDirs equal the header → both match.
+            // 两个 SolutionDir 都等于 header → 都匹配。
             var sessions = new SessionTable();
 
             var res = BindingResolver.ResolveTarget("D:\\projects\\MyApp", null, sessions, registry);
@@ -104,18 +103,18 @@ namespace VsMcp.Tests
             Assert.Contains("PID 5678", res.ErrorText);
         }
 
-        // ─────────────────── ② Session / instance offline ───────────────────
+        // ─────────────────── ② Session / 实例离线 ───────────────────
 
         [Fact]
         public void ResolveTarget_BoundInstanceGone_ReturnsInstanceGone()
         {
             var sessions = new SessionTable();
-            sessions.CreateWithId(9999, "vs-sess-x", "initialize"); // 9999 never registered
+            sessions.CreateWithId(9999, "vs-sess-x", "initialize"); // 9999 从未注册
             var registry = new InstanceRegistry();
 
             var res = BindingResolver.ResolveTarget(null, null, sessions, registry);
-            // No clientSessionId passed → falls through to ③/④ (0 instances).
-            // Re-run with the bound id to hit the ② instance-gone branch.
+            // 未传 clientSessionId → 落到 ③/④（0 个实例）。
+            // 用绑定的 id 重跑以命中 ② 实例已离线分支。
             var sessions2 = new SessionTable();
             var (_, binding) = sessions2.CreateWithId(9999, "vs-sess-x", "initialize");
             var res2 = BindingResolver.ResolveTarget(null, binding.ClientSessionId, sessions2, registry);

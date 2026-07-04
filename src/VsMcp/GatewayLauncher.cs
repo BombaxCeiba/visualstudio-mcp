@@ -9,18 +9,15 @@ using System.Threading.Tasks;
 namespace VsMcp
 {
     /// <summary>
-    /// Ensures the standalone Gateway exe (<c>VsMcpGateway.exe</c>) is running
-    /// before the pipe server tries to connect to it. The Gateway owns
-    /// <c>:43210</c> and the <c>vs-mcp-gateway</c> pipe; if it is not up when VS
-    /// starts, VS will keep retrying the pipe connect (slow). Pre-launching the
-    /// Gateway shortens that window.
+    /// 确保 standalone Gateway exe（<c>VsMcpGateway.exe</c>）在 pipe server 尝试
+    /// 连接它之前已运行。Gateway 持有 <c>:43210</c> 与 <c>vs-mcp-gateway</c>
+    /// pipe；若 VS 启动时它未起来，VS 会持续重试 pipe 连接（慢）。预拉起
+    /// Gateway 以缩短该窗口。
     ///
-    /// Fire-and-forget semantics: VS never awaits the child Gateway process and
-    /// never kills it on VS Dispose (the Gateway is designed to outlive any VS
-    /// instance — see 设计文档 §Gateway Lifecycle Management). If the Gateway
-    /// cannot be found on disk, this method returns false and the pipe server
-    /// still listens; the Gateway may have been started by another VS instance
-    /// or by the user.
+    /// fire-and-forget 语义：VS 从不 await 子 Gateway 进程，也绝不在 VS Dispose
+    /// 时杀它（Gateway 设计为比任何 VS 实例都长寿——见设计文档 §Gateway
+    /// Lifecycle Management）。若磁盘上找不到 Gateway，本方法返回 false，pipe
+    /// server 仍会监听；Gateway 可能已被另一个 VS 实例或用户启动。
     /// </summary>
     public static class GatewayLauncher
     {
@@ -30,15 +27,14 @@ namespace VsMcp
         private const int RetryIntervalMs = 500;
 
         /// <summary>
-        /// Resolve the Gateway exe path. Order:
-        ///   1. Same directory as this assembly (Wave 5 ships the exe next to
-        ///      the package dll in the VSIX).
-        ///   2. <c>VS_MCP_GATEWAY_PATH</c> environment variable (manual override).
-        /// Returns null if neither yields an existing file.
+        /// 解析 Gateway exe 路径。顺序：
+        ///   1. 本程序集同目录（Wave 5 把 exe 与 package dll 一起放在 VSIX 里）。
+        ///   2. <c>VS_MCP_GATEWAY_PATH</c> 环境变量（手动覆盖）。
+        /// 两者都不指向已存在文件时返回 null。
         /// </summary>
         public static string? ResolveGatewayPath()
         {
-            // (1) Same directory as the calling assembly.
+            // (1) 调用程序集同目录。
             try
             {
                 string? dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
@@ -49,30 +45,28 @@ namespace VsMcp
                         return candidate;
                 }
             }
-            catch { /* assembly location resolution can fail in some hosts */ }
+            catch { /* 某些 host 下程序集定位解析会失败 */ }
 
-            // (2) Environment override.
+            // (2) 环境变量覆盖。
             try
             {
                 string? envPath = Environment.GetEnvironmentVariable("VS_MCP_GATEWAY_PATH");
                 if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
                     return envPath;
             }
-            catch { /* env access must never throw */ }
+            catch { /* env 访问绝不能抛 */ }
 
             return null;
         }
 
         /// <summary>
-        /// Ensure the Gateway is reachable on :43210, launching it from the
-        /// resolved exe path if not. Retries the probe a few times so the
-        /// freshly-started Gateway has time to bind the port. Returns true if
-        /// the Gateway is reachable when this method exits; false if the Gateway
-        /// could not be reached or launched (the pipe server will keep retrying
-        /// its own connect, so this is best-effort, not fatal).
+        /// 确保 Gateway 在 :43210 可达，若不可达则从解析到的 exe 路径启动它。
+        /// 重试探测几次，让刚启动的 Gateway 有时间绑定端口。本方法退出时若
+        /// Gateway 可达则返回 true；若无法到达或启动则返回 false（pipe server
+        /// 会持续重试自己的连接，故此处为尽力而为，非致命）。
         ///
-        /// The optional injectables exist so unit tests can drive the decision
-        /// without actually spawning a process or opening a socket.
+        /// 可选注入项的存在使单元测试能驱动决策而无需真正 spawn 进程或开
+        /// socket。
         /// </summary>
         public static async Task<bool> EnsureGatewayRunningAsync(
             CancellationToken cancellationToken,
@@ -84,16 +78,15 @@ namespace VsMcp
             probe ??= DefaultProbe;
             launcher ??= DefaultLaunch;
 
-            // Fast path: already up.
+            // 快速路径：已经起来了。
             if (probe())
                 return true;
 
             string? exePath = pathResolver();
             if (exePath == null)
             {
-                // No exe on disk — another VS may have launched it, or the user
-                // runs it manually. Give the probe a few retries in case it is
-                // mid-startup, but don't attempt to launch.
+                // 磁盘上没有 exe——可能另一个 VS 已拉起它，或用户手动运行。
+                // 给探测几次重试，以防它正启动到一半，但不尝试启动。
                 for (int i = 0; i < RetryAttempts && !cancellationToken.IsCancellationRequested; i++)
                 {
                     await Task.Delay(RetryIntervalMs, cancellationToken).ConfigureAwait(false);
@@ -106,7 +99,7 @@ namespace VsMcp
             if (!launcher(exePath))
                 return false;
 
-            // The child needs time to bind :43210; retry the probe.
+            // 子进程需要时间绑定 :43210；重试探测。
             for (int i = 0; i < RetryAttempts && !cancellationToken.IsCancellationRequested; i++)
             {
                 await Task.Delay(RetryIntervalMs, cancellationToken).ConfigureAwait(false);
@@ -117,8 +110,8 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Probe whether anything is listening on the Gateway port. Uses a very
-        /// short connect timeout so a dead port fails fast (we retry elsewhere).
+        /// 探测 Gateway 端口上是否有东西在监听。用很短的连接超时，使死端口
+        /// 快速失败（我们在别处重试）。
         /// </summary>
         private static bool DefaultProbe()
         {
@@ -136,9 +129,9 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// Spawn the Gateway exe hidden (no console window). Returns true if the
-        /// process started; false if Start threw. Never awaits the child — the
-        /// Gateway runs independently of VS.
+        /// 隐藏地 spawn Gateway exe（无控制台窗口）。进程启动则返回 true；
+        /// Start 抛异常则返回 false。从不 await 子进程——Gateway 独立于 VS
+        /// 运行。
         /// </summary>
         private static bool DefaultLaunch(string exePath)
         {

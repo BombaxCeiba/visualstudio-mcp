@@ -9,12 +9,10 @@ using Xunit;
 namespace VsMcp.Tests
 {
     /// <summary>
-    /// Wave 3 control-frame path: VS pushes a <c>solution-changed</c> frame (no
-    /// id) over the pipe; the PipeRouter read loop recognizes it and dispatches
-    /// via the constructor callback instead of dropping it (the old behavior for
-    /// id-less frames). The Gateway's callback then refreshes the
-    /// InstanceRegistry so the ① Header tier sees the live SolutionDir without a
-    /// reconnect.
+    /// Wave 3 控制帧路径：VS 经 pipe 推送一个 <c>solution-changed</c> 帧（无
+    /// id）；PipeRouter 读循环识别它并通过构造回调分派，而非丢弃（无 id 帧的
+    /// 旧行为）。Gateway 回调随后刷新 InstanceRegistry，使 ① Header 层无需
+    /// 重连即可看到最新的 SolutionDir。
     /// </summary>
     public class SolutionChangedTests
     {
@@ -33,10 +31,9 @@ namespace VsMcp.Tests
             };
             byte[] frameBytes = PipeFraming.BuildFrameBytes(frame);
 
-            // A MemoryStream with exactly one framed payload: the read loop reads
-            // it, dispatches the control frame to the callback, then reads EOF
-            // and exits. MemoryStream's ReadAsync completes synchronously so the
-            // callback fires promptly after construction.
+            // 一个只含单帧 payload 的 MemoryStream：读循环读取它、把控制帧
+            // 分派给回调，然后读到 EOF 退出。MemoryStream 的 ReadAsync 同步完成，
+            // 所以构造后回调立即触发。
             using var stream = new MemoryStream(frameBytes);
             using var router = new PipeRouter(stream, ownsStream: false, onChange =>
             {
@@ -51,11 +48,10 @@ namespace VsMcp.Tests
         }
 
         /// <summary>
-        /// The Gateway's callback merges the push into the existing InstanceEntry
-        /// (preserving PipeName/VsVersion that the push DTO omits). Verifies the
-        /// exact merge logic Program.OnSolutionChanged performs, against a real
-        /// InstanceRegistry, so header routing after a solution change picks up
-        /// the new SolutionDir.
+        /// Gateway 回调把推送合并进既有 InstanceEntry（保留推送 DTO 省略的
+        /// PipeName/VsVersion）。针对真实 InstanceRegistry 校验
+        /// Program.OnSolutionChanged 的精确合并逻辑，使 solution 切换后的
+        /// header 路由能取到新的 SolutionDir。
         /// </summary>
         [Fact]
         public void SolutionChangedCallback_RefreshesRegistry_SolutionDir()
@@ -73,8 +69,8 @@ namespace VsMcp.Tests
             };
             registry.Register(new InstanceEntry(router, original, DateTime.UtcNow));
 
-            // Mirror Program.OnSolutionChanged's merge (keep PipeName/VsVersion
-            // from the existing entry; take solution fields from the push).
+            // 镜像 Program.OnSolutionChanged 的合并（保留既有条目的
+            // PipeName/VsVersion；solution 字段取自推送）。
             var pushed = new PipeSolutionChanged
             {
                 Pid = 777,
@@ -96,10 +92,10 @@ namespace VsMcp.Tests
             Assert.True(registry.TryGet(777, out var after));
             Assert.Equal("D:\\proj\\New.sln", after!.Info.SolutionPath);
             Assert.Equal("D:\\proj", after.Info.SolutionDir);
-            Assert.Equal("vs-mcp-gateway", after.Info.PipeName);   // preserved
-            Assert.Equal("18.0", after.Info.VsVersion);             // preserved
+            Assert.Equal("vs-mcp-gateway", after.Info.PipeName);   // 已保留
+            Assert.Equal("18.0", after.Info.VsVersion);             // 已保留
 
-            // And the refreshed SolutionDir is now visible to the ① Header tier.
+            // 刷新后的 SolutionDir 现在对 ① Header 层可见。
             var match = WorkspaceResolver.Resolve("D:\\proj",
                 new[] { (after.Info.Pid, after.Info.SolutionDir) });
             Assert.Equal(WorkspaceMatchKind.Single, match.Kind);
@@ -109,17 +105,17 @@ namespace VsMcp.Tests
         [Fact]
         public async Task PipeRouter_UnknownControlFrame_DoesNotInvokeCallback()
         {
-            // A heartbeat (Wave 4) or any other id-less frame must NOT trigger the
-            // solution-changed callback; it's silently dropped so a newer VS peer
-            // advertising unknown control frames never breaks the read loop.
+            // heartbeat（Wave 4）或任何其他无 id 帧都不得触发 solution-changed
+            // 回调；它被静默丢弃，这样推送未知控制帧的较新 VS 对端永远不会
+            // 破坏读循环。
             var invoked = false;
             byte[] frameBytes = PipeFraming.BuildFrameBytes(new PipeHeartbeat { Pid = 1 });
 
             using var stream = new MemoryStream(frameBytes);
             using var router = new PipeRouter(stream, ownsStream: false, _ => invoked = true);
 
-            // Give the read loop a moment to process the frame + EOF. The callback
-            // is invoked synchronously on read if at all, so a short delay is enough.
+            // 给读循环一点时间处理帧 + EOF。回调如果触发是在读取时同步执行的，
+            // 所以短延迟足够。
             await Task.Delay(200);
             Assert.False(invoked);
         }
@@ -127,9 +123,9 @@ namespace VsMcp.Tests
         [Fact]
         public async Task PipeRouter_DispatchesHeartbeatFrame_ToCallback()
         {
-            // Wave 4: a heartbeat control frame routes to the dedicated onHeartbeat
-            // callback (not the solution-changed one), so the Gateway can refresh
-            // InstanceEntry.LastSeen on every VS heartbeat.
+            // Wave 4：heartbeat 控制帧路由到专用 onHeartbeat 回调（而非
+            // solution-changed 回调），使 Gateway 能在每次 VS 心跳时刷新
+            // InstanceEntry.LastSeen。
             var tcs = new TaskCompletionSource<PipeHeartbeat>(TaskCreationOptions.RunContinuationsAsynchronously);
             byte[] frameBytes = PipeFraming.BuildFrameBytes(new PipeHeartbeat { Pid = 42 });
 
@@ -145,8 +141,7 @@ namespace VsMcp.Tests
 
     internal static class TaskTestExtensions
     {
-        /// <summary>Await with a hard timeout so a hung dispatch fails the test
-        /// fast instead of stalling the runner.</summary>
+        /// <summary>带硬超时等待，使挂起的分派快速失败测试而非卡死运行器。</summary>
         public static async Task<T> WaitForAsync<T>(this Task<T> task, int timeoutMs)
         {
             var winner = await Task.WhenAny(task, Task.Delay(timeoutMs));

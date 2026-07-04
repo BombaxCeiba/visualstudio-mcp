@@ -4,46 +4,46 @@ using System.Net;
 namespace VsMcp
 {
     /// <summary>
-    /// Bearer token authentication middleware for the MCP HTTP server.
-    /// Validates Authorization headers against an expected token.
-    /// When no token is configured (null), authentication is disabled and all requests are allowed.
+    /// MCP HTTP 服务器的 Bearer token 认证中间件。
+    /// 针对 expected token 校验 Authorization 头。
+    /// 当未配置 token（null）时，认证禁用，所有请求都放行。
     /// </summary>
     public sealed class McpAuthMiddleware
     {
         private readonly string? _expectedToken;
 
         /// <summary>
-        /// Creates a new auth middleware instance.
+        /// 创建一个新的认证中间件实例。
         /// </summary>
-        /// <param name="expectedToken">The expected bearer token, or null to disable authentication.</param>
+        /// <param name="expectedToken">期望的 bearer token，为 null 则禁用认证。</param>
         public McpAuthMiddleware(string? expectedToken)
         {
             _expectedToken = expectedToken;
         }
 
         /// <summary>
-        /// Gets whether authentication is enabled (true when a token is configured).
+        /// 获取认证是否启用（配置了 token 时为 true）。
         /// </summary>
         public bool IsEnabled => _expectedToken is not null;
 
         /// <summary>
-        /// Validates the authentication of an incoming HTTP request.
-        /// Returns true if the request is authorized, false otherwise.
-        /// When auth is disabled (null token), all requests are allowed.
+        /// 校验传入 HTTP 请求的认证。
+        /// 请求已授权则返回 true，否则 false。
+        /// 认证禁用时（null token），所有请求都放行。
         /// </summary>
-        /// <param name="request">The incoming HTTP request to validate.</param>
-        /// <returns>True if the request passes authentication, false otherwise.</returns>
+        /// <param name="request">要校验的传入 HTTP 请求。</param>
+        /// <returns>请求通过认证则为 true，否则为 false。</returns>
         public bool ValidateRequest(HttpListenerRequest request)
         {
             return ValidateAuthHeader(request.Headers["Authorization"]);
         }
 
         /// <summary>
-        /// Validates an Authorization header value directly.
-        /// Public for unit testing without requiring HttpListenerRequest.
+        /// 直接校验 Authorization 头的值。
+        /// public 以便无需 HttpListenerRequest 即可做单元测试。
         /// </summary>
-        /// <param name="authHeader">The Authorization header value, or null.</param>
-        /// <returns>True if auth is disabled or the bearer token matches.</returns>
+        /// <param name="authHeader">Authorization 头的值，或 null。</param>
+        /// <returns>认证禁用或 bearer token 匹配则为 true。</returns>
         public bool ValidateAuthHeader(string? authHeader)
         {
             if (!IsEnabled)
