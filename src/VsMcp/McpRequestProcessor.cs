@@ -5,7 +5,6 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -215,7 +214,7 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "get_build_output",
-                        Description = "Reads the VS Output window's Build pane and returns a sliced view of the build log. Authoritative source for compiler diagnostics (the in-IDE error list may include stale squiggles from incomplete IntelliSense). maxLines caps the returned line count (default 200); tail=true (default) reads the most recent lines where errors usually appear, tail=false reads from the top.",
+                        Description = "Reads the VS Output window's Build pane and returns PLAIN TEXT (not JSON): one header line (pane name, head/tail direction, returned/total line count, truncation flag) followed by the raw build log — newlines preserved, no escaping. Authoritative source for compiler diagnostics (the in-IDE error list may include stale squiggles from incomplete IntelliSense). maxLines caps the returned line count (default 200); tail=true (default) reads the most recent lines where errors usually appear, tail=false reads from the top.",
                         ReadOnly = true
                     }));
 
@@ -271,16 +270,16 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "list_local_variables",
-                        Description = "Lists all local variables at the current stack frame, SHALLOW: each entry shows name/type/value/hasChildren only, children are NOT expanded. Use get_variable_detail to drill into any with hasChildren=true. maxLocals (default 200) and maxChars (default 4096) cap the output so a frame with many/deep locals can't blow up the context. Prerequisite: break mode (returns not_in_break_mode otherwise).",
+                        Description = "Lists all local variables at the current stack frame as PLAIN TEXT (not JSON), one per line `name (type) = value`; `{…}` marks entries with children (use get_variable_detail to expand). SHALLOW — children are NOT expanded. maxLocals (default 200) and maxChars (default 4096) cap the output so a frame with many/deep locals can't blow up the context. Prerequisite: break mode (returns not_in_break_mode otherwise).",
                         ReadOnly = true
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.GetCallStackAsync(ct), ct),
+                    (CancellationToken ct) => SafeCall.WrapText(() => _facade.GetCallStackAsTextAsync(ct), ct),
                     new McpServerToolCreateOptions
                     {
                         Name = "get_call_stack",
-                        Description = "Returns the call stack with function names, module names, and return types. At most 50 frames (deepest frames dropped if the stack is deeper). Prerequisite: break mode (returns not_in_break_mode otherwise).",
+                        Description = "Returns the call stack as PLAIN TEXT (not JSON), one frame per line: `#idx  module!Function  → RetType`. At most 50 frames (deepest dropped if the stack is deeper). Prerequisite: break mode (returns not_in_break_mode otherwise).",
                         ReadOnly = true
                     }));
 
@@ -289,7 +288,7 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "evaluate_expression",
-                        Description = "Evaluates an arbitrary expression (e.g., obj.Property.Method()) and returns the result with type and value. Expression syntax follows the active debug engine: C#-like for managed, C/C++-like for native. May modify state if the expression has side effects. 5-second timeout. Prerequisite: break mode (returns not_in_break_mode otherwise).",
+                        Description = "Evaluates an arbitrary expression (e.g., obj.Property.Method()) and returns the result as PLAIN TEXT (not JSON): `expr (type) = value`, with object members indented underneath (tree-style). Expression syntax follows the active debug engine: C#-like for managed, C/C++-like for native. May modify state if the expression has side effects. 5-second timeout. Prerequisite: break mode (returns not_in_break_mode otherwise).",
                         Destructive = true
                     }));
 
@@ -314,7 +313,7 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "find_symbol",
-                        Description = "Searches symbols across every language (C#, VB, C++) via NavigateTo — VS's 'Go To All' (Ctrl+T) backend — so accuracy matches in-IDE symbol search, including for C++ (served by the VC Language Server over LSP workspace/symbol). Returns the most relevant matches: default 16, capped by the optional maxResults. Each match carries source file path, 1-based line, and column when the provider reports it, plus the symbol kind and language. Far more accurate than grep because it uses the language services' semantic model, not text matching.",
+                        Description = "Searches symbols across every language: C++ via the VC CodeStore (IVCNavigateToFactory, the same in-proc backend behind Ctrl+T) and C#/VB via LSP workspace/symbol — so accuracy matches in-IDE 'Go To All'. Returns PLAIN TEXT, not JSON: each match shows a header (name/kind/language/file:line) followed by source context — contextLines above and below the symbol line (default 10, set 0 for just the symbol line), with line numbers and a ▶ marker on the symbol line. Optional maxResults (default 16) caps the match count; maxChars (default 8000) caps total output (truncated with a notice if exceeded — raise it to see full context). Far more accurate than grep because it uses the language services' semantic model, not text matching.",
                         ReadOnly = true
                     }));
 
@@ -334,7 +333,7 @@ namespace VsMcp
                         new McpServerToolCreateOptions
                         {
                             Name = "go_to_definition",
-                            Description = "Resolves the definition of the symbol at the given source position (file:line:column) using VS's language service and returns the definition location. Has editor side effects: opens the definition file and moves the cursor. Only registered when the user enables it in Tools → Options → Visual Studio MCP → Tools (EnableGoToDefinition), so it stays invisible to the agent unless opted in.",
+                            Description = "Resolves the definition of the symbol at the given source position (file:line:column) using VS's language service and returns the definition location. Has editor side effects: opens the definition file and moves the cursor. Only registered when the user enables it in Tools → Options → VS MCP → Tools (EnableGoToDefinition), so it stays invisible to the agent unless opted in.",
                             ReadOnly = true
                         }));
                 }
@@ -352,7 +351,7 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "eval_csharp",
-                        Description = "在 VS 进程内用 Roslyn scripting 动态执行一段 C# 脚本（顶层语句 + await），用于实时探查/操作 VS 内部状态。脚本经注入的 globals 访问 VS：Package(AsyncPackage)、JTF(JoinableTaskFactory) —— 用 `await JTF.SwitchToMainThreadAsync()` 切 UI 线程，用 `await Package.GetServiceAsync(typeof(...))` 拿任意 VS 服务，可反射读非 public 字段。用 `Log(obj)` 记录输出；末尾 `return` 一个值。返回 Output(Log 累计) + ResultJson(return 值的 JSON) + Error(编译/运行/超时错误，非 null 表示失败)。任意代码执行，仅在 Tools→Options 开启 EnableEvalCsharp 时可用。",
+                        Description = "Executes C# dynamically inside the VS process (Roslyn CSharpCompilation, compiled then invoked via reflection) for live introspection/manipulation of VS internals. Two mutually exclusive inputs: (1) code — an inline snippet (top-level statements + await) for short probes; using directives may appear at the top and are auto-hoisted to the compilation unit, sidestepping the fact that using is illegal inside a method body. (2) filePath — a local code file (any extension, as long as it is text that compiles), read in full and executed; recommended when the eval needs a lot of code, since editing a giant inline script is awkward. The file may contain full using directives and helper types; if its content includes the `__EvalScript` marker it runs in full-file mode, where you provide `public class __EvalScript { public async Task<object> Run(VsMcp.EvalHost h){...} }`, otherwise it is wrapped as a method body. The script reaches VS through injected globals — Package (AsyncPackage) and JTF (JoinableTaskFactory): use `await JTF.SwitchToMainThreadAsync()` to hop to the UI thread, `await Package.GetServiceAsync(typeof(...))` to obtain any VS service, and reflection to read non-public fields. Call `Log(obj)` to emit output and `return` a value at the end. Returns PLAIN TEXT (not JSON) in labeled sections: an Output section with the accumulated Log, and on success a Return-value section carrying the clean JSON of the return value (NOT double-escaped by an outer JSON layer); on compile/run/timeout failure an Error section carries the detail (returned normally, NOT IsError, so the agent can fix the script from it). Arbitrary code Execution — only available when EnableEvalCsharp is on in Tools → Options.",
                         Destructive = true
                     }));
             }
@@ -369,23 +368,30 @@ namespace VsMcp
         /// McpServer）由 SDK 注入，不出现在 schema 中。
         /// </summary>
 #pragma warning disable VSTHRD200 // 作为工具处理器交给 MCP SDK；从不按名字 await
-        public async Task<object> FindSymbolToolAsync(string query, int maxResults = 16, int maxChars = 8000, CancellationToken ct = default)
+        public async Task<object> FindSymbolToolAsync(string query, int maxResults = 16, int maxChars = 8000, int contextLines = 10, CancellationToken ct = default)
         {
             try
             {
-                string text = await _symbolFacade!.FindSymbolAsync(query, maxResults > 0 ? maxResults : 16, maxChars > 0 ? maxChars : 8000, ct).ConfigureAwait(false);
+                string text = await _symbolFacade!.FindSymbolAsync(
+                    query,
+                    maxResults > 0 ? maxResults : 16,
+                    maxChars > 0 ? maxChars : 8000,
+                    contextLines > 0 ? contextLines : 10,
+                    ct).ConfigureAwait(false);
                 // 纯文本输出（不经 JSON 序列化）：find_symbol 返回的是带行号的源码上下文，
                 // JSON 包裹既费 token 又把换行转义成 \n。手动构造 CallToolResult 直接透传文本。
-                return new CallToolResult
+                // 因绕过 SafeCall.Wrap，回复不会自动记日志——经 LogAndReturn 补记到 VS Output 面板，
+                // 与其它工具一致（任务：find_symbol 回复缺失 mcpReply 日志）。
+                return SafeCall.LogAndReturn(new CallToolResult
                 {
                     Content = new List<ContentBlock> { new TextContentBlock { Text = text } }
-                };
+                });
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 SymbolFacade.ProbeLog($"find_symbol failed: {ex.GetType().Name}: {ex.Message}");
-                return new ErrorResult("internal_error", ex.Message).ToCallToolResult();
+                return SafeCall.LogAndReturn(new ErrorResult("internal_error", ex.Message).ToCallToolResult());
             }
         }
 
@@ -406,7 +412,7 @@ namespace VsMcp
             => SafeCall.Wrap(() => _facade!.ClearAllBreakpointsAsync(confirm, ct), ct);
 
         public Task<object> GetBuildOutputToolAsync(int maxLines = 200, bool tail = true, CancellationToken ct = default)
-            => SafeCall.Wrap(() => _facade!.GetBuildOutputAsync(maxLines > 0 ? maxLines : 200, tail, ct), ct);
+            => SafeCall.WrapText(() => _facade!.GetBuildOutputAsTextAsync(maxLines > 0 ? maxLines : 200, tail, ct), ct);
 
         // McpServer（同 CancellationToken 一样）由 SDK 注入，不在 schema 中；
         // 真正的可选 schema 参数是 waitForBreak / timeoutSeconds。server 必须排在
@@ -417,18 +423,19 @@ namespace VsMcp
         // list_local_variables：浅列当前栈帧所有 local（只顶层 name/type/value/hasChildren，
         // 不展开 children）。maxLocals/maxChars 双保险防 local 极多爆上下文。
         public Task<object> ListLocalVariablesToolAsync(int maxLocals = 200, int maxChars = 4096, CancellationToken ct = default)
-            => SafeCall.Wrap(() => _facade!.ListLocalVariablesAsync(maxLocals, maxChars, ct), ct);
+            => SafeCall.WrapText(() => _facade!.ListLocalVariablesAsTextAsync(maxLocals, maxChars, ct), ct);
 
         public Task<object> EvaluateExpressionToolAsync(string expression, int maxChars = 1024, CancellationToken ct = default)
-            => SafeCall.Wrap(() => _facade!.EvaluateExpressionAsync(expression, maxChars > 0 ? maxChars : 1024, ct), ct);
+            => SafeCall.WrapText(() => _facade!.EvaluateExpressionAsTextAsync(expression, maxChars > 0 ? maxChars : 1024, ct), ct);
 
 #if EVAL_CSHARP
         // eval_csharp：动态执行 C# 脚本。timeoutSeconds 默认 30（防死循环；<=0 不限）。
-        // 经 SafeCall.Wrap —— 成功路径 EvalCsharpResult 走 McpJson.ReadableOptions 序列化
-        // （中文不转义）。脚本编译/运行/超时错误封装进 EvalCsharpResult.Error 正常返回
-        // （非 IsError），把详情透给 agent 而非笼统 internal_error；仅 VS 关停级取消透明重抛。
-        public Task<object> EvalCsharpToolAsync(string code, int timeoutSeconds = 30, CancellationToken ct = default)
-            => SafeCall.Wrap(() => _evalFacade!.EvalAsync(code, timeoutSeconds, ct), ct);
+        // 经 SafeCall.WrapText —— 成功路径走 EvalAsTextAsync 渲染成 [输出]/[返回值] 纯文本块
+        // （脚本 return 值的 JSON 不被外层 JSON 二次转义）。脚本编译/运行/超时错误渲染进
+        // [错误] 段正常返回（非 IsError），把详情透给 agent 而非笼统 internal_error；
+        // 仅 VS 关停级取消透明重抛。
+        public Task<object> EvalCsharpToolAsync(string? code = null, string? filePath = null, int timeoutSeconds = 30, CancellationToken ct = default)
+            => SafeCall.WrapText(() => _evalFacade!.EvalAsTextAsync(code, filePath, timeoutSeconds, ct), ct);
 #endif
 
         // get_variable_detail：按一组调试器表达式批量取变量详情，每个展开 depth 层。

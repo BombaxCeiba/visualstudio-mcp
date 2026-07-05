@@ -297,7 +297,7 @@ namespace VsMcp
         /// <see cref="McpRequestProcessor"/> 构造时注入。静态：VS 进程内通常一个 processor。</summary>
         internal static ILogger? ReplyLogger;
 
-#pragma warning disable VSTHRD200 // "Wrap" 是 REMEDIATION/PATTERNS/plan 中确立的名称；调用方把结果 Task 交给 MCP SDK 且从不直接 await，故 "Async" 后缀会误导。
+#pragma warning disable VSTHRD200 // "Wrap"/"WrapText" 是 REMEDIATION/PATTERNS/plan 中确立的名称；调用方把结果 Task 交给 MCP SDK 且从不直接 await，故 "Async" 后缀会误导。
         public static async Task<object> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {
@@ -317,37 +317,91 @@ namespace VsMcp
                 // （会把取消掩盖为工具失败，并混淆 SDK 的拆除路径）。
                 throw;
             }
-            catch (RequireBreakModeException ex)
-            {
-                result = new ErrorResult("not_in_break_mode", ex.Message, ex.State).ToCallToolResult();
-            }
-            catch (BreakpointNotFoundException ex)
-            {
-                result = new ErrorResult("breakpoint_not_found", ex.Message).ToCallToolResult();
-            }
-            catch (FileNotInSolutionException ex)
-            {
-                // file_not_in_solution 同时携带所请求的文件和已加载的解决方案，
-                // 使 agent 能核对它本应引用哪个项目树，而非默默空操作。
-                result = new ErrorResult(
-                    "file_not_in_solution",
-                    ex.Message,
-                    File: ex.File,
-                    LoadedSolution: ex.LoadedSolution).ToCallToolResult();
-            }
             catch (Exception ex)
             {
-                // T-05-03-01 缓解：只有 ex.Message 传给 LLM，
-                // 绝不传 StackTrace 或固定分类标签之外的内部类型名。
-                result = new ErrorResult("internal_error", ex.Message).ToCallToolResult();
+                result = ToErrorResult(ex).ToCallToolResult();
             }
             LogReply(result);
             return result;
         }
 
+        /// <summary>
+        /// 纯文本返回路径的包装：与 <see cref="Wrap{T}"/> 完全相同的错误边界与
+        /// 回复日志（<see cref="LogReply"/>），但成功路径不做 JSON 序列化——
+        /// 直接把 facade 返回的 string 包进单个 <see cref="TextContentBlock"/>。
+        /// 供返回日志、调用栈、变量值等"阅读型"内容的工具使用，避免 JSON 包裹
+        /// 导致的换行/引号转义与 token 浪费（与 find_symbol 同一动机）。错误路径
+        /// 与 Wrap 一致：facade 抛出的类型化异常经 <see cref="ToErrorResult"/> 转
+        /// 成 IsError=true 的 ErrorResult，回复仍照常记进 VS Output 面板。
+        /// </summary>
+#pragma warning disable VSTHRD200 // 同 Wrap：结果 Task 交给 MCP SDK，从不直接 await。
+        public static async Task<object> WrapText(Func<Task<string>> work, CancellationToken ct)
+#pragma warning restore VSTHRD200
+        {
+            CallToolResult result;
+            try
+            {
+                string text = await work().ConfigureAwait(false);
+                result = new CallToolResult
+                {
+                    Content = new List<ContentBlock> { new TextContentBlock { Text = text } },
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                // 关停信号——透明重抛（同 Wrap）。
+                throw;
+            }
+            catch (Exception ex)
+            {
+                result = ToErrorResult(ex).ToCallToolResult();
+            }
+            LogReply(result);
+            return result;
+        }
+
+        /// <summary>
+        /// 把 facade 异常映射成结构化 <see cref="ErrorResult"/>。<see cref="Wrap{T}"/>
+        /// 与 <see cref="WrapText"/> 共用，确保 JSON 与纯文本两条返回路径的错误契约
+        /// 完全一致。<see cref="OperationCanceledException"/> 表示关停，由调用方重抛，
+        /// 不在此处理。
+        /// </summary>
+        private static ErrorResult ToErrorResult(Exception ex)
+        {
+            switch (ex)
+            {
+                case RequireBreakModeException r:
+                    return new ErrorResult("not_in_break_mode", r.Message, r.State);
+                case BreakpointNotFoundException b:
+                    return new ErrorResult("breakpoint_not_found", b.Message);
+                case FileNotInSolutionException f:
+                    // file_not_in_solution 同时携带所请求的文件和已加载的解决方案，
+                    // 使 agent 能核对它本应引用哪个项目树，而非默默空操作。
+                    return new ErrorResult(
+                        "file_not_in_solution",
+                        f.Message,
+                        File: f.File,
+                        LoadedSolution: f.LoadedSolution);
+                default:
+                    // T-05-03-01 缓解：只有 ex.Message 传给 LLM，
+                    // 绝不传 StackTrace 或固定分类标签之外的内部类型名。
+                    return new ErrorResult("internal_error", ex.Message);
+            }
+        }
+
+        /// <summary>给手动构造 <see cref="CallToolResult"/> 的工具用的回复日志入口：
+        /// find_symbol 返回纯文本 CallToolResult、不经 <see cref="Wrap{T}"/>，故 Wrap 末尾的
+        /// <see cref="LogReply"/> 不会被触发；调本方法补记一次，保证所有工具的回复都打到面板。
+        /// 记录后原样返回 result。</summary>
+        internal static CallToolResult LogAndReturn(CallToolResult result)
+        {
+            LogReply(result);
+            return result;
+        }
+
         /// <summary>把 CallToolResult 的 text content 打到 <see cref="ReplyLogger"/>（VS Output
-        /// 窗口 "VS MCP" 面板），方便即时观察 agent 收到的回复。超长截断（find_symbol 等
-        /// 文本回复可达数千字符），完整内容已发给 agent，面板只看摘要。打印异常绝不影响返回。</summary>
+        /// 窗口 "VS MCP" 面板），方便即时观察 agent 收到的回复。原样打印，绝不截断——
+        /// 面板看到的必须和 agent 收到的完全一致。打印异常绝不影响返回。</summary>
         private static void LogReply(CallToolResult result)
         {
             var logger = ReplyLogger;

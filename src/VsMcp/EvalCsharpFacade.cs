@@ -70,27 +70,69 @@ namespace VsMcp
         /// 可用 <c>await JTF.SwitchToMainThreadAsync()</c> 切 UI 线程，
         /// <c>await Package.GetServiceAsync(...)</c> 拿 VS 服务，反射读非 public 字段。
         /// </summary>
-        public async Task<EvalCsharpResult> EvalAsync(string code, int timeoutSeconds, CancellationToken externalCt)
+        public async Task<EvalCsharpResult> EvalAsync(string? code, string? filePath, int timeoutSeconds, CancellationToken externalCt)
         {
             var output = new StringBuilder();
+            var outputLock = new object();
+            // Log 可能从脚本的后台线程并发调用（eval_csharp 常用 Task.Run 范式），StringBuilder
+            // 非线程安全——写与读快照都经 outputLock 串行化，防内容损坏/竞态异常。
             void Log(string msg)
             {
-                if (output.Length > 0) output.AppendLine();
-                output.Append(msg);
+                lock (outputLock)
+                {
+                    if (output.Length > 0) output.AppendLine();
+                    output.Append(msg);
+                }
+            }
+            string SnapshotOutput()
+            {
+                lock (outputLock)
+                {
+                    // 拷贝后 ToString——内部用 copy.ToString() 而非 SnapshotOutput() 字面，
+                    // 使全文 replace_all(SnapshotOutput()→SnapshotOutput()) 不会递归命中此处。
+                    var copy = new StringBuilder(output.Length);
+                    copy.Append(output);
+                    return copy.ToString();
+                }
             }
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(externalCt);
             if (timeoutSeconds > 0) cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             var ct = cts.Token;
 
+            // 源码来源：filePath 优先（从文件读完整脚本，便于评估复杂代码——可在文件里
+            // 写 using 指令、声明辅助类型），否则用内联 code（简单探查）。二者至少给一个。
+            string source;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(filePath))
+                {
+                    if (!File.Exists(filePath))
+                        return new EvalCsharpResult(SnapshotOutput(), "null", $"文件不存在：{filePath}");
+                    source = await Task.Run(() => File.ReadAllText(filePath), ct).ConfigureAwait(false);
+                }
+                else if (!string.IsNullOrEmpty(code))
+                {
+                    source = code;
+                }
+                else
+                {
+                    return new EvalCsharpResult(SnapshotOutput(), "null", "必须提供 code 或 filePath 二者之一");
+                }
+            }
+            catch (Exception ex)
+            {
+                return new EvalCsharpResult(SnapshotOutput(), "null", $"读取源码失败：{ex.GetType().Name}: {ex.Message}");
+            }
+
             if (!EnsureCompiler())
             {
-                return new EvalCsharpResult("", "null",
+                return new EvalCsharpResult(SnapshotOutput(), "null",
                     "编译器初始化失败：" + _loadError);
             }
 
-            // 把用户代码包进一个 async 方法，注入 Package/JTF/Log 局部变量。
-            var wrappedCode = WrapUserCode(code);
+            // 包装源码：方法体模式（提取开头 using、注入 Package/JTF/Log）或完整文件模式。
+            var wrappedCode = PrepareSource(source);
 
             object? compilation;
             try
@@ -98,12 +140,12 @@ namespace VsMcp
                 compilation = BuildCompilation(wrappedCode, out string? buildError);
                 if (compilation == null)
                 {
-                    return new EvalCsharpResult(output.ToString(), "null", "构造 CSharpCompilation 失败：" + buildError);
+                    return new EvalCsharpResult(SnapshotOutput(), "null", "构造 CSharpCompilation 失败：" + buildError);
                 }
             }
             catch (Exception ex)
             {
-                return new EvalCsharpResult(output.ToString(), "null",
+                return new EvalCsharpResult(SnapshotOutput(), "null",
                     $"构造编译失败：{ex.GetType().Name}: {ex.Message}");
             }
 
@@ -116,7 +158,7 @@ namespace VsMcp
                 catch (Exception ex)
                 {
                     var real = ex is TargetInvocationException tie && tie.InnerException != null ? tie.InnerException : ex;
-                    return new EvalCsharpResult(output.ToString(), "null",
+                    return new EvalCsharpResult(SnapshotOutput(), "null",
                         $"Emit 调用异常：{real.GetType().Name}: {real.Message}");
                 }
 
@@ -130,7 +172,7 @@ namespace VsMcp
                         // Diagnostic.ToString() 形如 "(line,col): error CSxxxx: ..."，已含严重级别。
                         errors.Add(d.ToString());
                     }
-                    return new EvalCsharpResult(output.ToString(), "null",
+                    return new EvalCsharpResult(SnapshotOutput(), "null",
                         "脚本编译错误：\n" + string.Join("\n", errors.Take(30)));
                 }
                 compiled = Assembly.Load(ms.ToArray());
@@ -149,45 +191,80 @@ namespace VsMcp
                 var task = (Task<object>?)runMethod.Invoke(instance, new object[] { host });
                 if (task == null)
                 {
-                    return new EvalCsharpResult(output.ToString(), "null", "Run 返回 null task");
+                    return new EvalCsharpResult(SnapshotOutput(), "null", "Run 返回 null task");
                 }
                 returnValue = await task.ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (externalCt.IsCancellationRequested) { throw; }
             catch (OperationCanceledException)
             {
-                return new EvalCsharpResult(output.ToString(), "null",
+                return new EvalCsharpResult(SnapshotOutput(), "null",
                     $"脚本在 {timeoutSeconds}s 内未完成，已强制取消");
             }
             catch (Exception ex)
             {
                 var real = ex;
                 while (real is TargetInvocationException tie && tie.InnerException != null) real = tie.InnerException;
-                return new EvalCsharpResult(output.ToString(), "null",
+                return new EvalCsharpResult(SnapshotOutput(), "null",
                     $"{real.GetType().Name}: {real.Message}");
             }
 
-            return new EvalCsharpResult(output.ToString(), SerializeValue(returnValue), null);
+            // 脚本里创建的 COM 对象（DTE / VC CodeStore 等 RCW）靠 GC 回收才 Release native 引用——
+            // eval_csharp 探查代码常创建这类对象且不显式 Release。结束前先丢 returnValue 引用、强制
+            // GC + 等待 finalizer，让本次脚本创建的 RCW（已不可达）立即 Release，避免 native 引用跨
+            // 调用积累（codestore close 等引用归零时尤其要紧）。net48 的 Assembly.Load 不可逆，每次
+            // eval 的编译产物 assembly 仍会泄漏（已知权衡，与 COM 引用无关）；脚本若把对象存进静态
+            // 字段，GC 也回收不了——那是脚本作者的职责。
+            var resultJson = SerializeValue(returnValue);
+            returnValue = null;
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            return new EvalCsharpResult(SnapshotOutput(), resultJson, null);
         }
 
-        /// <summary>把用户代码包进 async 方法，注入 Package/JTF/Log。末尾 return null 兜底
-        /// （用户代码若已 return 则该行不可达；若没有则保证方法有返回值）。</summary>
-        private static string WrapUserCode(string code) =>
-@"using System;
-using System.IO;
-using System.Linq;
-using System.Text;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Reflection;
-using Microsoft.VisualStudio.Shell;
-using Microsoft.VisualStudio.Threading;
-using Microsoft.VisualStudio.ComponentModelHost;
-using EnvDTE;
-using EnvDTE80;
-using VsMcp;
+        /// <summary>eval_csharp 的纯文本渲染入口：调 <see cref="EvalAsync"/> 拿
+        /// EvalCsharpResult，渲染成 [输出]/[返回值] 或 [输出]/[错误] 文本块。
+        /// 关键收益：ResultJson 不再被外层 JSON 二次序列化（内部引号不再带反斜杠），
+        /// agent 直接读到脚本返回值的干净 JSON。Output 为空时省略输出段。</summary>
+        public async Task<string> EvalAsTextAsync(string? code, string? filePath, int timeoutSeconds, CancellationToken ct)
+        {
+            var r = await EvalAsync(code, filePath, timeoutSeconds, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            if (!string.IsNullOrEmpty(r.Output))
+            {
+                sb.AppendLine("── 输出 ──");
+                sb.AppendLine(r.Output);
+            }
+            if (!string.IsNullOrEmpty(r.Error))
+            {
+                if (sb.Length > 0) sb.AppendLine();
+                sb.AppendLine("── 错误 ──");
+                sb.Append(r.Error);
+            }
+            else
+            {
+                if (sb.Length > 0) sb.AppendLine();
+                sb.AppendLine("── 返回值 ──");
+                sb.Append(r.ResultJson);
+            }
+            return sb.ToString();
+        }
 
+        /// <summary>把用户源码包成可编译的 C# 编译单元。两种模式：
+        /// 1) 完整文件模式：源码含 "__EvalScript" 标识 → 用户自管类套路（可在文件里写 using、
+        ///    声明辅助类型），仅补固定 using 前缀。约定文件提供 public class __EvalScript
+        ///    { public async Task&lt;object&gt; Run(EvalHost h) {...} }，运行器反射实例化并调 Run。
+        /// 2) 方法体模式（默认）：固定 using + 用户代码作为 Run 方法体，注入 Package/JTF/Log。
+        ///    不做 C# 语法解析——用户代码不得含 using 指令（方法体内非法）；要额外 using 用完整文件模式。</summary>
+        private static string PrepareSource(string source)
+        {
+            if (source.Contains("__EvalScript"))
+                return FixedUsingsBlock() + source;
+
+            // 方法体模式：固定 using + 用户代码作为 Run 方法体（注入 Package/JTF/Log）。
+            // 不做任何 C# 语法解析——用户代码不得含 using 指令（方法体内非法）；要额外 using
+            // 就用完整文件模式（source 含 __EvalScript 时用户自管 using 与类型声明）。
+            return FixedUsingsBlock() + @"
 public class __EvalScript
 {
     public async Task<object> Run(EvalHost h)
@@ -195,10 +272,21 @@ public class __EvalScript
         var Package = h.Package;
         var JTF = h.JTF;
         var Log = new Action<object>(h.Log);
-" + code + @"
+" + source + @"
         return null;
     }
 }";
+        }
+
+        /// <summary>固定 using 前缀：方法体模式与完整文件模式都加上（重复 using 编译器忽略）。
+        /// 覆盖 VS 探查最常用的命名空间，省去每次手写。</summary>
+        private static string FixedUsingsBlock() =>
+"using System;\nusing System.IO;\nusing System.Linq;\nusing System.Text;\n" +
+"using System.Collections;\nusing System.Collections.Generic;\nusing System.Threading;\nusing System.Threading.Tasks;\n" +
+"using System.Reflection;\nusing Microsoft.VisualStudio.Shell;\n" +
+"using Microsoft.VisualStudio.Threading;\nusing Microsoft.VisualStudio.ComponentModelHost;\n" +
+"using EnvDTE;\nusing EnvDTE80;\nusing VsMcp;\n\n";
+
 
         /// <summary>
         /// 首次调用时从 VS 已加载的程序集里反射绑定 Roslyn 编译 API（CSharpCompilation 等）。

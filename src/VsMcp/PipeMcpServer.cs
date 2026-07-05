@@ -320,6 +320,35 @@ namespace VsMcp
         }
 
         /// <summary>
+        /// 推送一帧 <c>debugger-state-changed</c> 控制帧，让 Gateway 缓存的
+        /// InstanceEntry.DebuggerState 实时刷新（供 list_vs_instances 返回真实值）。
+        /// 由调用方（DebuggerEventsSubscriber）fire-and-forget 触发；吞掉 IO 错误，
+        /// 使短暂的 Gateway 断连不会让 UI 线程崩溃。下一次 register（重连时）会经
+        /// OnConnected 回调重推当前 state 自愈，因此被丢弃的推送可自愈。当前未连接
+        ///（<see cref="_activePipe"/> == null）时为 no-op。
+        /// </summary>
+        public async Task SendDebuggerStateChangedAsync(string? state, CancellationToken ct)
+        {
+            if (_disposed) return;
+            try
+            {
+                var frame = new PipeDebuggerStateChanged
+                {
+                    Pid = _pid,
+                    State = state,
+                };
+                _loggerFactory?.CreateLogger<PipeMcpServer>()
+                    ?.LogInformation("SendDebuggerStateChanged: pid={Pid} state={State}", _pid, state ?? "(null)");
+                await WriteLockedAsync(frame, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _loggerFactory?.CreateLogger<PipeMcpServer>()
+                    ?.LogDebug(ex, "Failed to send debugger-state-changed frame");
+            }
+        }
+
+        /// <summary>
         /// 发送一帧 <c>heartbeat</c> 控制帧（无 id），让 Gateway 知道本 VS 还活着；
         /// 同样重要的是，让 VS 端的 <see cref="HeartbeatClient"/> 能确认 pipe 仍可写
         /// （即 Gateway 进程仍在运行）。任何失败都抛异常（无活跃 pipe、写入错误、

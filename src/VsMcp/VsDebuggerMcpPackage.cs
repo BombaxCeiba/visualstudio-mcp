@@ -30,7 +30,7 @@ namespace VsMcp
     /// </summary>
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
     [ProvideAutoLoad(UIContextGuids80.NoSolution, PackageAutoLoadFlags.BackgroundLoad)]
-    [ProvideOptionPage(typeof(McpOptionsPage), "Visual Studio MCP", "Tools", 1000, 1001, true)]
+    [ProvideOptionPage(typeof(McpOptionsPage), "VS MCP", "Tools", 1000, 1001, true)]
     [Guid("a3f7c5e1-8b2d-4f6a-9c0e-1d3b5a7f2e4d")]
     public sealed class VsMcpPackage : AsyncPackage, IVsPackage
     {
@@ -42,6 +42,7 @@ namespace VsMcp
         private EvalCsharpFacade? _evalFacade;
 #endif
         private SolutionEventsSubscriber? _solutionSubscriber;
+        private DebuggerEventsSubscriber? _debuggerSubscriber;
 
         protected override async Task InitializeAsync(
             CancellationToken cancellationToken,
@@ -119,7 +120,15 @@ namespace VsMcp
             // IVsSolution 的 Advise 本身在下面 StartAsync 之后 fire-and-forget 执行。
             _solutionSubscriber = new SolutionEventsSubscriber(
                 this, _pipeServer, this.DisposalToken, loggerFactory.CreateLogger<SolutionEventsSubscriber>());
-            _pipeServer.SetOnConnected(token => _solutionSubscriber.PushCurrentSolutionAsync(token));
+            _debuggerSubscriber = new DebuggerEventsSubscriber(
+                this, _facade, _pipeServer, this.DisposalToken, loggerFactory.CreateLogger<DebuggerEventsSubscriber>());
+            // register 成功后同时重推 solution + debugger state，覆盖"连接前已发生的状态
+            // 变化"竞态，并在 Gateway 重连后重新同步（两者都自行切 UI 线程）。
+            _pipeServer.SetOnConnected(async token =>
+            {
+                await _solutionSubscriber.PushCurrentSolutionAsync(token);
+                await _debuggerSubscriber.PushCurrentStateAsync(token);
+            });
 
             try
             {
@@ -157,6 +166,21 @@ namespace VsMcp
                     pkgLogger.LogDebug(ex, "Solution-events subscription failed; solution-changed push disabled");
                 }
             });
+
+            // 同样 fire-and-forget 订阅 DebuggerEvents：订阅成功后每次模式切换都向
+            // Gateway 推送 debugger-state-changed。失败则降级为"仅 OnConnected 初值"，
+            // 不影响其余功能。
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _debuggerSubscriber.InitializeAsync(this.DisposalToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    pkgLogger.LogDebug(ex, "Debugger-events subscription failed; debugger-state-changed push disabled");
+                }
+            });
         }
 
         /// <summary>
@@ -170,6 +194,7 @@ namespace VsMcp
             if (disposing)
             {
                 try { _solutionSubscriber?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
+                try { _debuggerSubscriber?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
                 try { _heartbeat?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
                 try { _pipeServer?.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
                 _facade?.Dispose();

@@ -30,6 +30,9 @@ namespace VsMcp
     {
         private const int DefaultMaxResults = 16;
 
+        /// <summary>find_symbol 源码上下文默认行数：符号行上下各多少行。0 表示只看符号所在行。</summary>
+        private const int DefaultContextLines = 10;
+
         private readonly AsyncPackage _package;
         private bool _disposed;
 
@@ -79,7 +82,7 @@ namespace VsMcp
         /// <see cref="INavigateToCallback.Done"/> 发出完成信号。每提供程序
         /// 超时阻止单个卡住的语言服务器拖垮整个调用。
         /// </summary>
-        public async Task<string> FindSymbolAsync(string query, int maxResults, int maxChars, CancellationToken ct)
+        public async Task<string> FindSymbolAsync(string query, int maxResults, int maxChars, int contextLines, CancellationToken ct)
         {
             ThrowIfDisposed();
             if (string.IsNullOrWhiteSpace(query))
@@ -153,17 +156,18 @@ namespace VsMcp
             bool truncated = ordered.Count > limit;
             if (truncated) ordered = ordered.Take(limit).ToList();
 
-            return await BuildSymbolTextAsync(ordered, query, hits.Count, truncated, maxChars, ct).ConfigureAwait(true);
+            return await BuildSymbolTextAsync(ordered, query, hits.Count, truncated, maxChars, contextLines, ct).ConfigureAwait(true);
         }
 
         /// <summary>把符号命中渲染为文本：每个符号头（名/种类/语言/位置）+ 源文件上下文
-        /// （符号行 ±10，带行号、▶ 标记符号所在行）。读文件经 FileStream+StreamReader 逐行跳到
-        /// 目标范围（不读全文）；后台线程跑避免阻塞 UI。输出是纯文本而非 JSON——agent 直接
-        /// 看到代码上下文，省 token 且无需二次解析。</summary>
-        private async Task<string> BuildSymbolTextAsync(List<SymbolMatch> symbols, string query, int total, bool truncated, int maxChars, CancellationToken ct)
+        /// （符号行 ±contextLines，带行号、▶ 标记符号所在行）。读文件经 FileStream+StreamReader
+        /// 逐行跳到目标范围（不读全文）；后台线程跑避免阻塞 UI。输出是纯文本而非 JSON——agent
+        /// 直接看到代码上下文，省 token 且无需二次解析。</summary>
+        private async Task<string> BuildSymbolTextAsync(List<SymbolMatch> symbols, string query, int total, bool truncated, int maxChars, int contextLines, CancellationToken ct)
         {
             return await Task.Run(() =>
             {
+                int half = contextLines > 0 ? contextLines : DefaultContextLines;
                 var sb = new StringBuilder();
                 sb.AppendLine($"找到 {total} 个匹配 '{query}' 的符号" + (truncated ? $"（仅显示前 {symbols.Count}）" : "") + "：");
                 foreach (var s in symbols)
@@ -173,13 +177,13 @@ namespace VsMcp
                     if (string.IsNullOrEmpty(s.FilePath) || s.Line <= 0) continue;
                     try
                     {
-                        int start = Math.Max(1, s.Line - 10);
+                        int start = Math.Max(1, s.Line - half);
                         var lines = new List<string>();
                         using (var fs = new FileStream(s.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                         using (var sr = new StreamReader(fs))
                         {
                             for (int i = 1; i < start; i++) { if (sr.ReadLine() == null) break; }
-                            for (int i = 0; i < 21; i++) { var l = sr.ReadLine(); if (l == null) break; lines.Add(l); }
+                            for (int i = 0; i < half * 2 + 1; i++) { var l = sr.ReadLine(); if (l == null) break; lines.Add(l); }
                         }
                         for (int i = 0; i < lines.Count; i++)
                         {
@@ -192,7 +196,7 @@ namespace VsMcp
                 }
                 string result = sb.ToString();
                 if (maxChars > 0 && result.Length > maxChars)
-                    result = result.Substring(0, maxChars) + $"\n...（输出已截断至 {maxChars} 字符，完整 {result.Length} 字符；调高 maxChars 或收窄 query）";
+                    result = result.Substring(0, maxChars) + $"\n...（输出已截断至 {maxChars} 字符，完整 {result.Length} 字符；调高 maxChars、减小 contextLines 或收窄 query）";
                 return result;
             }, ct);
         }
@@ -247,11 +251,14 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// 解析类型在解决方案类型图中的位置：完整祖先链（递归 Bases 到根）、
-        /// 直接后代（经 <c>CodeType.DerivedTypes</c> 跨整个解决方案的子类型/
-        /// 实现）、以及兄弟类型（共享某个基类的其他类型）。这是读源代码无法
-        /// 复现的 VS 独有视图——反向继承需要索引解决方案中的每个类型，语言
-        /// 服务做到了，但 grep 源代码做不到。
+        /// 解析类型在解决方案类型图中的位置：完整祖先链（递归 Bases 到根）、直接后代
+        /// （跨整个解决方案的派生/实现）、以及兄弟类型（共享某个基类的其他类型）。这是
+        /// 读源代码无法复现的 VS 独有视图——反向继承需要索引整个解决方案，VS 语言服务
+        /// 做到了，但 grep 源代码做不到。
+        ///
+        /// 两条实现路径：<see cref="VcTypeHierarchySearcher"/>（C++，经 VC CodeStore，含 Open Folder /
+        /// CMake——DTE 在这些场景下 project.CodeModel=null 不可用）优先；VC 不可用时 fallback
+        /// 到 DTE CodeModel（C#/VB 传统 sln）。
         /// </summary>
         public async Task<TypeHierarchyResult> GetTypeHierarchyAsync(string typeName, CancellationToken ct)
         {
@@ -259,6 +266,22 @@ namespace VsMcp
             if (string.IsNullOrWhiteSpace(typeName))
                 return NotFound(typeName);
 
+            // 优先 VC CodeStore（C++，含 Open Folder）。find_symbol 同款 in-proc COM；
+            // null 表示 VC 不可用才 fallback DTE；Found=false（含 Found=true）是 VC 权威答案，直接用。
+            try
+            {
+                var vc = await VcTypeHierarchySearcher.QueryAsync(_package, typeName, ct).ConfigureAwait(true);
+                if (vc != null) return vc;
+            }
+            catch (Exception ex) { ProbeLog($"TYPEHIER VC threw {ex.GetType().Name}: {ex.Message}"); }
+
+            return await GetTypeHierarchyViaDteAsync(typeName, ct).ConfigureAwait(true);
+        }
+
+        /// <summary>DTE CodeModel 路径（C#/VB 传统 sln）。Open Folder 下 project.CodeModel=null
+        /// 走不到这里——GetTypeHierarchyAsync 会先经 VC CodeStore 返回。</summary>
+        private async Task<TypeHierarchyResult> GetTypeHierarchyViaDteAsync(string typeName, CancellationToken ct)
+        {
             await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
 
             var dte = await GetDteAsync(ct);

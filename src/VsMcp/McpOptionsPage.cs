@@ -3,7 +3,7 @@ using Microsoft.VisualStudio.Shell;
 namespace VsMcp
 {
     /// <summary>
-    /// Visual Studio MCP 扩展的 Tools → Options 页。控制那些有副作用、
+    /// VS MCP 扩展的 Tools → Options 页。控制那些有副作用、
     /// 用户可能想禁用的 opt-in 工具。
     /// 设置在 MCP server 启动时读取一次（在
     /// <see cref="VsMcpPackage.InitializeAsync"/> 中）；改完要重启 VS 才对
