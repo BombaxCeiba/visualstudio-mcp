@@ -245,8 +245,9 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 | ✅ 已完成 | **符号导航** — find_symbol（C++/C#/VB，带源码上下文）/ get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
 | ✅ 已完成 | **调用关系** — get_call_graph（C++ callers/callees，VS CallHierarchy 后端） | AI 做重构影响分析、追踪控制流，不再 grep |
 | ✅ 已完成 | **多实例 Gateway** — 一个端口后挂多个 VS，按工作区/会话路由 | 同时开多个项目不再端口冲突 |
+| 🚧 规划中 | **更多语言场景验证** — 当前核心验证 C++/CMake 与 C#（调试器本身语言无关） | 覆盖更多语言/项目模型 |
 | 🚧 规划中 | **语法诊断** — 直接读 VS 的编译/语义错误，不是 grep | 比 grep 准，覆盖 C++/C#/Python/… |
-| 🚧 规划中 | **符号导航扩展** — find-references / workspace symbols | 影响分析、重构场景 |
+| ✅ 已完成 | **符号导航扩展** — workspace symbols 经 find_symbol 落地；find-references 的调用方场景由 get_call_graph（callers）覆盖 | 影响分析、重构场景 |
 | 🔮 远期 | **post-tool-use 钩子** — 编辑后强制语法检查 | AI 改完代码立刻看到编译错误并自愈 |
 | 🔮 远期 | **工程级 MCP/hook 自动配置** — 读解决方案目录下的 `.claude/` 等配置自动生成 | 项目内开箱即用，无需手配 |
 
@@ -266,17 +267,6 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 | 工作区路由 | `X-VS-Workspace` header | 无状态前缀匹配，可选 |
 
 日志写入 VS 的 **输出窗口 → "VS MCP" 面板**（Information 级别及以上），错误同时写入 `IVsActivityLog`。**每次工具调用的回复也会原样打到该面板**（前缀 `← MCP 回复：`），方便立即观察 agent 实际收到的内容——**不截断**，面板看到的和 agent 收到的完全一致。Gateway 是无窗口进程，自身不写文件日志——运行状态用任务管理器看 `VsMcpGateway.exe`、`netstat -ano | findstr :43210`、或 Sysinternals `pipelist` 看 `vs-mcp-gateway`。
-
----
-
-## 已知限制
-
-- **依赖 VS 运行**：工具调用需要在 VS 进程内执行；没有任何 VS 实例运行时 Gateway 会宽限后自动退出，MCP 端点不可达。Gateway 不会、也无法自动启动 VS（它不知道该开哪个 solution）。
-- **`list_vs_instances` 的 `debuggerState` 暂未实时**：当前返回注册快照（多为 null），实时调试状态留待后续增强。
-- **同一 VS 实例内串行**：单个 VS 的工具调用受 VS SDK 单会话契约约束串行处理；不同 VS 实例之间可并行。
-- **切换 VS 后需重新 initialize**：`select_vs_instance` 切换到一个尚未经本 Gateway 初始化的 VS 时，下一次请求会返回"需重新 initialize"的提示（Gateway 不擅自合成 initialize）。
-- **语言覆盖**：调试器工具本身语言无关（VS 支持的都能调），核心验证场景是 C++/CMake 与 C#。
-
 
 ---
 
@@ -311,4 +301,8 @@ msbuild src\VsMcp.sln /p:Configuration=Release /p:EvalCsharpEnabled=false
 
 ## 许可证
 
-Apache 2.0。
+Copyright 2026 Dusk_NM02
+
+本项目基于 [Apache License, Version 2.0](./LICENSE) 授权（SPDX-License-Identifier: Apache-2.0）。
+
+除非适用法律要求或书面同意，按"原样"分发，不附任何明示或暗示的担保或条件。详见 [LICENSE](./LICENSE)。
