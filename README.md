@@ -64,7 +64,7 @@
 | 工具 | 作用 |
 |---|---|
 | `build_solution` | 触发整个解决方案构建并等待完成（构建期间推送日志通知保活并转发实时进度，长构建不会超时） |
-| `get_build_output` | 读取 VS 输出窗口 Build 面板的切片视图（编译错误/警告的权威来源） |
+| `get_build_output` | 读取 VS 输出窗口 Build 面板，返回**纯文本**日志切片（一行 header + 原文，不转义换行；编译错误/警告的权威来源） |
 
 ### 调试会话与项目
 
@@ -98,16 +98,16 @@
 
 | 工具 | 作用 |
 |---|---|
-| `get_local_variables` | 获取当前栈帧的局部变量（带字符预算，超限会提示下钻） |
-| `get_call_stack` | 获取调用栈 |
-| `evaluate_expression` | 在当前上下文求值任意表达式 |
+| `list_local_variables` | 列出当前栈帧的局部变量，**纯文本**（每行 `name (type) = value`，`{…}` 标有子项；浅层不展开，字符预算超限会提示下钻） |
+| `get_call_stack` | 获取调用栈，**纯文本**（每帧一行 `#idx  module!Function  → RetType`） |
+| `evaluate_expression` | 在当前上下文求值任意表达式，**纯文本**（`expr (type) = value`，对象成员缩进展示） |
 | `get_variable_detail` | 展开某个变量的子节点（递归下钻） |
 
 ### 符号导航
 
 | 工具 | 作用 |
 |---|---|
-| `find_symbol` | 按名字搜索符号：C++ 经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）、C#/VB 经 LSP。返回**每个符号 ±10 行带行号的源码上下文**（纯文本，`▶` 标记符号行）；`maxResults`/`maxChars` 限制输出 |
+| `find_symbol` | 按名字搜索符号：C++ 经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）、C#/VB 经 LSP。返回**每个符号 ±contextLines 行带行号的源码上下文**（纯文本，`▶` 标记符号行，`contextLines` 默认 10，可设 0 只看符号行）；`maxResults`/`maxChars` 限制输出（超限截断会提示调高 `maxChars`、减小 `contextLines` 或收窄 query） |
 | `get_type_hierarchy` | 返回类型的祖先链、派生类、兄弟类型（影响分析） |
 | `go_to_definition` | 解析指定位置的符号定义（可选，需在 Tools → Options 启用） |
 
@@ -115,9 +115,9 @@
 
 | 工具 | 作用 |
 |---|---|
-| `eval_csharp` | 在 VS 进程内动态执行任意 C#（Roslyn 编译），注入 `Package`/`JTF`，用于实时探查 VS 内部状态、反射读非 public 字段，**无需重编重装扩展**。等价于任意代码执行——仅本地开发构建含此工具，发布版 VSIX 完全不含（见下文「eval_csharp 编译开关」） |
+| `eval_csharp` | 在 VS 进程内动态执行任意 C#（Roslyn 编译），注入 `Package`/`JTF`，用于实时探查 VS 内部状态、反射读非 public 字段，**无需重编重装扩展**。返回**纯文本**（`输出`/`返回值` 或 `输出`/`错误` 段；脚本 return 值的 JSON 不被外层 JSON 二次转义）。等价于任意代码执行——仅本地开发构建含此工具，发布版 VSIX 完全不含（见下文「eval_csharp 编译开关」） |
 
-> 工具名称遵循 MCP 惯例使用 `snake_case`。除 `find_symbol`（返回带行号的源码上下文纯文本，省 token、不转义换行）外，返回值都是结构化 JSON（typed DTO）——AI 拿到的是稳定、schema 友好的数据。
+> 工具名称遵循 MCP 惯例使用 `snake_case`。返回格式按"AI 如何消费"分两类：**阅读型**工具返回**纯文本**（源码、日志、调用栈、变量值——整体通读的内容，JSON 包裹既费 token 又把换行/引号转义掉）；**结构型**工具返回**结构化 JSON**（typed DTO——路径、坐标、操作结果这类要抽取字段填给下游工具的内容，稳定且 schema 友好）。返回纯文本的工具：`find_symbol` / `get_build_output` / `get_call_stack` / `list_local_variables` / `evaluate_expression` / `eval_csharp`；其余返回 JSON。
 
 ---
 

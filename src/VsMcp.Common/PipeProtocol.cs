@@ -77,6 +77,17 @@ namespace VsMcp.Common
         public string? SolutionPath { get; set; }
     }
 
+    /// <summary>VS → Gateway：调试器模式切换（design/break/running）后的状态推送。
+    /// 与 solution-changed 同为无 id 控制帧；State 字符串与 DebuggerFacade.MapState
+    /// 输出一致。让 gateway 缓存的 InstanceEntry.DebuggerState 实时刷新，供
+    /// list_vs_instances 返回真实值而非恒定 null。</summary>
+    public sealed class PipeDebuggerStateChanged
+    {
+        public string Type { get; set; } = "debugger-state-changed";
+        public int Pid { get; set; }
+        public string? State { get; set; }
+    }
+
     /// <summary>VS → Gateway：周期心跳（VS 存活探测）。</summary>
     public sealed class PipeHeartbeat
     {

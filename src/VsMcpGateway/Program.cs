@@ -137,7 +137,7 @@ namespace VsMcpGateway
                         catch { /* 尽力而为 */ }
                     }
 
-                    var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged, OnHeartbeat);
+                    var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged, OnHeartbeat, OnDebuggerStateChanged);
                     Registry.Register(new InstanceEntry(router, info, DateTime.UtcNow));
                     GatewayLogger.Log($"registered VS PID={info.Pid} solution={info.SolutionPath ?? "<none>"} v{info.VsVersion}");
                 }
@@ -222,6 +222,19 @@ namespace VsMcpGateway
         {
             if (beat == null || beat.Pid <= 0) return;
             Registry.TouchLastSeen(beat.Pid);
+        }
+
+        /// <summary>
+        /// PipeRouter 控制帧回调：VS 推送了 <c>debugger-state-changed</c> 通知
+        ///（调试器进入 design/break/running）。刷新注册表中该实例的 DebuggerState，
+        /// 让 list_vs_instances 无需重连即可返回实时状态。在 pipe 读循环上内联执行，
+        /// 必须快且绝不抛异常——InstanceRegistry.UpdateDebuggerState 是一次
+        /// ConcurrentDictionary 字段写入，满足这两点。
+        /// </summary>
+        private static void OnDebuggerStateChanged(PipeDebuggerStateChanged changed)
+        {
+            if (changed == null || changed.Pid <= 0) return;
+            Registry.UpdateDebuggerState(changed.Pid, changed.State);
         }
 
         // ───────────────────────────── HTTP 路由 ──────────────────────────────
@@ -345,19 +358,21 @@ namespace VsMcpGateway
 
             if (!vsPid.HasValue)
             {
-                // 单实例 fallback（initialize 时的 ③）。
                 var snap = Registry.Snapshot();
                 vsPid = ResolveInitializeTarget(vsPid, snap.Count, () => snap.First().Info.Pid);
                 if (!vsPid.HasValue)
                 {
-                    // initialize 失败→JSON-RPC error，让 MCP 客户端把它解析为
-                    // initialize 失败，而不是 schema 不匹配的 result。
-                    int count = snap.Count;
-                    string msg = count == 0
-                        ? "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry."
-                        : GatewayTools.BuildInterceptMessage(snap);
-                    await WriteJsonRpcErrorAsync(ctx, body, -32001, msg).ConfigureAwait(false);
-                    return;
+                    // ResolveInitializeTarget 返回 null：0 实例或多实例。0 实例无法服务；多实例
+                    // 之前直接 -32001，客户端拿不到 select_vs_instance，永远无法绑定（死锁）——现在
+                    // auto-bind 第一个让客户端进入会话 + 拿到工具列表（含 select_vs_instance），再用
+                    // select_vs_instance 切到目标 VS（hint 提示当前绑定实例 + 切换方法）。
+                    if (snap.Count == 0)
+                    {
+                        await WriteJsonRpcErrorAsync(ctx, body, -32001,
+                            "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry.").ConfigureAwait(false);
+                        return;
+                    }
+                    vsPid = snap.First().Info.Pid;
                 }
                 isAutoFallback = true;
             }
@@ -421,22 +436,50 @@ namespace VsMcpGateway
             string? clientSessionId, string? workspaceHeader, CancellationToken ct)
         {
             var resolution = BindingResolver.ResolveTarget(workspaceHeader, clientSessionId, Sessions, Registry);
-            if (!resolution.Success)
+            int targetPid;
+            string? vsSessionId;
+            string? echoSessionId;
+            if (resolution.Success)
             {
+                targetPid = resolution.Pid!.Value;
+                vsSessionId = resolution.VsSessionId;
+                echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
+            }
+            else if (resolution.ErrorKind == TargetErrorKind.Intercept)
+            {
+                // 多实例未绑定：tools/list 是元请求，客户端要靠它拿到 select_vs_instance
+                // 才能绑定，不能 ④ 拦截（否则死锁——永远看不到 select_vs_instance）。转发
+                // 到第一个在线实例拿工具列表，不创建 binding、不武装 hint——绑定留给客户端
+                // 的 select_vs_instance。
+                var snap = Registry.Snapshot();
+                if (snap.Count == 0)
+                {
+                    await WriteJsonRpcErrorAsync(ctx, body, -32001,
+                        "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry.").ConfigureAwait(false);
+                    return;
+                }
+                var first = snap.First();
+                targetPid = first.Info.Pid;
+                vsSessionId = first.VsSessionId;
+                echoSessionId = clientSessionId;
+            }
+            else
+            {
+                // ① Header 未命中/歧义、InstanceGone、NeedsInitialize：正常报错。
                 await RespondToResolutionFailureAsync(ctx, body, clientSessionId, resolution).ConfigureAwait(false);
                 return;
             }
 
-            if (!Registry.TryGet(resolution.Pid!.Value, out var entry))
+            if (!Registry.TryGet(targetPid, out var entry))
             {
                 await WriteJsonRpcErrorAsync(ctx, body, -32003,
-                    $"Bound VS instance PID {resolution.Pid} is no longer connected.").ConfigureAwait(false);
+                    $"VS instance PID {targetPid} is no longer connected.").ConfigureAwait(false);
                 return;
             }
 
             var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(resolution.VsSessionId))
-                forwardedHeaders["Mcp-Session-Id"] = resolution.VsSessionId!;
+            if (!string.IsNullOrEmpty(vsSessionId))
+                forwardedHeaders["Mcp-Session-Id"] = vsSessionId!;
             else
                 forwardedHeaders.Remove("Mcp-Session-Id");
 
@@ -446,10 +489,6 @@ namespace VsMcpGateway
             await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
 
             byte[] injected = GatewayTools.InjectIntoToolsListSse(buffer.ToArray());
-
-            // 回显绑定创建时所用的 session id（对 ③ 自动绑定场景重要：客户端没发，
-            // 我们铸造了一个）。
-            string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
@@ -555,7 +594,10 @@ namespace VsMcpGateway
             // 缓冲完整响应——但仅限于此，以保持常见场景的流式传输（设计文档里
             // hint 缓冲的权衡）。
             SessionBinding? binding = resolution.Binding;
-            bool needsHint = binding != null && binding.HintPending;
+            // 原子 claim（ClaimHint）：多个并发 tools/call 只一个拿到 true，杜绝重复注入——
+            // 并发下两个请求都合法读到 HintPending=true（不是时序竞态，是共享 flag 缺乏互斥），
+            // 故必须在注入前原子地把 1 翻 0，让其余并发请求拿到 false。
+            bool needsHint = binding != null && binding.ClaimHint();
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
@@ -580,10 +622,10 @@ namespace VsMcpGateway
                 {
                     await injector.FlushRemainingAsync(ct).ConfigureAwait(false);
                 }
-                // 一次性：只有 hint 真正被某个 result 携带后才清除标志。无 result
-                // 的响应（错误）让它保持武装，等下一次调用（设计文档 MI-07）。
-                if (injector.DidInject)
-                    binding!.HintPending = false;
+                // claim 时已把 HintPending 翻 false。若注入失败（无 result.content，如错误响应）
+                // 则归还，让下次调用重试——保留原 MI-07「注入失败保持武装」语义。
+                if (!injector.DidInject)
+                    binding!.HintPending = true;
             }
             else
             {

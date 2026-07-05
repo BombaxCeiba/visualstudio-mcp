@@ -25,6 +25,10 @@ namespace VsMcpGateway
         public DateTime LastSeen { get; set; }
         public string? VsSessionId { get; set; }
 
+        /// <summary>本实例最新已知的调试器模式（"design"/"break"/"running"），由
+        /// debugger-state-changed 控制帧实时刷新。null = register 后尚未收到推送。</summary>
+        public string? DebuggerState { get; set; }
+
         public InstanceEntry(PipeRouter router, PipeRegister info, DateTime lastSeen)
         {
             Router = router ?? throw new ArgumentNullException(nameof(router));
@@ -75,6 +79,19 @@ namespace VsMcpGateway
         {
             if (_byPid.TryGetValue(pid, out var existing))
                 existing.LastSeen = DateTime.UtcNow;
+        }
+
+        /// <summary>debugger-state-changed 推送时刷新本实例的 DebuggerState（并更新
+        /// LastSeen，与 solution-changed/heartbeat 一致地标志"最近见过"）。PID 已下线
+        /// 则空操作。从 PipeRouter 读循环内联调用，必须快且不抛——ConcurrentDictionary
+        /// 字段写入满足这两点。</summary>
+        public void UpdateDebuggerState(int pid, string? state)
+        {
+            if (_byPid.TryGetValue(pid, out var existing))
+            {
+                existing.DebuggerState = state;
+                existing.LastSeen = DateTime.UtcNow;
+            }
         }
 
         /// <summary>首次 initialize 到达本 VS 实例时记录 VS 分配的 Mcp-Session-Id。

@@ -124,18 +124,31 @@ namespace VsMcpGateway
                 return TargetResolution.Routed(entry.Info.Pid, entry.VsSessionId, binding, hintJustAutoBound: false);
             }
 
-            // ③ 自动绑定——恰好一个实例在线，无 header，无 session。
+            // ③ 自动绑定——恰好一个实例在线，无 header，无 session（② 已 miss）。
             var snapshot = registry.Snapshot();
             if (snapshot.Count == 1)
             {
                 var only = snapshot.First();
                 // VS pipe 模式从不捕获 Mcp-Session-Id（head 帧不带），所以
-                // only.VsSessionId 为 null。这没问题——VS 端跑单个进程内会话并忽略
-                // 该 header。自动绑定（有状态）并标记一次性 hint；转发路径铸造客户端
-                // session id。
-                var (_, newBinding) = sessions.CreateWithId(only.Info.Pid, only.VsSessionId, "auto");
-                newBinding.HintPending = true;
-                return TargetResolution.Routed(only.Info.Pid, only.VsSessionId, newBinding, hintJustAutoBound: true);
+                // only.VsSessionId 为 null。这没问题——VS 端跑单个进程内会话并忽略该 header。
+                SessionBinding newBinding;
+                bool justCreated;
+                if (!string.IsNullOrEmpty(clientSessionId))
+                {
+                    // 客户端带了 session id（即使非 Gateway 分配——Claude Code 等客户端带自己
+                    // 缓存/生成的 id）——用它作 binding key，让后续 ② 层命中，避免每次 auto-bind
+                    // + hint 循环。复用现有 binding 不重设 HintPending（已注入过就不再注入）。
+                    var (b, c) = sessions.GetOrAdd(clientSessionId!, only.Info.Pid, only.VsSessionId, "auto");
+                    newBinding = b; justCreated = c;
+                }
+                else
+                {
+                    // 客户端没带 id——Gateway 铸造一个，转发路径回显给客户端。
+                    var (_, b) = sessions.CreateWithId(only.Info.Pid, only.VsSessionId, "auto");
+                    newBinding = b; justCreated = true;
+                }
+                if (justCreated) newBinding.HintPending = true;
+                return TargetResolution.Routed(only.Info.Pid, only.VsSessionId, newBinding, hintJustAutoBound: justCreated);
             }
 
             // ④ 拦截——0 或 ≥2 个实例，无 header，无 session（设计文档 §④）。

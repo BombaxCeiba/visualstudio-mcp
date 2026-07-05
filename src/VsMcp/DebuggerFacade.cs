@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1469,6 +1470,103 @@ namespace VsMcp
             // 将任何其他分隔符替换为反斜杠，使 FindProjectItem 的
             // 索引（仅反斜杠）无论调用方约定如何都能匹配。
             return full.Replace('/', '\\').ToUpperInvariant();
+        }
+
+        // =====================================================================
+        // 纯文本渲染层。下列 *AsTextAsync 方法各自调原 *Async 拿到 typed DTO，
+        // 再渲染成供 agent 直接阅读的纯文本，经 SafeCall.WrapText 包进
+        // TextContentBlock 返回（不走 JSON 序列化）。原 *Async 方法与 DTO 类型
+        // 全部保留——仍是 facade 的结构化能力表面，且被无 COM 单元测试覆盖。
+        // find_symbol 是这套"纯文本阅读型工具"的先例（见 SymbolFacade）。
+        // =====================================================================
+
+        /// <summary>get_build_output 的纯文本渲染：一行 header（pane 名、读取
+        /// 方向、returned/total、是否截断）后接 Build 面板日志原文，换行不转义。</summary>
+        public async Task<string> GetBuildOutputAsTextAsync(int maxLines, bool tail, CancellationToken ct)
+        {
+            var dto = await GetBuildOutputAsync(maxLines, tail, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            string direction = tail ? "末尾" : "开头";
+            string trunc = dto.Truncated ? "（已截断）" : "";
+            sb.AppendLine($"=== {dto.PaneName} pane · {direction} {dto.ReturnedLines}/{dto.TotalLines} 行{trunc} ===");
+            if (dto.TotalLines == 0)
+                sb.Append("（Build 面板无内容）");
+            else
+                sb.Append(dto.Output);
+            return sb.ToString();
+        }
+
+        /// <summary>get_call_stack 的纯文本渲染：每帧一行
+        /// <c>#idx  module!Function  → RetType</c>，module/返回类型为空时省略。</summary>
+        public async Task<string> GetCallStackAsTextAsync(CancellationToken ct)
+        {
+            var dto = await GetCallStackAsync(ct).ConfigureAwait(false);
+            if (dto.Total == 0)
+                return "（当前线程无栈帧）";
+            var sb = new StringBuilder();
+            string scope = dto.Returned < dto.Total ? $"，显示前 {dto.Returned}" : "，显示全部";
+            sb.AppendLine($"调用栈（共 {dto.Total} 帧{scope}）：");
+            foreach (var f in dto.Frames)
+            {
+                string mod = string.IsNullOrEmpty(f.Module) ? "" : $"{f.Module}!";
+                string ret = string.IsNullOrEmpty(f.ReturnType) ? "" : $"  → {f.ReturnType}";
+                sb.AppendLine($"  #{f.FrameIndex}  {mod}{f.FunctionName}{ret}");
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>list_local_variables 的纯文本渲染：浅层 local 列表，
+        /// 每项 <c>name (type) = value</c>，hasChildren 标 {…} 提示用
+        /// get_variable_detail 下钻。</summary>
+        public async Task<string> ListLocalVariablesAsTextAsync(int maxLocals, int maxChars, CancellationToken ct)
+        {
+            var dto = await ListLocalVariablesAsync(maxLocals, maxChars, ct).ConfigureAwait(false);
+            if (dto.Total == 0)
+                return "（当前栈帧无局部变量）";
+            var sb = new StringBuilder();
+            string trunc = dto.Truncated ? "（已截断，调大 maxLocals/maxChars 看更多）" : "";
+            sb.AppendLine($"局部变量（共 {dto.Total} 个，返回 {dto.Returned}）{trunc}：");
+            foreach (var local in dto.Locals)
+                RenderExpression(sb, local, indent: 0);
+            return sb.ToString();
+        }
+
+        /// <summary>evaluate_expression 的纯文本渲染：单个表达式求值后的
+        /// ExpressionInfo 树，递归缩进（每层 2 空格）。</summary>
+        public async Task<string> EvaluateExpressionAsTextAsync(string expression, int maxChars, CancellationToken ct)
+        {
+            var dto = await EvaluateExpressionAsync(expression, maxChars, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            RenderExpression(sb, dto.Expression, indent: 0);
+            return sb.ToString();
+        }
+
+        /// <summary>把单个 <see cref="ExpressionInfo"/> 节点渲染进 StringBuilder。
+        /// 缩进表达树层级（每层 2 空格）；hasChildren 标 {…}，truncated 标下钻提示。
+        /// evaluate_expression 的深树与 list_local_variables 的浅层列表共用本方法。</summary>
+        private static void RenderExpression(StringBuilder sb, ExpressionInfo e, int indent)
+        {
+            string pad = new string(' ', indent * 2);
+            // 有名字或类型才打表头行；两者皆空的极端节点只递归 children。
+            if (!string.IsNullOrEmpty(e.Name) || !string.IsNullOrEmpty(e.Type))
+            {
+                sb.Append(pad);
+                if (!string.IsNullOrEmpty(e.Name)) sb.Append(e.Name);
+                if (!string.IsNullOrEmpty(e.Type)) sb.Append($" ({e.Type})");
+                if (e.Error)
+                {
+                    string hint = string.IsNullOrEmpty(e.Hint) ? "" : $": {e.Hint}";
+                    sb.AppendLine($" = <求值失败{hint}>");
+                    return;
+                }
+                sb.Append($" = {e.Value ?? "<null>"}");
+                if (e.HasChildren) sb.Append("  {…}");
+                sb.AppendLine();
+                if (e.Truncated)
+                    sb.AppendLine($"{pad}  …（部分子项未展开，用 get_variable_detail 继续）");
+            }
+            foreach (var c in e.Children)
+                RenderExpression(sb, c, indent + 1);
         }
 
         private void ThrowIfDisposed()

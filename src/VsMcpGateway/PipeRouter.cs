@@ -71,6 +71,11 @@ namespace VsMcpGateway
         /// Null = 忽略该帧。</summary>
         private readonly Action<PipeHeartbeat>? _onHeartbeat;
 
+        /// <summary>VS 推送的 <c>debugger-state-changed</c> 控制帧的可选接收端。从
+        /// 读循环内联调用；Gateway 的处理器刷新 InstanceRegistry.DebuggerState。
+        /// Null = 忽略该帧。</summary>
+        private readonly Action<PipeDebuggerStateChanged>? _onDebuggerStateChanged;
+
         /// <summary>
         /// 控制帧载荷由 PipeFraming 以 camelCase 写出（共享的 pipe 帧策略），所以
         /// 这里的反序列化必须用同一策略，否则 <c>solutionPath</c> 之类的字段会
@@ -88,12 +93,14 @@ namespace VsMcpGateway
         /// （无 id）时调用。Gateway 用它刷新 InstanceRegistry 的 LastSeen 时间戳。</param>
         public PipeRouter(Stream connectedStream, bool ownsStream = true,
             Action<PipeSolutionChanged>? onSolutionChanged = null,
-            Action<PipeHeartbeat>? onHeartbeat = null)
+            Action<PipeHeartbeat>? onHeartbeat = null,
+            Action<PipeDebuggerStateChanged>? onDebuggerStateChanged = null)
         {
             _stream = connectedStream ?? throw new ArgumentNullException(nameof(connectedStream));
             _ownsStream = ownsStream;
             _onSolutionChanged = onSolutionChanged;
             _onHeartbeat = onHeartbeat;
+            _onDebuggerStateChanged = onDebuggerStateChanged;
             // 读循环运行至取消；在 DisposeAsync 中被观察。
             _readLoop = Task.Run(() => ReadLoopAsync(_loopCts.Token));
         }
@@ -250,7 +257,23 @@ namespace VsMcpGateway
                             // 畸形的 heartbeat 绝不能拖垮 pipe。
                         }
                     }
-                    // 未知控制帧落到这里被静默丢弃，让新旧版本配对绝不破坏流。
+                    else if (string.Equals(type, "debugger-state-changed", StringComparison.Ordinal) && _onDebuggerStateChanged != null)
+                    {
+                        try
+                        {
+                            var changed = JsonSerializer.Deserialize<PipeDebuggerStateChanged>(json, ControlFrameJsonOptions);
+                            if (changed != null)
+                                _onDebuggerStateChanged(changed);
+                        }
+                        catch
+                        {
+                            // 畸形的 debugger-state-changed 绝不能拖垮 pipe。
+                        }
+                    }
+                    // 落到这里 = 既非已知控制帧类型、也非注册了回调的帧。记一条日志后丢弃，
+                    // 让新旧版本配对绝不破坏流（新 VS 发了老 Gateway 不认识的帧时在日志里
+                    // 可见，便于诊断"VS 推了某类帧但 Gateway 侧没处理"）。
+                    GatewayLogger.Log($"ignoring control frame type='{type}' — no handler, dropping");
                     continue;
                 }
 

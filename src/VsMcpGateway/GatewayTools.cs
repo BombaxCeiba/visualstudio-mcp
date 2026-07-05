@@ -41,9 +41,9 @@ namespace VsMcpGateway
             string.Equals(toolName, SelectInstanceName, StringComparison.Ordinal);
 
         /// <summary>
-        /// 从注册表快照构造 list_vs_instances 的载荷。debuggerState 来自 register
-        /// 帧的快照（Wave 2 没有实时状态；Wave 3+ 可能刷新它）。返回该工具文本
-        /// 内容的 JSON 文本。
+        /// 从注册表快照构造 list_vs_instances 的载荷。debuggerState 来自
+        /// InstanceEntry.DebuggerState（由 debugger-state-changed 控制帧实时刷新；
+        /// register 后尚未收到推送时为 null）。返回该工具文本内容的 JSON 文本。
         /// </summary>
         public static string BuildListInstancesContent(IReadOnlyCollection<InstanceEntry> instances)
         {
@@ -60,7 +60,12 @@ namespace VsMcpGateway
                     writer.WriteNumber("pid", info.Pid);
                     writer.WriteString("solution", info.SolutionPath);
                     writer.WriteString("solutionDir", info.SolutionDir);
-                    writer.WriteNull("debuggerState"); // Wave 2：register 没有实时状态
+                    // 实时 state 来自 debugger-state-changed 推送（InstanceRegistry 缓存）；
+                    // register 后尚未收到推送时为 null。
+                    if (string.IsNullOrEmpty(inst.DebuggerState))
+                        writer.WriteNull("debuggerState");
+                    else
+                        writer.WriteString("debuggerState", inst.DebuggerState);
                     writer.WriteString("vsVersion", string.IsNullOrEmpty(info.VsVersion) ? null : info.VsVersion);
                     writer.WriteEndObject();
                 }
@@ -144,8 +149,8 @@ namespace VsMcpGateway
         // ①③④ 层都以 tool-error 文本形式浮现给 agent（设计文档 §①/§③/§④），让
         // agent 把引导转达给用户。消息文本在设计文档给出处逐字遵循。
 
-        /// <summary>把一个实例渲染成列表行。仅解决方案信息（Wave 2/3 不从 register
-        /// 帧携带实时调试器状态；Wave 4 的 heartbeat 可能补充它）。</summary>
+        /// <summary>把一个实例渲染成列表行（用于拦截/hint 消息）。仅解决方案信息，
+        /// 不含 debuggerState（实时状态经 list_vs_instances 的 JSON 载荷暴露）。</summary>
         private static string FormatInstance(InstanceEntry inst)
         {
             var info = inst.Info;

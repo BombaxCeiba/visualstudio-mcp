@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Threading;
 
 namespace VsMcpGateway
 {
@@ -20,13 +21,24 @@ namespace VsMcpGateway
         public string? VsSessionId { get; set; }
         public DateTime BoundAt { get; set; }
         public string Source { get; set; } = "";
+
+        // int 后备 + Interlocked：让 ClaimHint 能原子占有 hint，杜绝多个并发 tools/call 都读到
+        // HintPending=true 而重复注入。并发下两个请求都合法看到 true（不是时序竞态，是共享 flag
+        // 缺乏互斥），故 claim 必须用 CompareExchange 原子地把 1 翻 0，让其余并发请求拿到 false。
+        private int _hintPendingRaw;
         /// <summary>
-        /// 自动绑定后为 true，直到下一次转发的 tool result 被前置 hint；只清除一次
-        /// （一次性——设计文档决策 MI-07）。显式绑定（_meta.vsPid /
-        /// select_vs_instance）让此值保持 false，使用户/agent 在刻意选择时永远看不到
-        /// 自动绑定 hint。
+        /// 自动绑定后为 true，门控注入一次性 hint（设计文档 MI-07）。显式绑定（_meta.vsPid /
+        /// select_vs_instance）让此值保持 false，使用户/agent 在刻意选择时永远看不到自动绑定 hint。
         /// </summary>
-        public bool HintPending { get; set; }
+        public bool HintPending
+        {
+            get => _hintPendingRaw != 0;
+            set => Interlocked.Exchange(ref _hintPendingRaw, value ? 1 : 0);
+        }
+        /// <summary>原子占有 hint：若当前为 true 则置 false 并返回 true。多个并发请求只一个拿到
+        /// true，杜绝重复注入。注入方拿到 true 后若注入失败应归还（HintPending=true）。</summary>
+        public bool ClaimHint() => Interlocked.CompareExchange(ref _hintPendingRaw, 0, 1) == 1;
+
         /// <summary>
         /// 本绑定所键于的客户端可见 session id（<c>sess-...</c>）。在绑定时设置，让
         /// 自动绑定路径能把新铸造的 id 回显给没发 Mcp-Session-Id 的客户端。
@@ -65,6 +77,23 @@ namespace VsMcpGateway
             };
             _byClientSession[clientSessionId] = binding;
             return (clientSessionId, binding);
+        }
+
+        /// <summary>用客户端自带的 session id 建绑定（客户端带 Mcp-Session-Id 但不在表里时，
+        /// 替代 <see cref="CreateWithId"/> 生成新 id）。返回 binding + 是否本次新建。
+        /// 复用现有 binding 时不改状态（<see cref="SessionBinding.HintPending"/> 已清除的保持清除，
+        /// 避免每次重复注入 auto-bind hint——客户端带自己缓存/生成的 id 时的常见情形）。</summary>
+        public (SessionBinding Binding, bool Created) GetOrAdd(string clientSessionId, int pid, string? vsSessionId, string source)
+        {
+            if (_byClientSession.TryGetValue(clientSessionId, out var existing))
+                return (existing, false);
+            var created = new SessionBinding(pid, vsSessionId, DateTime.UtcNow, source)
+            {
+                ClientSessionId = clientSessionId,
+            };
+            // GetOrAdd 处理并发：另一线程可能同时建了同名 binding，此时返回那个、Created=false。
+            var actual = _byClientSession.GetOrAdd(clientSessionId, created);
+            return (actual, ReferenceEquals(actual, created));
         }
 
         public bool TryGet(string clientSessionId, out SessionBinding binding) =>
