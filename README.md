@@ -17,7 +17,7 @@
 - AI 想知道程序跑起来之后某个变量的值，只能让你自己去看。
 - 你同时开着两个 VS（一个调服务端、一个调客户端），AI 却只能连到其中一个。
 
-`vs-mcp` 通过把 Visual Studio 的能力暴露给 AI 来解决这些事——**让 AI 用和人类一样的 IDE 感知**。今天已经落地构建（触发编译、读 build 输出）、调试器控制（设断点、单步、读栈、求值）、符号导航（find_symbol / get_type_hierarchy / go_to_definition），以及**多实例路由**（一个端口背后挂多个 VS，按工作区或会话精确路由）。
+`vs-mcp` 通过把 Visual Studio 的能力暴露给 AI 来解决这些事——**让 AI 用和人类一样的 IDE 感知**。今天已经落地构建（触发编译、读 build 输出）、调试器控制（设断点、单步、读栈、求值）、符号导航与调用关系（find_symbol / get_type_hierarchy / get_call_graph / go_to_definition），以及**多实例路由**（一个端口背后挂多个 VS，按工作区或会话精确路由）。
 
 ---
 
@@ -50,7 +50,7 @@
 
 ## 现在能做什么
 
-暴露 **22 个 VS 工具**（含 2 个可选项：`go_to_definition`、`eval_csharp`）+ **2 个 Gateway 注入的多实例路由工具**，共 24 个。AI 调 `tools/list` 时会看到全部（可选项需在 Tools → Options 或编译时启用）。
+暴露 **24 个 VS 工具**（含 2 个可选项：`go_to_definition`、`eval_csharp`）+ **2 个 Gateway 注入的多实例路由工具**，共 26 个。AI 调 `tools/list` 时会看到全部（可选项需在 Tools → Options 或编译时启用）。`initialize` 响应里的 `instructions` 字段会引导 agent：查代码结构（符号定位 / 调用关系 / 继承）时**优先用这些 VS 工具而非 grep**——C++ 多态、重载、模板让 grep 不可靠。
 
 ### 多实例路由（Gateway 级工具）
 
@@ -110,6 +110,12 @@
 | `find_symbol` | 按名字搜索符号：C++ 经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）、C#/VB 经 LSP。返回**每个符号 ±contextLines 行带行号的源码上下文**（纯文本，`▶` 标记符号行，`contextLines` 默认 10，可设 0 只看符号行）；`maxResults`/`maxChars` 限制输出（超限截断会提示调高 `maxChars`、减小 `contextLines` 或收窄 query） |
 | `get_type_hierarchy` | 返回类型的祖先链、派生类、兄弟类型（影响分析） |
 | `go_to_definition` | 解析指定位置的符号定义（可选，需在 Tools → Options 启用） |
+
+### 调用关系（C++）
+
+| 工具 | 作用 |
+|---|---|
+| `get_call_graph` | 查 C++ 函数的调用关系：`callers`（谁调用了它）或 `callees`（它调用了谁，默认）——VS 调用层次结构窗口同款后端（VC CallHierarchy API）。同名符号（重载、`.h` 声明 + `.cpp` 实现、各类同名方法）全部遍历、合并去重。callers 反向搜全 solution 较慢（热门函数 1-3 分钟），默认 `timeoutSeconds=180` + 搜索期间每 5s 推送 logging 心跳保活；纯虚接口声明不在 C++ 符号索引里，其 callers 在具体实现上查 |
 
 ### 动态执行（可选，开发调试用）
 
@@ -237,6 +243,7 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 | ✅ 已完成 | **构建控制** — 触发构建、读 build 输出 | AI 改完代码能验证编译 |
 | ✅ 已完成 | **调试器控制** — 断点、单步、调用栈、局部变量、表达式求值 | AI 能看到运行时状态 |
 | ✅ 已完成 | **符号导航** — find_symbol（C++/C#/VB，带源码上下文）/ get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
+| ✅ 已完成 | **调用关系** — get_call_graph（C++ callers/callees，VS CallHierarchy 后端） | AI 做重构影响分析、追踪控制流，不再 grep |
 | ✅ 已完成 | **多实例 Gateway** — 一个端口后挂多个 VS，按工作区/会话路由 | 同时开多个项目不再端口冲突 |
 | 🚧 规划中 | **语法诊断** — 直接读 VS 的编译/语义错误，不是 grep | 比 grep 准，覆盖 C++/C#/Python/… |
 | 🚧 规划中 | **符号导航扩展** — find-references / workspace symbols | 影响分析、重构场景 |

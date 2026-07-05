@@ -91,6 +91,17 @@ namespace VsMcp
                 _transport,
                 new McpServerOptions
                 {
+                    // instructions 注入到 initialize 响应，客户端连上时即拿到。
+                    // 引导 agent：查代码结构优先用 VS 工具而非 grep（C++ 多态/重载/模板让 grep 不可靠）。
+                    ServerInstructions = @"This server drives Visual Studio — the debugger plus C++ code intelligence.
+
+When querying code STRUCTURE in this solution (locating symbols, call graphs, inheritance), PREFER these tools over grep or reading files. They use VS's full semantic index and stay correct for C++ overloads, virtual dispatch, and templates — exactly where grep goes wrong:
+  - find_symbol        locate a symbol's definitions/declarations
+  - get_call_graph     who calls a function (callers) / what it calls (callees)
+  - get_type_hierarchy inheritance / implementation relationships
+  - go_to_definition   resolve a symbol at a source position
+
+Reach for grep only for plain-text / literal searches. Use the debugger tools (set_breakpoint, step_over/step_into/step_out, continue_execution, list_local_variables, get_variable_detail, evaluate_expression) when diagnosing runtime behavior; they require break mode.",
                     ToolCollection = BuildToolCollection()
                 },
                 loggerFactory);
@@ -313,7 +324,7 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "find_symbol",
-                        Description = "Searches symbols across every language: C++ via the VC CodeStore (IVCNavigateToFactory, the same in-proc backend behind Ctrl+T) and C#/VB via LSP workspace/symbol — so accuracy matches in-IDE 'Go To All'. Returns PLAIN TEXT, not JSON: each match shows a header (name/kind/language/file:line) followed by source context — contextLines above and below the symbol line (default 10, set 0 for just the symbol line), with line numbers and a ▶ marker on the symbol line. Optional maxResults (default 16) caps the match count; maxChars (default 8000) caps total output (truncated with a notice if exceeded — raise it to see full context). Far more accurate than grep because it uses the language services' semantic model, not text matching.",
+                        Description = "Use when you need to locate where a symbol (function/class/variable/typedef) is defined or declared across the solution. Searches every language: C++ via the VC CodeStore (IVCNavigateToFactory, the same in-proc backend behind Ctrl+T) and C#/VB via LSP workspace/symbol — accuracy matches in-IDE 'Go To All'. Prefer over grep — C++ overloads, namespaces, and macros make plain-text search ambiguous; this uses the language services' semantic model. Returns PLAIN TEXT, not JSON: each match shows a header (name/kind/language/file:line) followed by source context — contextLines above and below the symbol line (default 10, set 0 for just the symbol line), with line numbers and a ▶ marker on the symbol line. Optional maxResults (default 16) caps the match count; maxChars (default 8000) caps total output (truncated with a notice if exceeded — raise it to see full context).",
                         ReadOnly = true
                     }));
 
@@ -322,7 +333,16 @@ namespace VsMcp
                     new McpServerToolCreateOptions
                     {
                         Name = "get_type_hierarchy",
-                        Description = "Returns a type's position in the solution's type graph: full ancestor chain (to root), direct descendants (who derives from / implements this type across the whole solution), and siblings (other types sharing a base). VS-exclusive — reverse inheritance requires indexing every type in the solution, which reading source files cannot replicate. Use for impact analysis before modifying a class/interface. Found=false if no type matches.",
+                        Description = "Use when you need a type's inheritance chain, who derives from / implements it, or sibling types sharing a base — for impact analysis before modifying a class/interface. Returns the full ancestor chain (to root), direct descendants across the whole solution, and siblings. Prefer over grep/reading files — reverse inheritance requires indexing every type in the solution, which source-grepping cannot replicate. Found=false if no type matches.",
+                        ReadOnly = true
+                    }));
+
+                tools.Add(McpServerTool.Create(
+                    GetCallGraphToolAsync,
+                    new McpServerToolCreateOptions
+                    {
+                        Name = "get_call_graph",
+                        Description = "Use when you need who calls a C++ function (direction='callers') or what it calls (direction='callees', default) — refactor impact analysis, dead-code hunting, or tracing control flow. The same backend behind VS's Call Hierarchy window (VC CallHierarchy API via IVCCallHierarchyMemberItemFactory). Prefer over grep — C++ virtual dispatch, overloads, and same-named methods across classes make text search wrong; this uses VS's full-solution call graph. Each node carries name + signature + file:line. A name usually matches multiple symbols (overloads, .h declaration + .cpp implementation, same-named methods across classes); all are enumerated, searched, and de-duplicated. callers reverse-search the whole solution per symbol and accumulate across matches, so a popular function can take 1-3 minutes (default timeoutSeconds=180); a logging heartbeat keeps the client alive meanwhile, and TimedOut=true means it didn't finish in time (Nodes still carries whatever was found). Found=false if no symbol matches. Pure virtual interface declarations are not in the C++ symbol index, so an interface's callers are reported at its concrete implementations.",
                         ReadOnly = true
                     }));
 
@@ -393,6 +413,26 @@ namespace VsMcp
                 SymbolFacade.ProbeLog($"find_symbol failed: {ex.GetType().Name}: {ex.Message}");
                 return SafeCall.LogAndReturn(new ErrorResult("internal_error", ex.Message).ToCallToolResult());
             }
+        }
+
+        public Task<object> GetCallGraphToolAsync(McpServer server, string query, string direction = "callees", int maxResults = 50, int timeoutSeconds = 180, CancellationToken ct = default)
+            => SafeCall.Wrap(() => RunCallGraphWithKeepAliveAsync(server, query, direction, maxResults, timeoutSeconds, ct), ct);
+
+        /// <summary>
+        /// get_call_graph 的保活包装：CallHierarchy callers 反向搜索全 solution 可能远超客户端
+        /// 工具调用超时（高频函数 + 多个同名符号累加，每个符号都要扫整个 solution）。搜索期间每 5 秒
+        /// 发一条 logging 心跳通知（notifications/message），客户端收到即重置超时——心跳只进调试面板，
+        /// 不注入模型上下文、不消耗 token。搜索结束 Dispose 心跳循环。
+        /// </summary>
+        private async Task<CallGraphResult> RunCallGraphWithKeepAliveAsync(
+            McpServer server, string query, string direction, int maxResults, int timeoutSeconds, CancellationToken ct)
+        {
+            using var keepAlive = new KeepAliveNotifier(
+                sendKeepAlive: token => SendLogNotificationAsync(server, "vs-debugger:call-graph",
+                    $"Searching {direction} for '{query}'...", token),
+                interval: TimeSpan.FromSeconds(5),
+                cancellationToken: ct);
+            return await _symbolFacade!.GetCallGraphAsync(query, direction, maxResults, timeoutSeconds, ct).ConfigureAwait(false);
         }
 
         public Task<object> SearchProjectToolAsync(string? query = null, CancellationToken ct = default)

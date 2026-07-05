@@ -189,6 +189,12 @@
         <HintPath>$(_VsIdePath)\PrivateAssemblies\Microsoft.VisualStudio.CodeStore.Internal.dll</HintPath>
         <Private>false</Private>
       </Reference>
+      <!-- VCImageMoniker（IVCCallHierarchyMemberItem.GetData 的 out 参数）定义在此——
+           get_call_graph 经 CallHierarchy API 查调用关系需要它。VS host 自带，Private=false。 -->
+      <Reference Include="Microsoft.VisualStudio.VC.Interfaces">
+        <HintPath>$(_VsIdePath)\PublicAssemblies\Microsoft.VisualStudio.VC.Interfaces.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <!-- MEF composition host — IComponentModel (SComponentModel) is the way to
            reach MEF exports (the NavigateTo factories) from an AsyncPackage. -->
       <Reference Include="Microsoft.VisualStudio.ComponentModelHost">

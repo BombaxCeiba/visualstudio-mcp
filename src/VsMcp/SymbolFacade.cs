@@ -278,6 +278,19 @@ namespace VsMcp
             return await GetTypeHierarchyViaDteAsync(typeName, ct).ConfigureAwait(true);
         }
 
+        /// <summary>get_call_graph：C++ 函数调用关系（callers 谁调用了它 / callees 它调用了谁），
+        /// 经 VC CallHierarchy（VS「调用层次结构」窗口后端）。仅 C++；其它语言无对应 API。
+        /// direction: "callers"（CallsTo）/ "callees"（CallsFrom，默认）。</summary>
+        public async Task<CallGraphResult> GetCallGraphAsync(string query, string direction, int maxResults, int timeoutSeconds, CancellationToken ct)
+        {
+            ThrowIfDisposed();
+            if (string.IsNullOrWhiteSpace(query))
+                return new CallGraphResult(Found: false, Query: query, Direction: direction,
+                    Nodes: new List<CallGraphNode>(), TimedOut: false, Error: "查询为空");
+            return await VcCallHierarchySearcher.QueryAsync(_package, query, direction, maxResults, timeoutSeconds, ct)
+                .ConfigureAwait(true);
+        }
+
         /// <summary>DTE CodeModel 路径（C#/VB 传统 sln）。Open Folder 下 project.CodeModel=null
         /// 走不到这里——GetTypeHierarchyAsync 会先经 VC CodeStore 返回。</summary>
         private async Task<TypeHierarchyResult> GetTypeHierarchyViaDteAsync(string typeName, CancellationToken ct)

@@ -8,6 +8,6 @@ namespace VsMcp.Common
     public static class ExtensionVersion
     {
         /// <summary>当前扩展版本，与 source.extension.vsixmanifest 的 Identity Version 保持一致。</summary>
-        public const string Current = "1.37";
+        public const string Current = "1.51";
     }
 }
