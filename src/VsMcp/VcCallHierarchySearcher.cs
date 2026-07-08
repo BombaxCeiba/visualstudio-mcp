@@ -34,6 +34,13 @@ namespace VsMcp
     ///
     /// 这些是 VS Internal API（非公开 ABI，*.Internal 程序集 / PrivateAssemblies），跨大版本不保证
     /// 稳定；COM 对象用 Com.Use / 显式 ReleaseComObject 确定性释放（见 <see cref="Com"/>）。
+    ///
+    /// 版本适配：StartSearch / GetLocation / CancelSearch 经 <see cref="CallHierarchyMemberAccess"/>
+    /// 包装层按 VS 主版本分流——Dev18 (VS2026) 走手写 6 参 StartSearch（pCancel=null）+ 2 out
+    /// GetLocation（file + VCTextSpan，取 iStartLine）；Dev17 (VS2022) 走手写 5 参 StartSearch
+    /// （无 pCancel）+ 5 out GetLocation（file + 4 int，取 pStartLine）。两版手写接口逐槽对照
+    /// 反编译结论见 <see cref="CallHierarchyAccess"/> 顶部注释。GetData 两版同签名同槽3，仍直调
+    /// 互操作接口，不经包装层。
     /// </summary>
     internal static class VcCallHierarchySearcher
     {
@@ -56,15 +63,19 @@ namespace VsMcp
                 ? VCCallHierarchySearchCategory.VCCallHierarchySearchCategory_CallsTo
                 : VCCallHierarchySearchCategory.VCCallHierarchySearchCategory_CallsFrom;
 
+            // 取一次 VS 主版本号（17=Dev17/VS2022，18=Dev18/VS2026）贯穿本次查询，
+            // 不每个 defId 重测（同一次 query 内 VS 版本恒定）。DTE.Version 要求 UI 线程。
+            int devMajor = CallHierarchyMemberAccess.DetectDevMajor(package);
+
             int timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : DefaultTimeoutMs;
-            return await QueryCoreAsync(mgr, factory, query, direction, category, maxResults, timeoutMs, ct)
+            return await QueryCoreAsync(mgr, factory, query, direction, category, maxResults, timeoutMs, devMajor, ct)
                 .ConfigureAwait(true);
         }
 
         private static async Task<CallGraphResult> QueryCoreAsync(
             IVCCodeStoreManager mgr, IVCCallHierarchyMemberItemFactory factory,
             string query, string direction, VCCallHierarchySearchCategory category,
-            int maxResults, int timeoutMs, CancellationToken ct)
+            int maxResults, int timeoutMs, int devMajor, CancellationToken ct)
         {
             // 后台找所有匹配的函数 IdItem（qcs 是 MTA，后台安全）。
             var defIds = await Task.Run(() => FindDefinitionIds(mgr, query), ct).ConfigureAwait(true);
@@ -99,22 +110,23 @@ namespace VsMcp
                     member = factory.CreateMemberItem(defId);
                     if (member == null) continue;
                     using var memberScope = Com.Use(member);
-                    // pCancel 传 null：传自己的 IVCCancellationToken 实现会让原生搜索卡在 ~97% 进度
-                    // 不投递结果（cancel 实现不正确，猜测是 RegisterCancelAction 返回的 registration
-                    // 不符合原生预期）。传 null 能取得符合预期的结果，取消改用 member.CancelSearch（见
-                    // 下方 Register）。
-                    member.StartSearch(
+                    // 经包装层按 VS 主版本分流 StartSearch / CancelSearch：
+                    // Dev18 走手写 6 参 StartSearch（第 6 参 pCancel 恒传 null，传自己的 cancel token
+                    // 会让原生搜索卡在 ~97% 不投递，已验证 1.51）；Dev17 走手写 5 参 StartSearch
+                    // （原生签名无 pCancel）。pCancel 处理由包装层内部完成，调用方不传。
+                    var access = CallHierarchyMemberAccess.Create(member, devMajor);
+                    access.StartSearch(
                         category,
                         VCCallHierarchySearchScope.VCCallHierarchySearchScope_EntireSolution,
                         VCCallHierarchySearchOptions.VCCallHierarchySearchOptions_None,
                         VCCallHierarchySearchReason.VCCallHierarchySearchReason_CallHierarchy,
-                        cb, null);
+                        cb);
 
                     // UI 线程 async 等（不阻塞 UI）。linkedCts 取消 → CancelSearch + TrySetCanceled。
                     // CancelSearch 在 timer 线程跨线程调，try/catch 吞 RPC_E_WRONG_THREAD。
                     using (linkedCts.Token.Register(() =>
                     {
-                        try { member.CancelSearch(category); } catch { }
+                        try { access.CancelSearch(category); } catch { }
                         tcs.TrySetCanceled();
                     }))
                     {
@@ -123,7 +135,7 @@ namespace VsMcp
                     }
 
                     // 合并 found（去重）
-                    foreach (var node in ReadNodes(found, maxResults - allNodes.Count))
+                    foreach (var node in ReadNodes(found, maxResults - allNodes.Count, devMajor))
                     {
                         if (seen.Add($"{node.Name}|{node.File}|{node.Line}")) allNodes.Add(node);
                     }
@@ -183,7 +195,7 @@ namespace VsMcp
         }
 
         /// <summary>把 callback 收集的 IVCCallHierarchyMemberItem 读成 CallGraphNode（名字 + 签名 + 文件 + 行）。</summary>
-        private static List<CallGraphNode> ReadNodes(List<IVCCallHierarchyMemberItem> found, int limit)
+        private static List<CallGraphNode> ReadNodes(List<IVCCallHierarchyMemberItem> found, int limit, int devMajor)
         {
             var list = new List<CallGraphNode>();
             if (limit <= 0) return list;
@@ -192,10 +204,14 @@ namespace VsMcp
                 if (list.Count >= limit) break;
                 try
                 {
+                    // GetData 两版同签名同槽3，仍直调互操作接口（跨版本安全）。
                     item.GetData(out var name, out var sig, out var _, out var _,
                         out var _, out var _, out var _);
-                    item.GetLocation(out var file, out var span);
-                    list.Add(new CallGraphNode(name ?? "", sig ?? "", file ?? "", span.iStartLine));
+                    // GetLocation 走包装层：Dev18 取 VCTextSpan.iStartLine，Dev17 取独立 pStartLine
+                    // （互操作 GetLocation 是 Dev18 形状，VS2022 上槽位/签名错，必须经包装分流）。
+                    var itemAccess = CallHierarchyMemberAccess.Create(item, devMajor);
+                    var (file, line) = itemAccess.GetLocation();
+                    list.Add(new CallGraphNode(name ?? "", sig ?? "", file, line));
                 }
                 catch { }
             }
