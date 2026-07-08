@@ -134,7 +134,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                 // 以及 delegate 的输入参数保持不变，使 MCP SDK 派生出的输入
                 // schema 在字节级保持完全一致。
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.GetDebuggerStateAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.GetDebuggerStateAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "get_debugger_state",
@@ -147,7 +147,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.GetSessionInfoAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.GetSessionInfoAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "get_session_info",
@@ -157,7 +157,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    SearchProjectToolAsync,
+                    (Func<string?, CancellationToken, Task<object>>)SearchProjectToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "search_project",
@@ -166,7 +166,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    StartDebuggingToolAsync,
+                    (Func<string, string?, string?, string?, string?, CancellationToken, Task<object>>)StartDebuggingToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "start_debugging",
@@ -177,7 +177,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string file, int line, CancellationToken ct) => SafeCall.Wrap(() => _facade.SetBreakpointAsync(file, line, ct), ct),
+                    (Func<string, int, CancellationToken, Task<object>>)((string file, int line, CancellationToken ct) => SafeCall.Wrap(() => _facade.SetBreakpointAsync(file, line, ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "set_breakpoint",
@@ -185,7 +185,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.ListBreakpointsAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.ListBreakpointsAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "list_breakpoints",
@@ -194,7 +194,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string file, int line, CancellationToken ct) => SafeCall.Wrap(() => _facade.DeleteBreakpointAsync(file, line, ct), ct),
+                    (Func<string, int, CancellationToken, Task<object>>)((string file, int line, CancellationToken ct) => SafeCall.Wrap(() => _facade.DeleteBreakpointAsync(file, line, ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "delete_breakpoint",
@@ -203,7 +203,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    ClearAllBreakpointsToolAsync,
+                    (Func<bool, CancellationToken, Task<object>>)ClearAllBreakpointsToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "clear_all_breakpoints",
@@ -212,7 +212,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (McpServer server, CancellationToken ct) => SafeCall.Wrap(() => RunBuildWithKeepAliveAsync(server, ct), ct),
+                    (Func<McpServer, CancellationToken, Task<object>>)((McpServer server, CancellationToken ct) => SafeCall.Wrap(() => RunBuildWithKeepAliveAsync(server, ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "build_solution",
@@ -221,7 +221,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    GetBuildOutputToolAsync,
+                    (Func<int, bool, CancellationToken, Task<object>>)GetBuildOutputToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "get_build_output",
@@ -230,7 +230,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    ContinueExecutionToolAsync,
+                    (Func<McpServer, bool, int, CancellationToken, Task<object>>)ContinueExecutionToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "continue_execution",
@@ -244,7 +244,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.StepIntoAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.StepIntoAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "step_into",
@@ -252,7 +252,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.StepOverAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.StepOverAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "step_over",
@@ -260,7 +260,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.StepOutAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.StepOutAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "step_out",
@@ -268,7 +268,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.Wrap(() => _facade.StopDebuggingAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.Wrap(() => _facade.StopDebuggingAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "stop_debugging",
@@ -277,7 +277,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    ListLocalVariablesToolAsync,
+                    (Func<int, int, CancellationToken, Task<object>>)ListLocalVariablesToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "list_local_variables",
@@ -286,7 +286,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (CancellationToken ct) => SafeCall.WrapText(() => _facade.GetCallStackAsTextAsync(ct), ct),
+                    (Func<CancellationToken, Task<object>>)((CancellationToken ct) => SafeCall.WrapText(() => _facade.GetCallStackAsTextAsync(ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "get_call_stack",
@@ -295,7 +295,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    EvaluateExpressionToolAsync,
+                    (Func<string, int, CancellationToken, Task<object>>)EvaluateExpressionToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "evaluate_expression",
@@ -304,7 +304,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    GetVariableDetailToolAsync,
+                    (Func<string[], int, int, CancellationToken, Task<object>>)GetVariableDetailToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "get_variable_detail",
@@ -320,7 +320,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                 // 在 schema 中将其标为可选。lambda 的参数无法声明默认值，因此会被
                 // 强制设为必填（早先的 int? 尝试已证明这点）。
                 tools.Add(McpServerTool.Create(
-                    FindSymbolToolAsync,
+                    (Func<string, int, int, int, CancellationToken, Task<object>>)FindSymbolToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "find_symbol",
@@ -329,7 +329,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    (string typeName, CancellationToken ct) => SafeCall.Wrap(() => _symbolFacade.GetTypeHierarchyAsync(typeName, ct), ct),
+                    (Func<string, CancellationToken, Task<object>>)((string typeName, CancellationToken ct) => SafeCall.Wrap(() => _symbolFacade.GetTypeHierarchyAsync(typeName, ct), ct)),
                     new McpServerToolCreateOptions
                     {
                         Name = "get_type_hierarchy",
@@ -338,7 +338,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                     }));
 
                 tools.Add(McpServerTool.Create(
-                    GetCallGraphToolAsync,
+                    (Func<McpServer, string, string, int, int, CancellationToken, Task<object>>)GetCallGraphToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "get_call_graph",
@@ -349,7 +349,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                 if (_enableGoToDefinition)
                 {
                     tools.Add(McpServerTool.Create(
-                        (string file, int line, int column, CancellationToken ct) => SafeCall.Wrap(() => _symbolFacade.GoToDefinitionAsync(file, line, column, ct), ct),
+                        (Func<string, int, int, CancellationToken, Task<object>>)((string file, int line, int column, CancellationToken ct) => SafeCall.Wrap(() => _symbolFacade.GoToDefinitionAsync(file, line, column, ct), ct)),
                         new McpServerToolCreateOptions
                         {
                             Name = "go_to_definition",
@@ -367,7 +367,7 @@ Reach for grep only for plain-text / literal searches. Use the debugger tools (s
                 // 的数分钟循环压成一次 MCP 调用。任意代码执行，安全敏感 —— 仅 Tools→Options
                 // 开启 EnableEvalCsharp 时注册（默认关，对 agent 不可见）。
                 tools.Add(McpServerTool.Create(
-                    EvalCsharpToolAsync,
+                    (Func<string?, string?, int, CancellationToken, Task<object>>)EvalCsharpToolAsync,
                     new McpServerToolCreateOptions
                     {
                         Name = "eval_csharp",

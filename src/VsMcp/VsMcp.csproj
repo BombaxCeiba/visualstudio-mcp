@@ -2,7 +2,9 @@
 
   <PropertyGroup>
     <TargetFramework>net48</TargetFramework>
-    <LangVersion>latest</LangVersion>
+    <!-- 限 C# 9：net48 可用 C# 9（record/init-only/target-typed new/nullable/pattern matching/
+         using var/out var 均在 C# 9 范围内）。不上 C# 10+ 以保证 VSIX 在多版本 VS 宿主上一致编译。 -->
+    <LangVersion>9</LangVersion>
     <Nullable>enable</Nullable>
     <Deterministic>true</Deterministic>
     <RootNamespace>VsMcp</RootNamespace>
