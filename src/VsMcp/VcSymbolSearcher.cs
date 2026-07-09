@@ -82,7 +82,7 @@ namespace VsMcp
                             FilePath: fileNameStr?.Value,
                             Line: span.iStartLine,      // 1-based，与 VS 行号一致
                             Column: span.iStartCol,
-                            Kind: kind.ToString(),
+                            Kind: VcKindLabels.ToFriendly(kind.ToString()),
                             Language: MapLanguage(lang),
                             Container: parentSort?.Value));
                     }

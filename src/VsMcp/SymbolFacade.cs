@@ -30,8 +30,9 @@ namespace VsMcp
     {
         private const int DefaultMaxResults = 16;
 
-        /// <summary>find_symbol 源码上下文默认行数：符号行上下各多少行。0 表示只看符号所在行。</summary>
-        private const int DefaultContextLines = 10;
+        /// <summary>find_symbol 源码上下文默认行数：符号行上下各多少行。0 表示只看符号所在行。
+        /// 默认 5：短符号 ±10 行占满半屏费 token，±5 行够看签名与紧邻上下文（要看更多显式调大 contextLines）。</summary>
+        private const int DefaultContextLines = 5;
 
         private readonly AsyncPackage _package;
         private bool _disposed;
@@ -82,16 +83,23 @@ namespace VsMcp
         /// <see cref="INavigateToCallback.Done"/> 发出完成信号。每提供程序
         /// 超时阻止单个卡住的语言服务器拖垮整个调用。
         /// </summary>
-        public async Task<string> FindSymbolAsync(string query, int maxResults, int maxChars, int contextLines, CancellationToken ct)
+        public async Task<string> FindSymbolAsync(string query, int maxResults, int maxChars, int contextLines, string? language, string? kind, CancellationToken ct)
         {
             ThrowIfDisposed();
             if (string.IsNullOrWhiteSpace(query))
                 return "查询为空，请提供符号名。";
 
             int limit = maxResults > 0 ? maxResults : DefaultMaxResults;
+            // 过滤激活时 VC searcher 会在 facade 前按上限截断（SearchAsync 的 while hits.Count < maxResults），
+            // 过滤后剩余不足。故过滤时放大收集、facade 过滤后再 take(limit)。系数依据：
+            // 4× —— 假设过滤保留率 ≥25%（同类/同语言符号通常占命中 1/4 以上），收 4 倍量→过滤后大概率仍 ≥ limit；
+            // 64  —— limit 小时 4× 太少、过滤空间不足，垫到 64；200 —— limit 大时 4× 可能到几百，热门符号（命中上千）
+            // 收集几百个会拖到数秒，封顶 200 保响应。无过滤仍传 limit（现状，不变慢）。
+            bool filtering = !string.IsNullOrEmpty(language) || !string.IsNullOrEmpty(kind);
+            int vcBuffer = filtering ? Math.Min(Math.Max(limit * 4, 64), 200) : limit;
             await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
 
-            ProbeLog($"FIND START query='{query}' limit={limit} thread={System.Threading.Thread.CurrentThread.ManagedThreadId}");
+            ProbeLog($"FIND START query='{query}' limit={limit} vcBuffer={vcBuffer} lang='{language}' kind='{kind}' thread={System.Threading.Thread.CurrentThread.ManagedThreadId}");
 
             var hits = new List<SymbolMatch>();
 
@@ -101,7 +109,7 @@ namespace VsMcp
             // 所以 C++ 必须直接调 IVCNavigateToFactory。
             try
             {
-                var vcHits = await VcSymbolSearcher.SearchAsync(_package, query, limit, ct).ConfigureAwait(true);
+                var vcHits = await VcSymbolSearcher.SearchAsync(_package, query, vcBuffer, ct).ConfigureAwait(true);
                 ProbeLog($"FIND VC hits={vcHits.Count}");
                 hits.AddRange(vcHits);
             }
@@ -147,16 +155,35 @@ namespace VsMcp
 
             ProbeLog($"FIND END total hits={hits.Count}");
 
-            // 去重（VC + LSP 可能重叠）→ 优先有源位置 → 按名排序，保证对 agent 确定且稳定。
-            var ordered = hits
+            // 1. 补全 Language：LSP 的 C# 命中 Language=""（ExtractFromSymbolInformation 写死空串），
+            //    按扩展名补回（InferLanguage），否则 language 过滤对 C# 失效。
+            // 2. 过滤：language / kind 大小写不敏感子串，非空才套（kind 对友好标签匹配，源头已 VcKindLabels 归一）。
+            // 3. 去重（VC + LSP 可能重叠）：按 (Name, FilePath, Line)。
+            // 4. 排序：按文件聚合——FilePath OrdinalIgnoreCase（无 FilePath 用 "￿" 占位排末）→ 行号。比"有源位置优先 +
+            //    名字序"直观：同名符号的 .h 声明 + .cpp 实现聚一起；同名符号按名字序基本乱序，无意义。
+            IEnumerable<SymbolMatch> processed = hits
+                .Select(h => string.IsNullOrEmpty(h.Language) ? h with { Language = InferLanguage(h.FilePath) } : h);
+            if (!string.IsNullOrEmpty(language))
+            {
+                var langKey = NormalizeLanguageKey(language);
+                processed = processed.Where(h => NormalizeLanguageKey(h.Language) == langKey);
+            }
+            if (!string.IsNullOrEmpty(kind))
+            {
+                var kindKey = kind!.ToLowerInvariant();
+                processed = processed.Where(h => h.Kind.ToLowerInvariant().Contains(kindKey));
+            }
+            var ordered = processed
                 .GroupBy(h => (h.Name ?? "", h.FilePath ?? "", h.Line)).Select(g => g.First())
-                .OrderByDescending(h => h.FilePath != null)
-                .ThenBy(h => h.Name, StringComparer.Ordinal)
+                .OrderBy(h => h.FilePath ?? "￿", StringComparer.OrdinalIgnoreCase)
+                .ThenBy(h => h.Line)
                 .ToList();
-            bool truncated = ordered.Count > limit;
+            int total = ordered.Count;
+            bool truncated = total > limit;
             if (truncated) ordered = ordered.Take(limit).ToList();
 
-            return await BuildSymbolTextAsync(ordered, query, hits.Count, truncated, maxChars, contextLines, ct).ConfigureAwait(true);
+            ProbeLog($"FIND filter lang='{language}' kind='{kind}' vcBuffer={vcBuffer} postFilter={total} shown={ordered.Count}");
+            return await BuildSymbolTextAsync(ordered, query, total, truncated, maxChars, contextLines, ct).ConfigureAwait(true);
         }
 
         /// <summary>把符号命中渲染为文本：每个符号头（名/种类/语言/位置）+ 源文件上下文
@@ -245,9 +272,48 @@ namespace VsMcp
                 FilePath: filePath,
                 Line: line,
                 Column: column,
-                Kind: si.Kind.ToString(),
+                Kind: VcKindLabels.ToFriendly(si.Kind.ToString()),
                 Language: "",
                 Container: si.ContainerName);
+        }
+
+        /// <summary>按文件扩展名推断语言串（补全 LSP C# 命中缺失的 Language，供 language 过滤）。</summary>
+        private static string InferLanguage(string? filePath)
+        {
+            switch (Path.GetExtension(filePath ?? "").ToLowerInvariant())
+            {
+                case ".cs": return "C#";
+                case ".vb": return "VB";
+                case ".cpp": case ".cc": case ".cxx": case ".c":
+                case ".h": case ".hpp": case ".hh": case ".hxx": case ".inl":
+                case ".ixx": case ".cppm": case ".mpp": case ".mxx":   // C++ 模块（MSVC .ixx / 标准 .cppm 等）
+                    return "C++";
+                default: return "";
+            }
+        }
+
+        /// <summary>把语言标签/用户输入归一到统一 key，供 language 过滤等值匹配。直接 Contains
+        /// 子串匹配不了缩写（"cpp" 非 "C++" 的子串），故双方都过此归一后等值比较：
+        /// c++/cpp/cxx→cpp；c#/csharp/cs→csharp；vb/visualbasic→vb；其余原样小写。</summary>
+        private static string NormalizeLanguageKey(string? s)
+        {
+            var x = (s ?? "").ToLowerInvariant().Replace(" ", "");
+            switch (x)
+            {
+                case "c++":
+                case "cpp":
+                case "cxx":
+                    return "cpp";
+                case "c#":
+                case "csharp":
+                case "cs":
+                    return "csharp";
+                case "vb":
+                case "visualbasic":
+                    return "vb";
+                default:
+                    return x;
+            }
         }
 
         /// <summary>

@@ -253,7 +253,7 @@ namespace VsMcp
             CodeItemKind.CIK_Union => "union",
             CodeItemKind.CIK_Enum => "enum",
             CodeItemKind.CIK_BaseClass => "base",  // Bases 查询返回的继承关系项
-            _ => k.ToString().Replace("CIK_", "").ToLowerInvariant(),
+            _ => VcKindLabels.ToFriendly(k.ToString()),
         };
     }
 }
