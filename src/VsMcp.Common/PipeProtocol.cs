@@ -96,6 +96,52 @@ namespace VsMcp.Common
     }
 
     /// <summary>
+    /// Gateway → VS：转发一个 tool 调用。Gateway 解析 MCP tools/call 后，
+    /// 把工具名和原始参数 JSON 透传给 VS 端的 ToolExecutor。Id 复用现有
+    /// head/data/end 的 Guid 配对机制，支持并发 tool-call。
+    /// </summary>
+    public sealed class PipeToolCall
+    {
+        /// <summary>固定 "tool-call"。Gateway 生成，用于配对响应。</summary>
+        public string Type { get; set; } = "tool-call";
+        public string Id { get; set; } = "";
+        /// <summary>工具名（find_symbol / set_breakpoint 等）。</summary>
+        public string Tool { get; set; } = "";
+        /// <summary>MCP 原始参数 JSON 文本（params.arguments 的 GetRawText()）。
+        /// VS 端用 JsonDocument.Parse 再按工具签名反序列化各参数。</summary>
+        public string Arguments { get; set; } = "";
+    }
+
+    /// <summary>
+    /// VS → Gateway：对某 tool-call 的结果。该帧结束对应 Id 的配对。
+    /// Content 是 MCP content 的文本（find_symbol 返回纯文本，其它工具返回
+    /// JSON 序列化的 DTO）。IsError=true 时 Content 是错误 JSON。
+    /// </summary>
+    public sealed class PipeToolResult
+    {
+        public string Type { get; set; } = "tool-result";
+        public string Id { get; set; } = "";
+        /// <summary>工具结果文本（纯文本或 JSON）。</summary>
+        public string Content { get; set; } = "";
+        /// <summary>true 时 Content 是错误 JSON，对应 MCP result.isError=true。</summary>
+        public bool IsError { get; set; }
+    }
+
+    /// <summary>
+    /// CallToolAsync 的返回值（Gateway 侧）。与帧 DTO PipeToolResult 区分：
+    /// PipeToolResult 是 wire 帧类型，PipeToolResultData 是 PipeRouter
+    /// 返回给 HTTP 处理器的内存类型。两端共享避免重复定义。
+    /// 用 sealed class 而非 record——PipeProtocol.cs 源链接进 VsMcpGateway，
+    /// 后者无 IsExternalInit polyfill，record 会编译失败。
+    /// </summary>
+    public sealed class PipeToolResultData
+    {
+        public string Content { get; }
+        public bool IsError { get; }
+        public PipeToolResultData(string content, bool isError) { Content = content; IsError = isError; }
+    }
+
+    /// <summary>
     /// 所有帧共有的判别包装。接收方先读 <see cref="Type"/> 再反序列化为具体
     /// DTO；此类型仅用于 switch 分派，不直接承载业务字段。
     /// </summary>
