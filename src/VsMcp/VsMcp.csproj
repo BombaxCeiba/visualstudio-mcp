@@ -62,23 +62,33 @@
     <DefineConstants Condition=" '$(EvalCsharpEnabled)' == 'true' ">$(DefineConstants);EVAL_CSHARP</DefineConstants>
   </PropertyGroup>
 
-  <!-- NuGet Package References.
-       System.Text.Json is pinned explicitly (not left to MCP's transitive
-       resolution) so VsMcp.dll's compile-time reference matches the version
-       VsMcpGateway.exe carries directly. The Gateway ships its own
-       System.Text.Json in the VSIX next to VsMcp.dll, and the two processes
-       share that single bundled dll; aligning both compile-time references to
-       10.0.0.9 eliminates the cross-project version skew that would otherwise
-       need error-prone manual bindingRedirects. ProvideBindingRedirection in
-       AssemblyInfo.cs then points the pkgged redirect at 10.0.0.9. -->
+  <!-- NuGet Package References。
+       架构反转后 VS 包不再引 MCP SDK（MCP 移至 Gateway 进程，VS 包退化为工具后端，
+       代码已无任何 ModelContextProtocol 类型引用）。
+       System.Text.Json 降到 10.0.0（assembly version 10.0.0.0）：18.5.2 host 的
+       bindingRedirect range ≤10.0.0.2，引 10.0.0.0 落在范围内被 host redirect 接受，
+       运行时用 host 的 System.Text.Json；旧引 10.0.9（=10.0.0.9 > 10.0.0.2）被 host
+       压制 → 0x80131040。STJ copy-local 供 CreatePkgDef 加载，但不打包进 VSIX
+       （ForceIncludeRuntimeDependencies 改从 Gateway 输出目录打包 10.0.9 给 Gateway；
+       VsMcp.dll 运行时走 host codeBase 的 STJ，不用 VSIX 副本）。Gateway 是独立进程，
+       不受 host redirect 管辖，保持 10.0.9。Microsoft.Extensions.Logging.Abstractions
+       引 host PublicAssemblies（Private=false，与 Shell.15.0 同模式），运行时用 host 的；
+       删 MCP 后此引用不再由 MCP 传递，需单独 host Reference。 -->
   <ItemGroup>
-    <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
     <!-- Microsoft.VisualStudio.Threading is intentionally NOT a PackageReference:
          binding a NuGet version (e.g. 17.14.15) against an SDK Shell.15.0 from a
          different VS install triggers CS1705 (Threading 17.x vs Shell's internal
          reference to Threading 18.x). Instead we resolve the dll from the same
          VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
-    <PackageReference Include="System.Text.Json" Version="10.0.9" />
+    <!-- STJ 用 Reference（非 PackageReference）：PackageReference 会传递 Microsoft.Bcl.AsyncInterfaces
+         10.0.0.0，与下方 host Bcl 10.0.0.4 重复 → CS0433。改 Reference 不传递依赖。
+         引 NuGet 10.0.0 dll（assembly 10.0.0.0 ≤ 18.5.2 host STJ redirect range 10.0.0.2，
+         被 host redirect 接受），Private=false 不 copy-local，运行时用 host 的 STJ
+         （host redirect 10.0.0.0→10.0.0.2 on 18.5.2 / 10.0.0.4 on 18.7）。 -->
+    <Reference Include="System.Text.Json">
+      <HintPath>$(NuGetPackageRoot)system.text.json\10.0.0\lib\net462\System.Text.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
     <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
   </ItemGroup>
@@ -227,6 +237,50 @@
         <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Interop.dll</HintPath>
         <Private>false</Private>
       </Reference>
+      <!-- Microsoft.Extensions.Logging.Abstractions：VS 包用 ILoggerFactory/ILogger
+           （PipeMcpServer/Logging 层）。删 MCP 后不再由 MCP 传递，引 host
+           PublicAssemblies（Private=false，与 Shell.15.0 同模式），运行时用 host 的。 -->
+      <Reference Include="Microsoft.Extensions.Logging.Abstractions">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- Microsoft.Bcl.AsyncInterfaces：IAsyncEnumerable<T>（SymbolFacade LSP
+           RequestAllAsync 返回值）。host LanguageServer.Client.Implementation 引用
+           10.0.0.3，NuGet 最高 10.0.0.0 低于它 → CS1705。引 host PublicAssemblies
+           （Private=false），assembly 10.0.0.3 匹配 host。 -->
+      <Reference Include="Microsoft.Bcl.AsyncInterfaces">
+        <HintPath>$(VsSdkAssembliesPath)\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- VS 包代码直接用的 polyfill：System.Text.Encodings.Web（JavaScriptEncoder）、
+           System.Threading.Tasks.Extensions（ValueTask）。删 MCP/STJ PackageReference 后
+           不再由 NuGet 传递，引 host PublicAssemblies（Private=false，与 Shell.15.0 同模式）。 -->
+      <Reference Include="System.Text.Encodings.Web">
+        <HintPath>$(VsSdkAssembliesPath)\System.Text.Encodings.Web.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System.Threading.Tasks.Extensions">
+        <HintPath>$(VsSdkAssembliesPath)\System.Threading.Tasks.Extensions.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <!-- Span/Memory polyfill 依赖链：STJ API（JsonDocument.Parse 等）用 ReadOnlySpan/
+           ReadOnlyMemory，需 System.Memory；Memory 依赖 Buffers/Unsafe/Numerics.Vectors。 -->
+      <Reference Include="System.Memory">
+        <HintPath>$(VsSdkAssembliesPath)\System.Memory.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System.Buffers">
+        <HintPath>$(VsSdkAssembliesPath)\System.Buffers.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System.Runtime.CompilerServices.Unsafe">
+        <HintPath>$(VsSdkAssembliesPath)\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System.Numerics.Vectors">
+        <HintPath>$(VsSdkAssembliesPath)\System.Numerics.Vectors.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <Reference Include="System" />
       <Reference Include="System.Core" />
       <Reference Include="System.Net.Http" />
@@ -312,50 +366,28 @@
     Must run before GetVsixSourceItems; Link= forces VSIX-root placement.
   -->
   <Target Name="ForceIncludeRuntimeDependencies" BeforeTargets="GetVsixSourceItems">
+    <PropertyGroup>
+      <VsMcpGatewayOutputDir>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\</VsMcpGatewayOutputDir>
+    </PropertyGroup>
     <ItemGroup>
-      <!-- VsMcpGateway.exe + its generated .exe.config (bindingRedirects). The
-           config is mandatory: without it the Gateway process hits
-           System.Memory 4.0.2.0 vs 4.0.5.0 FileLoadException on startup. -->
+      <!-- VsMcpGateway.exe + .exe.config 从 $(TargetDir)（CopyGatewayExe 已拷来）。
+           config 必带：否则 Gateway 启动 System.Memory 4.0.2.0 vs 4.0.5.0 FileLoadException。 -->
       <Content Include="$(TargetDir)VsMcpGateway.exe" Condition="Exists('$(TargetDir)VsMcpGateway.exe')">
         <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe</Link>
       </Content>
       <Content Include="$(TargetDir)VsMcpGateway.exe.config" Condition="Exists('$(TargetDir)VsMcpGateway.exe.config')">
         <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe.config</Link>
       </Content>
-      <!-- Gateway-side runtime deps (its own private copies; VS host is
-           unaffected because it loads System.* via devenv codeBase). -->
-      <Content Include="$(TargetDir)System.Text.Json.dll" Condition="Exists('$(TargetDir)System.Text.Json.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Json.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Text.Encodings.Web.dll" Condition="Exists('$(TargetDir)System.Text.Encodings.Web.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Text.Encodings.Web.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)Microsoft.Bcl.AsyncInterfaces.dll" Condition="Exists('$(TargetDir)Microsoft.Bcl.AsyncInterfaces.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>Microsoft.Bcl.AsyncInterfaces.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.IO.Pipelines.dll" Condition="Exists('$(TargetDir)System.IO.Pipelines.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.IO.Pipelines.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Buffers.dll" Condition="Exists('$(TargetDir)System.Buffers.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Buffers.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Memory.dll" Condition="Exists('$(TargetDir)System.Memory.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Memory.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Numerics.Vectors.dll" Condition="Exists('$(TargetDir)System.Numerics.Vectors.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Numerics.Vectors.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Runtime.CompilerServices.Unsafe.dll" Condition="Exists('$(TargetDir)System.Runtime.CompilerServices.Unsafe.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Runtime.CompilerServices.Unsafe.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Diagnostics.DiagnosticSource.dll" Condition="Exists('$(TargetDir)System.Diagnostics.DiagnosticSource.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Diagnostics.DiagnosticSource.dll</Link>
-      </Content>
-      <Content Include="$(TargetDir)System.Threading.Tasks.Extensions.dll" Condition="Exists('$(TargetDir)System.Threading.Tasks.Extensions.dll')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>System.Threading.Tasks.Extensions.dll</Link>
+      <!-- Gateway 运行时依赖从 Gateway 输出目录打包全套。架构反转后 VS 包 polyfill 引 host
+           （Private=false 不 copy-local），$(TargetDir) 无这些 dll；Gateway 是独立进程，自带
+           MCP/STJ 10.0.9 + 传递依赖全套。VsMcp.dll 运行时用 host polyfill（codeBase 优先），
+           不用这些 VSIX 副本。通配 *.dll 确保全套（含 Microsoft.Extensions.* 等 MCP 传递依赖），
+           不漏；CreatePkgDef 在本 target 之前跑，$(TargetDir) 干净不受影响。 -->
+      <Content Include="$(VsMcpGatewayOutputDir)*.dll">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>%(Filename)%(Extension)</Link>
       </Content>
     </ItemGroup>
-    <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(TargetDir)" Importance="high" />
+    <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(VsMcpGatewayOutputDir)" Importance="high" />
   </Target>
 
 </Project>

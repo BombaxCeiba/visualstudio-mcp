@@ -18,19 +18,17 @@ using Microsoft.VisualStudio.Shell;
 // loads cleanly even though it sits outside the VS application base.
 [assembly: ProvideCodeBase]
 
-// ProvideBindingRedirection 把底层 polyfill（Span/Memory/Unsafe 等）的
-// 0.0.0.0-<bundled> 版本范围重定向到 VSIX 自带的版本。host 的版本可能旧，
-// redirect + codeBase 让 CLR 解析到 VSIX 目录的副本。System.Text.Json /
-// Microsoft.Extensions.Logging.Abstractions 等引 host SharedAssemblies /
-// PrivateAssemblies（Private=false），不打包进 VSIX，无需 redirect。
-// Microsoft.Bcl.AsyncInterfaces 提供 IAsyncEnumerable<T>——SymbolFacade 的
-// LSP RequestAllAsync 返回值依赖它，System.Threading.Tasks.Extensions 4.5.4
-// 不含此类型定义，故单独 redirect。
-[assembly: ProvideBindingRedirection(AssemblyName = "System.Buffers", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "4.0.5.0", NewVersion = "4.0.5.0")]
-[assembly: ProvideBindingRedirection(AssemblyName = "System.Memory", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "4.0.5.0", NewVersion = "4.0.5.0")]
-[assembly: ProvideBindingRedirection(AssemblyName = "System.Numerics.Vectors", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "4.1.6.0", NewVersion = "4.1.6.0")]
-[assembly: ProvideBindingRedirection(AssemblyName = "System.Runtime.CompilerServices.Unsafe", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "6.0.3.0", NewVersion = "6.0.3.0")]
-[assembly: ProvideBindingRedirection(AssemblyName = "System.Threading.Tasks.Extensions", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "4.2.4.0", NewVersion = "4.2.4.0")]
-[assembly: ProvideBindingRedirection(AssemblyName = "Microsoft.Bcl.AsyncInterfaces", OldVersionLowerBound = "0.0.0.0", OldVersionUpperBound = "10.0.0.9", NewVersion = "10.0.0.9")]
+// 架构反转后 VS 包的所有 polyfill（System.Text.Json / Microsoft.Bcl.AsyncInterfaces /
+// System.Memory / System.Buffers / System.Runtime.CompilerServices.Unsafe /
+// System.Numerics.Vectors / System.Threading.Tasks.Extensions / System.Text.Encodings.Web /
+// Microsoft.Extensions.Logging.Abstractions）都引 host PublicAssemblies（Private=false，
+// 不 copy-local、不打包进 VSIX），运行时直接用 host 加载的版本。host 自身已对这些
+// polyfill 做 bindingRedirect（VS 扩展生态共用，range 宽），VS 包无需再
+// ProvideBindingRedirection——旧 redirect 的 NewVersion 指向 VSIX 自带副本版本，现在
+// VSIX 不带副本（Private=false），CreatePkgDef 处理 redirect 时加载 $(TargetDir) 副本
+// 读版本会失败（FileNotFound），且运行时 redirect 指向不存在的版本致 FileLoadException。
+// 唯一例外 System.Text.Json 引 NuGet 10.0.0（assembly 10.0.0.0 ≤ 18.5.2 host redirect
+// range 10.0.0.2），运行时 host redirect 10.0.0.0→host 版本，亦无需 VS 包 redirect。
+// ProvideCodeBase 保留：VsMcp.dll 自身的 codeBase 条目（VSIX 安装目录定位）。
 [assembly: AssemblyVersion("1.0.0.0")]
 [assembly: AssemblyFileVersion("1.0.0.0")]
