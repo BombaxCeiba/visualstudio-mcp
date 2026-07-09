@@ -8,14 +8,19 @@ using VsMcp.Common;
 namespace VsMcpGateway
 {
     /// <summary>
-    /// 两个 Gateway 级工具、它们的描述、它们的处理器，以及本地构造的
-    /// initialize / tools/list 响应。Gateway 进程内持有完整 MCP server，
-    /// 不再转发 initialize/tools-list 到 VS。
+    /// Gateway 级工具描述、hint 消息构造。MCP 协议处理（initialize/tools-list）
+    /// 由 SDK 自动完成——不再需要手工构造 JSON-RPC 响应。
     /// </summary>
     public static class GatewayTools
     {
         public const string ListInstancesName = "list_vs_instances";
         public const string SelectInstanceName = "select_vs_instance";
+
+        /// <summary>ServerInstructions 常量（从 ToolSchema.ServerInstructions 搬过来）。</summary>
+        public const string ServerInstructions =
+            "This server provides Visual Studio integration tools (debugger, build, symbol navigation). " +
+            "Tools route to a specific VS instance based on session binding or X-VS-Workspace header. " +
+            "Use list_vs_instances to see available instances and select_vs_instance to bind.";
 
         /// <summary>判断 <paramref name="toolName"/> 是否是 Gateway 自处理的工具之一。</summary>
         public static bool IsGatewayTool(string? toolName) =>
@@ -23,10 +28,11 @@ namespace VsMcpGateway
             string.Equals(toolName, SelectInstanceName, StringComparison.Ordinal);
 
         // ─────────────────────── 本地 MCP 响应 ──────────────────────
+        // 以下响应构造方法已废弃——SDK 自动处理 initialize/tools-list。
+        // 临时删除 ToolSchema 引用；后续 SDK 重写完成后删除这些方法。
 
         /// <summary>
-        /// 构造 initialize 的 JSON-RPC 响应。Gateway 本地回答，不转发到 VS。
-        /// protocolVersion 与 MCP SDK 1.2.0 一致（"2025-06-18"）。
+        /// 构造 initialize 的 JSON-RPC 响应（临时实现）。
         /// </summary>
         public static string BuildInitializeResponse(object jsonRpcId)
         {
@@ -46,27 +52,23 @@ namespace VsMcpGateway
                         name = "vs-debugger-mcp",
                         version = ExtensionVersion.Current,
                     },
-                    instructions = ToolSchema.ServerInstructions,
+                    instructions = ServerInstructions,
                 },
             };
             return JsonSerializer.Serialize(resp);
         }
 
         /// <summary>
-        /// 构造 tools/list 的 JSON-RPC 响应。Gateway 本地回答，不转发到 VS。
-        /// 前置 gateway 工具（list_vs_instances / select_vs_instance），
-        /// 再追加 VS 工具（来自 ToolSchema.GetAllTools）。
+        /// 构造 tools/list 的 JSON-RPC 响应（临时实现——仅返回 gateway 工具）。
         /// </summary>
         public static string BuildToolsListResponse(object jsonRpcId, bool includeGoToDefinition, bool includeEvalCsharp)
         {
-            // 组合 gateway 工具 + VS 工具。gateway 工具在前，让 agent 先看到多路复用器。
             var allTools = new List<object>();
             allTools.Add(new
             {
                 name = ListInstancesName,
                 description = "Lists all running Visual Studio instances connected to the gateway. Returns PID, solution path, solution directory, and debugger state for each instance.",
                 inputSchema = new { type = "object", properties = new { }, required = new string[] { } },
-                annotations = new { readOnlyHint = true, destructiveHint = false },
             });
             allTools.Add(new
             {
@@ -78,9 +80,8 @@ namespace VsMcpGateway
                     properties = new { pid = new { type = "integer", description = "VS process ID to bind to" } },
                     required = new[] { "pid" },
                 },
-                annotations = new { readOnlyHint = false, destructiveHint = false },
             });
-            allTools.AddRange(ToolSchema.GetAllTools(includeGoToDefinition, includeEvalCsharp));
+            // TODO: SDK 重写后移除——SDK 自动生成完整工具列表
 
             var resp = new
             {

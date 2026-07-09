@@ -15,9 +15,11 @@ namespace VsMcpGateway
     /// 帧分派给对应的 pending 请求。这让 Gateway 能在一条 pipe 上转发多个在途
     /// 工具调用（每个 MCP 客户端会话一条），没有队头阻塞。
     ///
-    /// 读循环也识别 VS 推送的不带 id 的 CONTROL 帧（solution-changed /
-    /// heartbeat / debugger-state-changed）。每种控制帧有自己的可选回调；
-    /// 未识别的控制帧被忽略，所以新旧版本配对绝不会破坏流。
+    /// 读循环也识别 VS 推送的 tool-progress 帧（流式进度通知），通过 onProgress
+    /// 回调转发给 Gateway，再由 Gateway 发为 MCP notifications/message。
+    /// 也识别 VS 推送的不带 id 的 CONTROL 帧（solution-changed / heartbeat /
+    /// debugger-state-changed）。每种控制帧有自己的可选回调；未识别的控制帧
+    /// 被忽略，所以新旧版本配对绝不会破坏流。
     /// </summary>
     public sealed class PipeRouter : IDisposable, IAsyncDisposable
     {
@@ -162,6 +164,33 @@ namespace VsMcpGateway
                 if (!_pending.TryGetValue(id, out var pending))
                     continue; // 未知 id（过期/重复）——忽略
 
+                if (string.Equals(type, "tool-progress", StringComparison.Ordinal))
+                {
+                    // tool-progress 帧：流式进度通知，不结束 pending
+                    try
+                    {
+                        using (var doc = JsonDocument.Parse(json))
+                        {
+                            if (doc.RootElement.TryGetProperty("text", out var t))
+                            {
+                                string text = t.GetString() ?? "";
+                                if (pending.OnProgress != null)
+                                {
+                                    // fire-and-forget 调用 onProgress（不阻塞读循环）
+                                    _ = Task.Run(async () =>
+                                    {
+                                        try { await pending.OnProgress(text).ConfigureAwait(false); }
+                                        catch { /* onProgress 失败不影响主流程 */ }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    catch { /* 尽力解析 */ }
+                    // 不 TryRemove、不 TrySetResult——继续等 tool-result
+                    continue;
+                }
+
                 if (string.Equals(type, "tool-result", StringComparison.Ordinal))
                 {
                     try
@@ -206,6 +235,62 @@ namespace VsMcpGateway
             {
                 Id = id,
                 CompletionTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            };
+            _pending[id] = pending;
+
+            using var reg = ct.Register(() =>
+            {
+                pending.CompletionTcs.TrySetCanceled();
+                _pending.TryRemove(id, out _);
+            });
+
+            await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await PipeFraming.WriteFrameAsync(_stream, new PipeToolCall
+                {
+                    Id = id,
+                    Tool = toolName,
+                    Arguments = argumentsJson ?? "",
+                }, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+
+            try
+            {
+                await pending.CompletionTcs.Task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                throw new IOException("Pipe tool-call was canceled.");
+            }
+
+            return new PipeToolResultData(pending.Content, pending.IsError);
+        }
+
+        /// <summary>
+        /// 流式转发 tool 调用：支持 onProgress 回调接收 tool-progress 帧。
+        /// 用于 build_solution 等长任务，周期收到进度通知。
+        /// </summary>
+        public async Task<PipeToolResultData> CallToolStreamingAsync(
+            string toolName, string argumentsJson, Func<string, Task> onProgress, CancellationToken ct)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(PipeRouter));
+
+            string id = Guid.NewGuid().ToString("N");
+            var pending = new Pending
+            {
+                Id = id,
+                CompletionTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+                OnProgress = onProgress,
             };
             _pending[id] = pending;
 
@@ -297,6 +382,8 @@ namespace VsMcpGateway
             public string Content { get; set; } = "";
             public bool IsError { get; set; }
             public TaskCompletionSource<bool> CompletionTcs { get; set; } = new();
+            /// <summary>tool-progress 帧的回调（fire-and-forget，无 CancellationToken）。</summary>
+            public Func<string, Task>? OnProgress { get; set; }
         }
     }
 }

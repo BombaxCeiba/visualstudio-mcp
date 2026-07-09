@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- 独立 Gateway 进程，独占 :43210，作为所有 MCP 客户端的唯一入口。 -->
+    <!-- 独立 Gateway 进程，独占 :43210，作为所有 MCP 客户端的唯一入口。
+         核心包 ModelContextProtocol 1.2.0 目标 netstandard2.0，net48 可用。 -->
     <TargetFramework>net48</TargetFramework>
     <!-- WinExe: 不创建控制台窗口（CREATE_NO_WINDOW 的等价物），用户无感知。 -->
     <OutputType>WinExe</OutputType>
@@ -32,15 +33,15 @@
     <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
     <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
     <Compile Include="..\VsMcp.Common\ExtensionVersion.cs" Link="Common\ExtensionVersion.cs" />
-    <Compile Include="..\VsMcp.Common\ToolSchema.cs" Link="Common\ToolSchema.cs" />
+    <!-- ToolSchema.cs 已删除——SDK 反射 McpServerTool 委托签名自动生成 schema。 -->
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Gateway 端按帧 type 分派时解析 JSON，但绝不解析 JSON-RPC method（Wave 1
-         纯透传；method/session 路由是 Wave 2 的工作）。
-         Unlike VsMcp (which inherits VS host's System.Text.Json via codeBase),
-         the Gateway is an independent process and MUST carry its own
-         System.Text.Json copy for the bindingRedirects to redirect against. -->
+    <!-- 核心 MCP SDK（netstandard2.0，net48 可用）。StreamableHttpServerTransport
+         提供标准 MCP server 支持，SDK 自动处理 initialize/tools-list/ping/notification。 -->
+    <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
+    <!-- Gateway 独立进程，需要自己的 System.Text.Json 副本（与 VS host 的 codeBase 隔离）。
+         ModelContextProtocol 传递依赖此包，显式 pin 与 VS 同款。 -->
     <PackageReference Include="System.Text.Json" Version="10.0.9" />
   </ItemGroup>
 
