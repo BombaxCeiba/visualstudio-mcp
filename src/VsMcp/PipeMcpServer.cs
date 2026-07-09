@@ -13,8 +13,7 @@ namespace VsMcp
     /// <summary>
     /// VS 端的 NamedPipe 客户端端：主动连到 Gateway 监听的
     /// <c>\\.\pipe\vs-mcp-gateway</c>，连接建立后先发一帧 <see cref="PipeRegister"/>
-    /// （携带 PID + solution info），然后进入请求读循环，把收到的
-    /// <see cref="PipeRequest"/> 帧交给共享的 <see cref="McpRequestProcessor"/> 处理。
+    /// （携带 PID + solution info），然后进入请求读循环，处理收到的 tool-call 帧。
     ///
     /// Wave 2 反转了 Wave 1 的方向：Wave 1 里 VS 做 server（等 Gateway 连
     /// <c>vs-mcp-{pid}</c>），但多实例下 Gateway 无法枚举 PID 去反向连接每个 VS。
@@ -26,10 +25,10 @@ namespace VsMcp
     /// 写下字节交错而损坏协议。
     ///
     /// 连接循环：连 Gateway → 发 register → 服务请求直到断开 → 重连（Gateway
-    /// 抢占式重启后 VS 自动重新拨入）。客户端用 <see cref="PipeOptions.None"/> +
-    /// <c>Task.Run(() =&gt; Connect(timeout))</c> —— net48 上唯一不挂死的 client
-    /// 连接范式（Wave 1 已验证）。VS 端请求处理是串行的（读一帧、处理、回帧），
-    /// 无并发读写，故 None handle 安全。
+    /// 抢占式重启后 VS 自动重新拨入）。客户端用 <see cref="PipeOptions.Asynchronous"/> +
+    /// 异步 Connect/Read/Write —— net48 上唯一不挂死的 client
+    /// 连接范式（Wave 3 已验证）。VS 端请求处理是串行的（读一帧、处理、回帧），
+    /// 无并发读写，故 Asynchronous handle 安全。
     /// </summary>
     public sealed class PipeMcpServer : IAsyncDisposable, IDisposable
     {
