@@ -12,7 +12,6 @@ using EnvDTE80;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
-using ModelContextProtocol;
 
 namespace VsMcp
 {
@@ -28,6 +27,13 @@ namespace VsMcp
     {
         private const int MaxFrames = 50;
         private const int DefaultCharBudget = 1024;
+
+        // 环境变量 JSON 反序列化用的选项。原用 MCP SDK 的 McpJsonUtilities.DefaultOptions
+        //（camelCase + 默认 encoder），VS Package 去除 MCP SDK 依赖后改用本地等价选项。
+        private static readonly JsonSerializerOptions EnvVarOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        };
         // list_local_variables 返回 local 数量的上限，超过则标 Truncated——
         // 防止上千 local 的栈帧即便浅层模式也撑爆上下文。
         private const int DefaultLocalCap = 200;
@@ -540,7 +546,7 @@ namespace VsMcp
                 try
                 {
                     envVars = JsonSerializer.Deserialize<Dictionary<string, string>>(
-                        environmentVariablesJson!, McpJsonUtilities.DefaultOptions);
+                        environmentVariablesJson!, EnvVarOptions);
                 }
                 catch (Exception ex)
                 {

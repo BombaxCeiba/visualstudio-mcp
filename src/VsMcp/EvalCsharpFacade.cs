@@ -499,7 +499,7 @@ public class __EvalScript
             if (value == null) return "null";
             try
             {
-                var json = JsonSerializer.Serialize(value, value.GetType(), McpJson.ReadableOptions);
+                var json = JsonSerializer.Serialize(value, value.GetType(), SafeCall.ReadableOptions);
                 if (!string.IsNullOrEmpty(json) && json != "{}") return json;
             }
             catch { /* 复杂/循环对象序列化失败 —— fallback */ }

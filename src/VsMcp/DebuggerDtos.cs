@@ -6,8 +6,6 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using System.Threading;
 using System.Threading.Tasks;
-using ModelContextProtocol;
-using ModelContextProtocol.Protocol;
 
 // net48 polyfill：C# 编译器需要 System.Runtime.CompilerServices.IsExternalInit
 // 来合成 record 的 init-only 属性 setter。.NET Framework 4.8 不附带它；
@@ -20,48 +18,18 @@ namespace System.Runtime.CompilerServices
 namespace VsMcp
 {
     // ===========================================================================
-    // F-6 typed result DTOs. 工具成功结果经 SafeCall → McpJson.ToTextResult 用
-    // McpJson.ReadableOptions（宽松编码器，不转义中文）序列化进 TextContentBlock；
-    // 错误结果（ErrorResult）同样走 ReadableOptions。不再使用 SDK 的
-    // McpJsonUtilities.DefaultOptions —— 其 Encoder 为 null，会把中文等非 ASCII
-    // 转义成 \uXXXX，模型最终收到的是字面转义串而非可读文本。
-    // 之前手写的 JSON 层（EscapeJson/SerializeError 等）已在 DebuggerFacade.cs
-    // 中删除——这些 record 全盘取代了它。
+    // F-6 typed result DTOs. 工具成功结果经 SafeCall.Wrap 用 ReadableOptions
+    //（宽松编码器，不转义中文）序列化为 JSON 文本包进 ToolResult；错误结果
+    //（ErrorResult）同样走 ReadableOptions。VS Package 不再依赖 MCP SDK 类型
+    //（CallToolResult/TextContentBlock 等），ToolResult 是本地等价物。
     // ===========================================================================
 
     /// <summary>
-    /// 可读 JSON 序列化基础设施。MCP SDK 的 <see cref="McpJsonUtilities"/>.DefaultOptions
-    /// 其 Encoder 为 null（等价 <see cref="JavaScriptEncoder"/>.Default），会把非 ASCII
-    /// 字符（中文等）和引号转义为 \uXXXX；而 SDK 把工具返回的 DTO 自动序列化进
-    /// <see cref="TextContentBlock.Text"/> 时正用该 DefaultOptions，导致模型最终收到字面
-    /// 的转义串（生成 而非可读的"生成"）。该 DefaultOptions 只读且 getter 返回的实例
-    /// 已被冻结、<see cref="McpServerOptions"/> 也无 JSON 注入点，无法在 SDK 层替换 ——
-    /// 故工具成功结果统一经 <see cref="ToTextResult"/> 用本类的宽松选项序列化后包成
-    /// <see cref="CallToolResult"/> 返回（SDK 对 CallToolResult 原样透传）。最外层 wire
-    /// 上中文会被 SDK 的 DefaultOptions 合法转义为 \uXXXX，客户端 JSON 解码后还原为真实
-    /// 字符，模型看到可读文本。
+    /// 工具执行结果。Content 是文本（JSON 序列化的 DTO 或纯文本），
+    /// IsError=true 时 Content 是错误 JSON。对应 MCP result.content[0].text
+    /// + result.isError，由 Gateway 侧组装成 JSON-RPC 响应。
     /// </summary>
-    internal static class McpJson
-    {
-        /// <summary>宽松编码器：不转义非 ASCII（中文等）与 HTML 敏感字符。MCP 的
-        /// JSON-RPC 由客户端 JSON 解析器消费，非嵌入 HTML，故 UnsafeRelaxed 的 XSS
-        /// 风险在此场景不适用。</summary>
-        public static JsonSerializerOptions ReadableOptions { get; } = new(JsonSerializerDefaults.Web)
-        {
-            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        };
-
-        /// <summary>把任意 DTO 用 <see cref="ReadableOptions"/> 序列化进单个
-        /// <see cref="TextContentBlock"/> 的 <see cref="CallToolResult"/>。供 SafeCall
-        /// 成功路径与 <see cref="ErrorResult.ToCallToolResult"/> 复用。</summary>
-        public static CallToolResult ToTextResult<T>(T dto) => new()
-        {
-            Content = new List<ContentBlock>
-            {
-                new TextContentBlock { Text = JsonSerializer.Serialize(dto, ReadableOptions) },
-            },
-        };
-    }
+    public sealed record ToolResult(string Content, bool IsError = false);
 
     /// <summary><c>get_debugger_state</c> 的结果。</summary>
     public sealed record DebuggerStateResult(string State);
@@ -209,23 +177,6 @@ namespace VsMcp
         string? File = null,
         string? LoadedSolution = null)
     {
-        /// <summary>
-        /// 构建一个 MCP 规范的 <see cref="CallToolResult"/>，其
-        /// <see cref="CallToolResult.IsError"/> = true，含单个
-        /// <see cref="TextContentBlock"/>，文本为该 ErrorResult 经
-        /// <see cref="McpJson.ReadableOptions"/> 序列化的结果。
-        /// </summary>
-        public CallToolResult ToCallToolResult() => new()
-        {
-            IsError = true,
-            Content = new List<ContentBlock>
-            {
-                new TextContentBlock
-                {
-                    Text = JsonSerializer.Serialize(this, McpJson.ReadableOptions)
-                }
-            },
-        };
     }
 
     // ===========================================================================
@@ -276,76 +227,70 @@ namespace VsMcp
     }
 
     // ===========================================================================
-    // SafeCall——唯一的错误路由边界。每个调用 facade 的工具 lambda 注册到
-    // MCP SDK 时都经此包装，使 facade 异常成为
-    // CallToolResult{IsError=true}+ErrorResult。
+    // SafeCall——唯一的错误路由边界。每个调用 facade 的工具方法经此包装，
+    // 使 facade 异常成为 ToolResult{IsError=true}+ErrorResult JSON。
     // OperationCanceledException 原样重抛：它表示关停，绝不能被吞进错误响应。
     // ===========================================================================
 
     /// <summary>
-    /// 将 facade 异常路由进 D-12 结构化错误契约，并经
-    /// <see cref="McpJson.ToTextResult"/> 包装每个成功结果，使 LLM 看到可读的
-    /// （未转义的）JSON。放宽的 <c>Task&lt;object&gt;</c> 返回类型满足 MCP SDK
-    /// 的工具调用契约：成功与错误路径都产出 <see cref="CallToolResult"/>，SDK
-    /// 原样返回（REMEDIATION fact #7），而非经转义中文的
-    /// <c>McpJsonUtilities.DefaultOptions</c> 重新序列化。
+    /// 将 facade 异常路由进 D-12 结构化错误契约，并用宽松编码器序列化每个
+    /// 成功结果，使 LLM 看到可读的（未转义的）JSON。成功与错误路径都产出
+    /// <see cref="ToolResult"/>，由 ToolExecutor 经 pipe 帧返回给 Gateway。
     /// </summary>
     public static class SafeCall
     {
-        /// <summary>工具回复日志：若设置，每次 Wrap 返回前把 CallToolResult 的文本内容
+        /// <summary>工具回复日志：若设置，每次 Wrap 返回前把 ToolResult 的文本内容
         /// 打到这里（VS Output "VS MCP" 面板），便于即时观察 agent 实际收到的回复。由
-        /// <see cref="McpRequestProcessor"/> 构造时注入。静态：VS 进程内通常一个 processor。</summary>
+        /// <see cref="ToolExecutor"/> 构造时注入。静态：VS 进程内通常一个 executor。</summary>
         internal static ILogger? ReplyLogger;
 
-#pragma warning disable VSTHRD200 // "Wrap"/"WrapText" 是 REMEDIATION/PATTERNS/plan 中确立的名称；调用方把结果 Task 交给 MCP SDK 且从不直接 await，故 "Async" 后缀会误导。
-        public static async Task<object> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
+        /// <summary>宽松编码器：不转义非 ASCII（中文等）与 HTML 敏感字符。MCP 的
+        /// JSON-RPC 由客户端 JSON 解析器消费，非嵌入 HTML，故 UnsafeRelaxed 的 XSS
+        /// 风险在此场景不适用。CamelCase 命名策略与 MCP SDK 默认一致。</summary>
+        internal static JsonSerializerOptions ReadableOptions { get; } = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+
+#pragma warning disable VSTHRD200 // "Wrap"/"WrapText" 是历史确立的名称；调用方把结果 Task 交给 ToolExecutor 且从不直接 await，故 "Async" 后缀会误导。
+        public static async Task<ToolResult> Wrap<T>(Func<Task<T>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {
-            CallToolResult result;
             try
             {
-                // 用宽松编码器把 DTO 序列化进 CallToolResult 返回，绕过 SDK 对 DTO 的
-                // 自动序列化（它用转义中文的 McpJsonUtilities.DefaultOptions）。SDK 对
-                // CallToolResult 原样透传；最外层 wire 上的合法 \uXXXX 转义由客户端 JSON
-                // 解码还原为真实字符。详见 McpJson。
                 T r = await work().ConfigureAwait(false);
-                result = McpJson.ToTextResult(r);
+                string json = JsonSerializer.Serialize(r, ReadableOptions);
+                return LogReply(new ToolResult(json, false));
             }
             catch (OperationCanceledException)
             {
                 // 关停信号——透明重抛。绝不能转为 ErrorResult
-                // （会把取消掩盖为工具失败，并混淆 SDK 的拆除路径）。
+                // （会把取消掩盖为工具失败）。
                 throw;
             }
             catch (Exception ex)
             {
-                result = ToErrorResult(ex).ToCallToolResult();
+                var err = ToErrorResult(ex);
+                return LogReply(new ToolResult(JsonSerializer.Serialize(err, ReadableOptions), true));
             }
-            LogReply(result);
-            return result;
         }
 
         /// <summary>
         /// 纯文本返回路径的包装：与 <see cref="Wrap{T}"/> 完全相同的错误边界与
         /// 回复日志（<see cref="LogReply"/>），但成功路径不做 JSON 序列化——
-        /// 直接把 facade 返回的 string 包进单个 <see cref="TextContentBlock"/>。
+        /// 直接把 facade 返回的 string 包进 ToolResult。
         /// 供返回日志、调用栈、变量值等"阅读型"内容的工具使用，避免 JSON 包裹
-        /// 导致的换行/引号转义与 token 浪费（与 find_symbol 同一动机）。错误路径
-        /// 与 Wrap 一致：facade 抛出的类型化异常经 <see cref="ToErrorResult"/> 转
-        /// 成 IsError=true 的 ErrorResult，回复仍照常记进 VS Output 面板。
+        /// 导致的换行/引号转义与 token 浪费。错误路径与 Wrap 一致。
         /// </summary>
-#pragma warning disable VSTHRD200 // 同 Wrap：结果 Task 交给 MCP SDK，从不直接 await。
-        public static async Task<object> WrapText(Func<Task<string>> work, CancellationToken ct)
+#pragma warning disable VSTHRD200 // 同 Wrap：结果 Task 交给 ToolExecutor，从不直接 await。
+        public static async Task<ToolResult> WrapText(Func<Task<string>> work, CancellationToken ct)
 #pragma warning restore VSTHRD200
         {
-            CallToolResult result;
             try
             {
                 string text = await work().ConfigureAwait(false);
-                result = new CallToolResult
-                {
-                    Content = new List<ContentBlock> { new TextContentBlock { Text = text } },
-                };
+                return LogReply(new ToolResult(text, false));
             }
             catch (OperationCanceledException)
             {
@@ -354,10 +299,9 @@ namespace VsMcp
             }
             catch (Exception ex)
             {
-                result = ToErrorResult(ex).ToCallToolResult();
+                var err = ToErrorResult(ex);
+                return LogReply(new ToolResult(JsonSerializer.Serialize(err, ReadableOptions), true));
             }
-            LogReply(result);
-            return result;
         }
 
         /// <summary>
@@ -389,40 +333,29 @@ namespace VsMcp
             }
         }
 
-        /// <summary>给手动构造 <see cref="CallToolResult"/> 的工具用的回复日志入口：
-        /// find_symbol 返回纯文本 CallToolResult、不经 <see cref="Wrap{T}"/>，故 Wrap 末尾的
-        /// <see cref="LogReply"/> 不会被触发；调本方法补记一次，保证所有工具的回复都打到面板。
-        /// 记录后原样返回 result。</summary>
-        internal static CallToolResult LogAndReturn(CallToolResult result)
-        {
-            LogReply(result);
-            return result;
-        }
-
-        /// <summary>把 CallToolResult 的 text content 打到 <see cref="ReplyLogger"/>（VS Output
+        /// <summary>把 ToolResult 的 Content 打到 <see cref="ReplyLogger"/>（VS Output
         /// 窗口 "VS MCP" 面板），方便即时观察 agent 收到的回复。原样打印，绝不截断——
-        /// 面板看到的必须和 agent 收到的完全一致。打印异常绝不影响返回。</summary>
-        private static void LogReply(CallToolResult result)
+        /// 面板看到的必须和 agent 收到的完全一致。打印异常绝不影响返回。
+        /// 返回原 result 供调用方链式使用。internal 让 ToolExecutor 的 find_symbol
+        /// 路径（不经 Wrap/WrapText）也能复用同一日志入口。</summary>
+        internal static ToolResult LogReply(ToolResult result)
         {
             var logger = ReplyLogger;
-            if (logger == null) return;
+            if (logger == null) return result;
             try
             {
-                var sb = new StringBuilder();
-                foreach (var c in result.Content)
+                if (!string.IsNullOrEmpty(result.Content))
                 {
-                    if (c is TextContentBlock t && !string.IsNullOrEmpty(t.Text))
-                        sb.Append(t.Text);
+                    // 原样打印，绝不截断——面板看到的必须和 agent 收到的完全一致，
+                    // 否则失去"立即观察 agent 实际收到的内容"的意义。
+                    logger.LogInformation("← MCP 回复：\n{text}", result.Content);
                 }
-                if (sb.Length == 0) return;
-                // 原样打印，绝不截断——面板看到的必须和 agent 收到的完全一致，
-                // 否则失去"立即观察 agent 实际收到的内容"的意义。
-                logger.LogInformation("← MCP 回复：\n{text}", sb.ToString());
             }
             catch
             {
                 // 打印绝不能影响工具返回路径
             }
+            return result;
         }
     }
 }

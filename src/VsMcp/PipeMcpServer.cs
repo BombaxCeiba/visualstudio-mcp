@@ -2,11 +2,10 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using ModelContextProtocol;
-using ModelContextProtocol.Protocol;
 using VsMcp.Common;
 
 namespace VsMcp
@@ -45,7 +44,7 @@ namespace VsMcp
 
         private readonly int _pid;
         private readonly DebuggerFacade? _facade;
-        private readonly McpRequestProcessor _processor;
+        private readonly ToolExecutor _executor;
         private readonly ILoggerFactory? _loggerFactory;
 
         private CancellationTokenSource? _loopCts;
@@ -110,7 +109,7 @@ namespace VsMcp
             _pid = pid;
             _facade = facade;
             _loggerFactory = loggerFactory;
-            _processor = new McpRequestProcessor(callerToken, facade, symbolFacade,
+            _executor = new ToolExecutor(facade, symbolFacade,
 #if EVAL_CSHARP
                 evalFacade,
 #endif
@@ -414,7 +413,7 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// 服务一个 Gateway 连接：读帧循环，按 type 分派。只处理 <c>request</c>；
+        /// 服务一个 Gateway 连接：读帧循环，按 type 分派。只处理 <c>tool-call</c>；
         /// 未知帧类型被忽略以保持向前兼容。循环在干净断开（ReadFrameJson 返回
         /// null）或 shutdown 时退出，交还控制权给 ConnectLoop 等待重连。
         /// </summary>
@@ -447,174 +446,81 @@ namespace VsMcp
                 string type;
                 try
                 {
-                    using (var doc = System.Text.Json.JsonDocument.Parse(json))
+                    using (var doc = JsonDocument.Parse(json))
                     {
                         type = doc.RootElement.TryGetProperty("type", out var t) ? (t.GetString() ?? "") : "";
                     }
                 }
-                catch (System.Text.Json.JsonException)
+                catch (JsonException)
                 {
                     // 帧格式错误 —— 跳过它而非拆除连接。
                     continue;
                 }
 
-                if (string.Equals(type, "request", StringComparison.Ordinal))
+                if (string.Equals(type, "tool-call", StringComparison.Ordinal))
                 {
-                    PipeRequest? req;
-                    try { req = System.Text.Json.JsonSerializer.Deserialize<PipeRequest>(json, PipeFraming.Options); }
-                    catch (System.Text.Json.JsonException) { continue; }
+                    PipeToolCall? call;
+                    try { call = JsonSerializer.Deserialize<PipeToolCall>(json, PipeFraming.Options); }
+                    catch (JsonException) { continue; }
 
-                    if (req != null)
+                    if (call != null)
                     {
-                        // 记录每条入站 MCP 请求体，使连接/调用问题能在 VS 输出窗口
-                        // 可见 —— 包的 logger factory 运行在 Information 级别。
                         _loggerFactory?.CreateLogger<PipeMcpServer>()
-                            ?.LogInformation("MCP request {Id}: {Body}", req.Id, req.Body);
-                        await HandleRequestAsync(pipe, req, ct).ConfigureAwait(false);
+                            ?.LogInformation("tool-call {Id}: {Tool}", call.Id, call.Tool);
+                        await HandleToolCallAsync(call, ct).ConfigureAwait(false);
                     }
                 }
-                // 其他帧类型（register 回显 / heartbeat）被静默忽略，这样新老对端
-                // 配对绝不会打断流。
+                // 其他帧类型（register 回显 / heartbeat / 旧 request 帧）被静默忽略，
+                // 这样新老对端配对绝不会打断流。
             }
         }
 
         /// <summary>
-        /// 处理一条转发请求：发 head → 处理 JSON-RPC（SSE 经 chunkSink 实时封帧）→ 发 end。
-        /// head 中的状态码反映 body 是否可解析。
+        /// 处理一条 tool-call：调 ToolExecutor 执行工具，发回 tool-result 帧。
+        /// Arguments 是 MCP 原始参数 JSON，JsonDocument.Parse 后取 RootElement 传入。
         /// </summary>
-        private async Task HandleRequestAsync(NamedPipeClientStream pipe, PipeRequest req, CancellationToken ct)
+        private async Task HandleToolCallAsync(PipeToolCall call, CancellationToken ct)
         {
-            JsonRpcMessage? message = null;
-            bool parsed = true;
+            ToolResult result;
             try
             {
-                message = System.Text.Json.JsonSerializer.Deserialize<JsonRpcMessage>(req.Body, McpJsonUtilities.DefaultOptions);
-                if (message == null) parsed = false;
-            }
-            catch (System.Text.Json.JsonException)
-            {
-                parsed = false;
-            }
-
-            var head = new PipeResponseHead
-            {
-                Id = req.Id,
-                Status = parsed ? 200 : 400,
-                Headers =
+                JsonElement args;
+                if (!string.IsNullOrEmpty(call.Arguments))
                 {
-                    ["Content-Type"] = "text/event-stream",
-                    ["Cache-Control"] = "no-cache",
-                },
-            };
-            await WriteLockedAsync(head, ct).ConfigureAwait(false);
+                    using var doc = JsonDocument.Parse(call.Arguments);
+                    args = JsonSerializer.Deserialize<JsonElement>(doc.RootElement.GetRawText());
+                }
+                else
+                {
+                    args = JsonSerializer.Deserialize<JsonElement>("{}");
+                }
 
-            // chunkSink 把每次 SDK SSE 写入转成实时 data 帧，使 build_solution 的
-            // 保活通知不经缓冲即到达客户端。在这里创建（而不仅在解析成功路径），
-            // 以便下面的响应日志在两个分支都有有效的字节计数。
-            var sink = new PipeChunkSink(this, req.Id);
-
-            if (!parsed)
-            {
-                await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
-                LogResponse(req.Id, head.Status, sink.WrittenBytes);
-                return;
-            }
-
-            try
-            {
-                await _processor.HandleAsync(message!, sink, ct).ConfigureAwait(false);
+                result = await _executor.ExecuteAsync(call.Tool, args, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                // 调用中途停机 —— 发出 end 让 Gateway 干净地拆除。
+                // 调用中途停机——发错误 result 让 Gateway 解除等待。
+                result = new ToolResult("{\"error\":\"cancelled\",\"message\":\"tool execution cancelled\"}", true);
             }
             catch (Exception ex)
             {
-                // 工具级异常已在处理器内部（SafeCall）转成 error 结果；走到这里说明
-                // 是传输层故障。
+                // 传输层故障（参数解析失败等）——工具级异常已在 ToolExecutor 内部转为 error ToolResult。
                 _loggerFactory?.CreateLogger<PipeMcpServer>()
-                    ?.LogError(ex, "Unexpected error handling pipe request {Id}", req.Id);
+                    ?.LogError(ex, "Unexpected error handling tool-call {Id}", call.Id);
+                var err = new ErrorResult("internal_error", ex.Message);
+                result = new ToolResult(JsonSerializer.Serialize(err, SafeCall.ReadableOptions), true);
             }
 
-            await WriteLockedAsync(new PipeEnd { Id = req.Id }, ct).ConfigureAwait(false);
-            LogResponse(req.Id, head.Status, sink.WrittenBytes);
+            await WriteLockedAsync(new PipeToolResult
+            {
+                Id = call.Id,
+                Content = result.Content,
+                IsError = result.IsError,
+            }, ct).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// 记录每次调用的响应摘要。抽出此方法，使 <see cref="HandleRequestAsync"/> 中
-        /// 的解析成功与解析失败两条路径都输出一行响应，给每个请求一条配对的响应轨迹。
-        /// </summary>
-        private void LogResponse(string id, int status, long bytes)
-        {
-            // 响应摘要：SSE body 以分片形式流式写入 sink，因此记录聚合字节数 + HTTP
-            // 状态，而非每个分片。这与 ServeConnectionAsync 中的请求日志配对，在 VS
-            // 输出窗口给出每次调用的轨迹。
-            _loggerFactory?.CreateLogger<PipeMcpServer>()
-                ?.LogInformation("MCP response {Id}: status {Status}, body bytes {Bytes}", id, status, bytes);
-        }
-
-        /// <summary>
-        /// 把 SDK 写入的 SSE 字节流实时转成 <see cref="PipeDataChunk"/> 帧的适配 Stream。
-        /// 每次写入立即封帧发出（不缓冲），保证长任务的保活通知不被吞掉。字节以 base64
-        /// 承载，规避 SDK 任意写入粒度下 UTF-8 多字节字符跨块边界的解码问题。
-        /// 写入经所属 <see cref="PipeMcpServer.WriteLocked(object)"/> 串行化，与
-        /// solution-changed 推送互不交错。
-        /// </summary>
-        private sealed class PipeChunkSink : Stream
-        {
-            private readonly PipeMcpServer _owner;
-            private readonly string _id;
-
-            // 统计 SDK 写入的原始（base64 前）body 字节数，以便 HandleRequestAsync
-            // 按每次 MCP 调用记录响应大小摘要。SSE 响应以分片流式传输；记录总字节数
-            // （而非分片）给出一个有意义的数字。
-            private long _written;
-
-            public PipeChunkSink(PipeMcpServer owner, string id)
-            {
-                _owner = owner;
-                _id = id;
-            }
-
-            /// <summary>流经此 sink 的原始 body 总字节数。</summary>
-            public long WrittenBytes => Interlocked.Read(ref _written);
-
-            public override bool CanRead => false;
-            public override bool CanSeek => false;
-            public override bool CanWrite => true;
-            public override long Length => throw new NotSupportedException();
-            public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-            public override void Flush() { }
-            public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-            public override void SetLength(long value) => throw new NotSupportedException();
-
-            public override void Write(byte[] buffer, int offset, int count)
-            {
-                if (count <= 0) return;
-                _owner.WriteLocked(new PipeDataChunk
-                {
-                    Id = _id,
-                    Body = Convert.ToBase64String(buffer, offset, count),
-                });
-                Interlocked.Add(ref _written, count);
-            }
-
-            public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-            {
-                if (count <= 0) return;
-                await _owner.WriteLockedAsync(new PipeDataChunk
-                {
-                    Id = _id,
-                    Body = Convert.ToBase64String(buffer, offset, count),
-                }, cancellationToken).ConfigureAwait(false);
-                Interlocked.Add(ref _written, count);
-            }
-        }
-
-        /// <summary>
-        /// 同步停机入口：翻转 _disposed、取消连接循环，fire-and-forget 异步销毁。
+        /// 同步停机入口：翻转 _disposed、取消连接循环。
         /// 绝不阻塞调用线程（VS exit 时 package 同步调用此路径）。
         /// </summary>
         public void Dispose()
@@ -624,12 +530,11 @@ namespace VsMcp
             _disposed = true;
 
             try { _loopCts?.Cancel(); } catch (ObjectDisposedException) { }
-            try { _processor.Dispose(); } catch { /* 停机期间绝不能抛异常 */ }
         }
 
         /// <summary>
-        /// 异步停机：取消连接循环 → 观察循环退出 → dispose 处理器（SDK loop + transport）。
-        /// 幂等（_disposeLock + _disposed）。
+        /// 异步停机：取消连接循环 → 观察循环退出。
+        /// 幂等（_disposeLock + _disposed）。ToolExecutor 无需 Dispose（无托管资源）。
         /// </summary>
         public async ValueTask DisposeAsync()
         {
@@ -653,9 +558,6 @@ namespace VsMcp
                     catch { /* 停机期间绝不能抛异常 */ }
 #pragma warning restore VSTHRD003
                 }
-
-                try { await _processor.DisposeAsync().ConfigureAwait(false); }
-                catch { /* 停机期间绝不能抛异常 */ }
 
                 _loopCts?.Dispose();
             }
