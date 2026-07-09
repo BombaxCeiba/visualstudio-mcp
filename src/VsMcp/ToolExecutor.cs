@@ -13,8 +13,7 @@ namespace VsMcp
     /// Gateway 发来 tool-call 帧，PipeMcpServer 调本类执行后回 tool-result 帧。
     ///
     /// 方法体从 McpRequestProcessor 搬过来，但：
-    /// - 去掉 McpServer 参数（keep-alive 通知全删，长任务一次性返回结果）。
-    /// - 去掉 KeepAliveNotifier 用法。
+    /// - 去掉 McpServer 参数（keep-alive 通知通过 onProgress 委托回调）。
     /// - 参数从 JsonElement args 读取（args.TryGetProperty）。
     /// </summary>
     public sealed class ToolExecutor
@@ -58,9 +57,14 @@ namespace VsMcp
         /// <summary>
         /// 按工具名分派执行。args 是 MCP params.arguments 的 JsonElement
         ///（Gateway 透传 GetRawText()，VS 端 JsonDocument.Parse 后传入）。
+        /// onProgress 为非 null 时，长工具执行期间周期调用它推送进度文本（如 build log）。
         /// 返回 ToolResult（Content 是文本/JSON，IsError 标记错误）。
         /// </summary>
-        public async Task<ToolResult> ExecuteAsync(string toolName, JsonElement args, CancellationToken ct)
+        public async Task<ToolResult> ExecuteAsync(
+            string toolName,
+            JsonElement args,
+            Func<string, CancellationToken, Task>? onProgress,
+            CancellationToken ct)
         {
             try
             {
@@ -123,8 +127,9 @@ namespace VsMcp
 
                     case "build_solution":
                         if (_facade == null) goto NotFound;
-                        // 保活通知已删除（无 McpServer），构建期间不再流式推送日志。
-                        return await SafeCall.Wrap(() => _facade.BuildSolutionAsync(ct), ct).ConfigureAwait(false);
+                        return onProgress != null
+                            ? await RunBuildWithKeepAliveAsync(onProgress, ct).ConfigureAwait(false)
+                            : await SafeCall.Wrap(() => _facade.BuildSolutionAsync(ct), ct).ConfigureAwait(false);
 
                     case "get_build_output":
                         if (_facade == null) goto NotFound;
@@ -139,7 +144,8 @@ namespace VsMcp
                         {
                             bool waitForBreak = GetOptionalBool(args, "waitForBreak", false);
                             int timeoutSeconds = GetOptionalInt(args, "timeoutSeconds", 0);
-                            // 保活通知已删除（无 McpServer），wait_for_break=true 时不再流式推送心跳。
+                            if (waitForBreak && onProgress != null)
+                                return await RunContinueWithKeepAliveAsync(timeoutSeconds, onProgress, ct).ConfigureAwait(false);
                             return await SafeCall.Wrap(() => _facade.ContinueExecutionAsync(waitForBreak, timeoutSeconds, ct), ct).ConfigureAwait(false);
                         }
 
@@ -232,7 +238,8 @@ namespace VsMcp
                             string direction = GetOptionalString(args, "direction") ?? "callees";
                             int maxResults = GetOptionalInt(args, "maxResults", 50);
                             int timeoutSeconds = GetOptionalInt(args, "timeoutSeconds", 180);
-                            // 保活通知已删除（无 McpServer），callers 反向搜索期间不再流式推送心跳。
+                            if (onProgress != null && direction == "callers")
+                                return await RunCallGraphWithKeepAliveAsync(query, direction, maxResults, timeoutSeconds, onProgress, ct).ConfigureAwait(false);
                             return await SafeCall.Wrap(() => _symbolFacade.GetCallGraphAsync(query, direction, maxResults, timeoutSeconds, ct), ct).ConfigureAwait(false);
                         }
 
@@ -276,6 +283,72 @@ namespace VsMcp
 
         NotFound:
             return ToolNotAvailable(toolName, "the required facade is not initialized.");
+        }
+
+        /// <summary>
+        /// 带 KeepAliveNotifier 的 build_solution：周期读取增量 build log
+        /// 并通过 onProgress 推送给客户端。
+        /// </summary>
+        private async Task<ToolResult> RunBuildWithKeepAliveAsync(
+            Func<string, CancellationToken, Task> onProgress,
+            CancellationToken ct)
+        {
+            if (_facade == null) return ToolNotAvailable("build_solution", "facade not initialized.");
+
+            int nextLine = 0;
+            using var notifier = new KeepAliveNotifier(
+                async token =>
+                {
+                    var delta = await _facade.GetBuildOutputDeltaAsync(nextLine, token).ConfigureAwait(false);
+                    nextLine = delta.TotalLines;
+                    foreach (var line in delta.NewLines)
+                        await onProgress(line, token).ConfigureAwait(false);
+                },
+                TimeSpan.FromSeconds(2),
+                ct);
+
+            return await SafeCall.Wrap(() => _facade.BuildSolutionAsync(ct), ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// 带 KeepAliveNotifier 的 continue_execution（waitForBreak=true）：
+        /// 周期发送保活心跳。
+        /// </summary>
+        private async Task<ToolResult> RunContinueWithKeepAliveAsync(
+            int timeoutSeconds,
+            Func<string, CancellationToken, Task> onProgress,
+            CancellationToken ct)
+        {
+            if (_facade == null) return ToolNotAvailable("continue_execution", "facade not initialized.");
+
+            using var notifier = new KeepAliveNotifier(
+                token => onProgress("Continuing execution...", token),
+                TimeSpan.FromSeconds(10),
+                ct);
+
+            return await SafeCall.Wrap(() => _facade.ContinueExecutionAsync(waitForBreak: true, timeoutSeconds, ct), ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// 带 KeepAliveNotifier 的 get_call_graph（callers 反向搜索）：
+        /// 周期发送保活心跳。
+        /// </summary>
+        private async Task<ToolResult> RunCallGraphWithKeepAliveAsync(
+            string query,
+            string direction,
+            int maxResults,
+            int timeoutSeconds,
+            Func<string, CancellationToken, Task> onProgress,
+            CancellationToken ct)
+        {
+            if (_symbolFacade == null) return ToolNotAvailable("get_call_graph", "symbol facade not initialized.");
+
+            using var notifier = new KeepAliveNotifier(
+                token => onProgress("Searching call graph...", token),
+                TimeSpan.FromSeconds(10),
+                ct);
+
+            return await SafeCall.Wrap(() => _symbolFacade.GetCallGraphAsync(query, direction, maxResults, timeoutSeconds, ct), ct).ConfigureAwait(false);
         }
 
         /// <summary>构造"工具不可用"错误 ToolResult。</summary>

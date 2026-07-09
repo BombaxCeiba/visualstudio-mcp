@@ -477,6 +477,7 @@ namespace VsMcp
         /// <summary>
         /// 处理一条 tool-call：调 ToolExecutor 执行工具，发回 tool-result 帧。
         /// Arguments 是 MCP 原始参数 JSON，JsonDocument.Parse 后取 RootElement 传入。
+        /// 执行期间通过 onProgress 回调发送 PipeToolProgress 帧（如 build log）。
         /// </summary>
         private async Task HandleToolCallAsync(PipeToolCall call, CancellationToken ct)
         {
@@ -494,7 +495,13 @@ namespace VsMcp
                     args = JsonSerializer.Deserialize<JsonElement>("{}");
                 }
 
-                result = await _executor.ExecuteAsync(call.Tool, args, ct).ConfigureAwait(false);
+                // 构造 onProgress 回调，写 PipeToolProgress 帧到 pipe
+                Func<string, CancellationToken, Task> onProgress = async (text, token) =>
+                {
+                    await WriteLockedAsync(new PipeToolProgress { Id = call.Id, Text = text }, token).ConfigureAwait(false);
+                };
+
+                result = await _executor.ExecuteAsync(call.Tool, args, onProgress, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
