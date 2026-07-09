@@ -281,13 +281,22 @@ namespace VsMcpGateway
                 }
                 GatewayLogger.Log($"REQ {method} session={clientSessionId ?? "<none>"} workspace={workspaceHeader ?? "<none>"}");
 
+                // notification（无 id）直接 202，不转发到 VS。
+                object? jsonRpcId = TryGetJsonRpcId(body);
+                if (jsonRpcId == null)
+                {
+                    ctx.Response.StatusCode = 202;
+                    ctx.Response.Close();
+                    return;
+                }
+
                 if (string.Equals(method, "initialize", StringComparison.Ordinal))
                 {
-                    await HandleInitializeAsync(ctx, body, headers, workspaceHeader, ct).ConfigureAwait(false);
+                    await HandleInitializeAsync(ctx, body, workspaceHeader, ct).ConfigureAwait(false);
                 }
                 else if (string.Equals(method, "tools/list", StringComparison.Ordinal))
                 {
-                    await HandleToolsListAsync(ctx, body, headers, clientSessionId, workspaceHeader, ct).ConfigureAwait(false);
+                    await HandleToolsListAsync(ctx, body, clientSessionId, ct).ConfigureAwait(false);
                 }
                 else if (string.Equals(method, "tools/call", StringComparison.Ordinal) &&
                          TryGetToolName(body, out string? toolName) &&
@@ -295,9 +304,17 @@ namespace VsMcpGateway
                 {
                     await HandleGatewayToolCallAsync(ctx, body, clientSessionId, toolName!).ConfigureAwait(false);
                 }
+                else if (string.Equals(method, "tools/call", StringComparison.Ordinal))
+                {
+                    await HandleForwardAsync(ctx, body, clientSessionId, workspaceHeader, ct).ConfigureAwait(false);
+                }
+                else if (string.Equals(method, "ping", StringComparison.Ordinal))
+                {
+                    await WriteSimpleResultAsync(ctx, body, new { }).ConfigureAwait(false);
+                }
                 else
                 {
-                    await HandleForwardAsync(ctx, body, headers, clientSessionId, workspaceHeader, ct).ConfigureAwait(false);
+                    await WriteJsonRpcErrorAsync(ctx, body, -32601, $"Method not found: {method}").ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -313,15 +330,12 @@ namespace VsMcpGateway
 
         /// <summary>
         /// initialize：通过优先级链（<c>_meta.vsPid</c> &gt; ① Header 唯一 &gt;
-        /// 单实例 fallback）解析目标 VS，转发时剥掉客户端的 Mcp-Session-Id（让
-        /// VS 分配自己的），从 head 帧捕获 VS 的 Mcp-Session-Id，并记录绑定。
-        /// VS 分配的 id 同步写入 InstanceEntry（每个 VS 的权威来源——设计文档
-        /// §Solution 信息动态更新），让无状态的 ① Header 层之后能恢复它。单实例
-        /// fallback 视为自动绑定（Source="auto"，HintPending=true）；显式的
-        /// <c>_meta.vsPid</c> 或 ① Header 匹配是刻意绑定（HintPending=false）。
+        /// 单实例 fallback）解析目标 VS，本地构造 initialize 响应（不转发到 VS）。
+        /// Gateway 自己分配 Mcp-Session-Id，不再从 VS head 帧捕获。单实例
+        /// fallback 视为自动绑定（Source="auto"，HintPending=true）。
         /// </summary>
         private static async Task HandleInitializeAsync(
-            HttpListenerContext ctx, string body, IDictionary<string, string> headers,
+            HttpListenerContext ctx, string body,
             string? workspaceHeader, CancellationToken ct)
         {
             int? vsPid = TryGetMetaVsPid(body);
@@ -329,9 +343,6 @@ namespace VsMcpGateway
 
             if (!vsPid.HasValue && !string.IsNullOrWhiteSpace(workspaceHeader))
             {
-                // initialize 时的 ① Header 层：挑选 SolutionDir 与 header 指向一致
-                // 的 VS。唯一→预绑定；None/Ambiguous→用与转发路径相同的面向 agent
-                // 的消息失败。
                 var snap = Registry.Snapshot();
                 var match = WorkspaceResolver.Resolve(workspaceHeader,
                     snap.Select(e => (e.Info.Pid, e.Info.SolutionDir)));
@@ -339,10 +350,6 @@ namespace VsMcpGateway
                     vsPid = match.Pid;
                 else if (match.Kind == WorkspaceMatchKind.None)
                 {
-                    // initialize 失败→JSON-RPC error（不是 tool-error）。MCP 客户端
-                    // 会对 initialize result 做 schema 校验；tool-error
-                    // （result.isError）没有 protocolVersion/capabilities/serverInfo，
-                    // 会触发 zod，向用户暴露三个 undefined 字段。
                     await WriteJsonRpcErrorAsync(ctx, body, -32001,
                         GatewayTools.BuildWorkspaceMissMessage(workspaceHeader!, snap)).ConfigureAwait(false);
                     return;
@@ -362,10 +369,6 @@ namespace VsMcpGateway
                 vsPid = ResolveInitializeTarget(vsPid, snap.Count, () => snap.First().Info.Pid);
                 if (!vsPid.HasValue)
                 {
-                    // ResolveInitializeTarget 返回 null：0 实例或多实例。0 实例无法服务；多实例
-                    // 之前直接 -32001，客户端拿不到 select_vs_instance，永远无法绑定（死锁）——现在
-                    // auto-bind 第一个让客户端进入会话 + 拿到工具列表（含 select_vs_instance），再用
-                    // select_vs_instance 切到目标 VS（hint 提示当前绑定实例 + 切换方法）。
                     if (snap.Count == 0)
                     {
                         await WriteJsonRpcErrorAsync(ctx, body, -32001,
@@ -377,26 +380,15 @@ namespace VsMcpGateway
                 isAutoFallback = true;
             }
 
-            if (!Registry.TryGet(vsPid.Value, out var entry))
+            if (!Registry.TryGet(vsPid.Value, out _))
             {
                 await WriteJsonRpcErrorAsync(ctx, body, -32002, $"VS instance {vsPid.Value} is not connected.").ConfigureAwait(false);
                 return;
             }
 
-            // 剥掉客户端的 session header，让 VS 的 SDK 把它当作新会话并分配自己的
-            // Mcp-Session-Id（我们在下面捕获）。
-            var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            forwardedHeaders.Remove("Mcp-Session-Id");
-
-            // 预分配客户端可见的 session id，并在任何字节到达 OutputStream 之前就把它
-            // 设为响应 header。HttpListener 在第一次写入响应流时刷新状态行 + headers
-            // （ForwardAsync 的读循环实时刷新每个 data 帧），所以转发后才设 header
-            // 已经太迟，客户端永远收不到它的 session id。VS 自己的 session id 在转发
-            // 返回前未知，所以绑定先用 null 占位创建，等观察到 head 帧再补上。
+            // Gateway 自己分配 session id，不依赖 VS 的 SDK 分配。
             string source = isAutoFallback ? "auto" : "initialize";
             var (clientSessionId, binding) = Sessions.CreateWithId(vsPid.Value, vsSessionId: null, source);
-            // 单实例 fallback 是自动绑定：武装一次性 hint，让本次 initialize 后的
-            // 第一个 tool result 携带它。
             if (isAutoFallback)
                 binding.HintPending = true;
 
@@ -405,98 +397,36 @@ namespace VsMcpGateway
             ctx.Response.Headers["Cache-Control"] = "no-cache";
             ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
 
-            ForwardResult result;
-            using (var output = ctx.Response.OutputStream)
-            {
-                result = await entry.Router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
-            }
+            // 本地构造 initialize 响应（不转发到 VS）。
+            string respJson = GatewayTools.BuildInitializeResponse(TryGetJsonRpcId(body) ?? 0);
+            string sse = "event: message\ndata: " + respJson + "\n\n";
+            byte[] bytes = Encoding.UTF8.GetBytes(sse);
+            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
             GatewayLogger.Log($"initialize OK: client session {clientSessionId} → VS PID={vsPid.Value}");
-
-            // 读循环已从 VS 的 head 帧填好 result.Headers；记录 VS 分配的 session id，
-            // 让后续转发把它带回该 VS 的 SDK，使其恢复正确的服务端会话。
-            // InstanceEntry 是该 id 的每个 VS 权威存放处（无状态的 ① 路由直接读它）。
-            if (result.Headers.TryGetValue("Mcp-Session-Id", out var vsSid) && !string.IsNullOrEmpty(vsSid))
-            {
-                binding.VsSessionId = vsSid;
-                Registry.SetVsSessionId(vsPid.Value, vsSid);
-            }
 
             try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
         /// <summary>
-        /// tools/list：通过 4 层流程（①②③④）解析目标，转发到绑定的 VS，缓冲 SSE
-        /// 响应，注入 gateway 工具，并写入改写后的字节。tools/list 不是工具调用
-        /// （tool CALL），所以这里武装 ③ 的自动绑定 hint 但不在此注入——下一次
-        /// tools/call 才让它浮现。回显自动绑定的客户端 session id，让客户端在
-        /// 下一次调用前采纳它。
+        /// tools/list：本地构造工具列表响应（不转发到 VS）。Gateway 固定列出全部
+        /// 工具（含 go_to_definition / eval_csharp）。回显客户端 session id。
         /// </summary>
         private static async Task HandleToolsListAsync(
-            HttpListenerContext ctx, string body, IDictionary<string, string> headers,
-            string? clientSessionId, string? workspaceHeader, CancellationToken ct)
+            HttpListenerContext ctx, string body,
+            string? clientSessionId, CancellationToken ct)
         {
-            var resolution = BindingResolver.ResolveTarget(workspaceHeader, clientSessionId, Sessions, Registry);
-            int targetPid;
-            string? vsSessionId;
-            string? echoSessionId;
-            if (resolution.Success)
-            {
-                targetPid = resolution.Pid!.Value;
-                vsSessionId = resolution.VsSessionId;
-                echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
-            }
-            else if (resolution.ErrorKind == TargetErrorKind.Intercept)
-            {
-                // 多实例未绑定：tools/list 是元请求，客户端要靠它拿到 select_vs_instance
-                // 才能绑定，不能 ④ 拦截（否则死锁——永远看不到 select_vs_instance）。转发
-                // 到第一个在线实例拿工具列表，不创建 binding、不武装 hint——绑定留给客户端
-                // 的 select_vs_instance。
-                var snap = Registry.Snapshot();
-                if (snap.Count == 0)
-                {
-                    await WriteJsonRpcErrorAsync(ctx, body, -32001,
-                        "No VS instance connected. Open a Visual Studio instance with the MCP extension, then retry.").ConfigureAwait(false);
-                    return;
-                }
-                var first = snap.First();
-                targetPid = first.Info.Pid;
-                vsSessionId = first.VsSessionId;
-                echoSessionId = clientSessionId;
-            }
-            else
-            {
-                // ① Header 未命中/歧义、InstanceGone、NeedsInitialize：正常报错。
-                await RespondToResolutionFailureAsync(ctx, body, clientSessionId, resolution).ConfigureAwait(false);
-                return;
-            }
-
-            if (!Registry.TryGet(targetPid, out var entry))
-            {
-                await WriteJsonRpcErrorAsync(ctx, body, -32003,
-                    $"VS instance PID {targetPid} is no longer connected.").ConfigureAwait(false);
-                return;
-            }
-
-            var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(vsSessionId))
-                forwardedHeaders["Mcp-Session-Id"] = vsSessionId!;
-            else
-                forwardedHeaders.Remove("Mcp-Session-Id");
-
-            // 缓冲整个响应：tools/list 是单条小 SSE 消息，我们需要完整 JSON 才能
-            // 插入我们的工具。
-            using var buffer = new MemoryStream();
-            await entry.Router.ForwardAsync(body, forwardedHeaders, buffer, ct).ConfigureAwait(false);
-
-            byte[] injected = GatewayTools.InjectIntoToolsListSse(buffer.ToArray());
+            string respJson = GatewayTools.BuildToolsListResponse(
+                TryGetJsonRpcId(body) ?? 0, includeGoToDefinition: true, includeEvalCsharp: true);
+            string sse = "event: message\ndata: " + respJson + "\n\n";
+            byte[] bytes = Encoding.UTF8.GetBytes(sse);
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
-            if (!string.IsNullOrEmpty(echoSessionId))
-                ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
+            if (!string.IsNullOrEmpty(clientSessionId))
+                ctx.Response.Headers["Mcp-Session-Id"] = clientSessionId;
 
-            await ctx.Response.OutputStream.WriteAsync(injected, 0, injected.Length, ct).ConfigureAwait(false);
+            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
             try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
@@ -554,14 +484,12 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// 默认路径（tools/call 等）：通过 4 层流程（①②③④）解析，转发到绑定的 VS。
-        /// 若解析武装了 hint（③ 自动绑定或之前自动绑定遗留的 HintPending），缓冲
-        /// SSE 响应，把 hint 文本注入 result.content 前端，并清除一次性标志。否则
-        /// 直接流式转发响应，让长任务（build_solution）的实时 keep-alive 通知保持
-        /// 不缓冲。
+        /// tools/call（非 gateway 工具）：通过 4 层流程（①②③④）解析目标 VS，
+        /// 发 tool-call 帧，等 tool-result 帧返回。若有 hint pending，把 hint
+        /// 文本追加到 content 末尾。回显 session id。
         /// </summary>
         private static async Task HandleForwardAsync(
-            HttpListenerContext ctx, string body, IDictionary<string, string> headers,
+            HttpListenerContext ctx, string body,
             string? clientSessionId, string? workspaceHeader, CancellationToken ct)
         {
             var resolution = BindingResolver.ResolveTarget(workspaceHeader, clientSessionId, Sessions, Registry);
@@ -578,26 +506,57 @@ namespace VsMcpGateway
                 return;
             }
 
-            var forwardedHeaders = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
-            if (!string.IsNullOrEmpty(resolution.VsSessionId))
-                forwardedHeaders["Mcp-Session-Id"] = resolution.VsSessionId!;
-            else
-                forwardedHeaders.Remove("Mcp-Session-Id");
-
-            // 回显绑定创建时所用的 session id。对 ③ 自动绑定场景，客户端没发，我们
-            // 铸造了一个——必须回显，让后续请求携带它（否则每次调用都会再次自动
-            // 绑定，hint 会永远触发）。
             string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
 
-            // hint 注入由 HintPending 门控。无状态的 ① 层从不设置绑定，所以从不
-            // 注入（正确：header 路由的调用是刻意的，不是自动绑定）。注入时必须
-            // 缓冲完整响应——但仅限于此，以保持常见场景的流式传输（设计文档里
-            // hint 缓冲的权衡）。
+            // hint 注入由 HintPending 门控。原子 claim 防止并发重复注入。
             SessionBinding? binding = resolution.Binding;
-            // 原子 claim（ClaimHint）：多个并发 tools/call 只一个拿到 true，杜绝重复注入——
-            // 并发下两个请求都合法读到 HintPending=true（不是时序竞态，是共享 flag 缺乏互斥），
-            // 故必须在注入前原子地把 1 翻 0，让其余并发请求拿到 false。
             bool needsHint = binding != null && binding.ClaimHint();
+
+            // 提取工具名和参数 JSON（params.arguments 的 GetRawText）。
+            TryGetToolName(body, out string? toolName);
+            TryGetToolArguments(body, out string? argumentsJson);
+
+            // 调用 VS 端 ToolExecutor，经 pipe tool-call/tool-result 帧。
+            PipeToolResultData toolResult;
+            try
+            {
+                toolResult = await entry.Router.CallToolAsync(
+                    toolName ?? "", argumentsJson ?? "{}", ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // pipe 断连、router disposed 等。
+                await WriteJsonRpcErrorAsync(ctx, body, -32003,
+                    $"VS pipe error during tool-call: {ex.Message}").ConfigureAwait(false);
+                return;
+            }
+
+            // 构造 JSON-RPC 响应。hint 追加到 content 末尾（\n\n 分隔）。
+            string contentText = toolResult.Content;
+            if (needsHint)
+            {
+                string hint = GatewayTools.BuildAutoBindHint(entry);
+                contentText = contentText + "\n\n" + hint;
+            }
+
+            object? jsonRpcId = TryGetJsonRpcId(body) ?? 0;
+            var resp = new
+            {
+                jsonrpc = "2.0",
+                id = jsonRpcId,
+                result = new
+                {
+                    content = new[] { new { type = "text", text = contentText } },
+                    isError = toolResult.IsError,
+                },
+            };
+            string respJson = JsonSerializer.Serialize(resp);
+            string sse = "event: message\ndata: " + respJson + "\n\n";
+            byte[] bytes = Encoding.UTF8.GetBytes(sse);
 
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
@@ -605,35 +564,25 @@ namespace VsMcpGateway
             if (!string.IsNullOrEmpty(echoSessionId))
                 ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
 
-            if (needsHint)
-            {
-                // 通过 SSE 感知的注入器流式转发响应，而不是整体缓冲。整体缓冲会
-                // 饿死长任务（build_solution）：它们的 keep-alive 日志通知堆在
-                // MemoryStream 里直到构建结束，客户端看不到任何字节于是超时。注入器
-                // 在每个完整 SSE 事件到达时重组——通知立即透传（保留 2s 的
-                // keep-alive 节奏），只有第一个 result.content 被前置 hint。
-                string hint = GatewayTools.BuildAutoBindHint(entry);
-                var injector = new HintInjectingStream(ctx.Response.OutputStream, hint);
-                try
-                {
-                    await entry.Router.ForwardAsync(body, forwardedHeaders, injector, ct).ConfigureAwait(false);
-                }
-                finally
-                {
-                    await injector.FlushRemainingAsync(ct).ConfigureAwait(false);
-                }
-                // claim 时已把 HintPending 翻 false。若注入失败（无 result.content，如错误响应）
-                // 则归还，让下次调用重试——保留原 MI-07「注入失败保持武装」语义。
-                if (!injector.DidInject)
-                    binding!.HintPending = true;
-            }
-            else
-            {
-                using (var output = ctx.Response.OutputStream)
-                {
-                    await entry.Router.ForwardAsync(body, forwardedHeaders, output, ct).ConfigureAwait(false);
-                }
-            }
+            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
+        }
+
+        /// <summary>
+        /// 写一个携带简单 result 的 SSE 响应（用于 ping 等）。
+        /// </summary>
+        private static async Task WriteSimpleResultAsync(HttpListenerContext ctx, string body, object result)
+        {
+            object? id = TryGetJsonRpcId(body) ?? 0;
+            var resp = new { jsonrpc = "2.0", id, result };
+            string respJson = JsonSerializer.Serialize(resp);
+            string sse = "event: message\ndata: " + respJson + "\n\n";
+            byte[] bytes = Encoding.UTF8.GetBytes(sse);
+
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
             try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 
@@ -706,6 +655,25 @@ namespace VsMcpGateway
                 {
                     name = n.GetString();
                     return !string.IsNullOrEmpty(name);
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>提取 params.arguments 的原始 JSON 文本（GetRawText），
+        /// 透传给 VS 端 ToolExecutor 经 JsonDocument.Parse 再按工具签名反序列化。</summary>
+        private static bool TryGetToolArguments(string body, out string? argumentsJson)
+        {
+            argumentsJson = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.TryGetProperty("params", out var p) &&
+                    p.TryGetProperty("arguments", out var a))
+                {
+                    argumentsJson = a.GetRawText();
+                    return true;
                 }
             }
             catch { }
