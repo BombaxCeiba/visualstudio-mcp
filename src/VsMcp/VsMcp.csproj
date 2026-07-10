@@ -60,28 +60,40 @@
     <DefineConstants Condition=" '$(EvalCsharpEnabled)' == 'true' ">$(DefineConstants);EVAL_CSHARP</DefineConstants>
   </PropertyGroup>
 
+  <!-- polyfill 版本随 VsTarget：vs2026 引 10.0.0（assembly 10.0.0.0 ≤ 18.5.2 redirect range ≤10.0.0.2），
+       vs2022 引 9.0.0（≤ 17.x range）。STJ/BCL/Encodings 是 10.x range 压制点（18.5.2 host ≤10.0.0.2），
+       必须 NuGet 低版本；Memory/Buffers/Unsafe/Numerics.Vectors/Tasks.Extensions 用 host PublicAssemblies
+       （Private=false，运行时走 host）。 -->
+  <PropertyGroup Condition=" '$(VsTarget)' == 'vs2026' ">
+    <StjVersion>10.0.0</StjVersion>
+    <BclVersion>10.0.0</BclVersion>
+    <EncodingsVersion>10.0.0</EncodingsVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(VsTarget)' == 'vs2022' ">
+    <StjVersion>9.0.0</StjVersion>
+    <BclVersion>9.0.0</BclVersion>
+    <EncodingsVersion>9.0.0</EncodingsVersion>
+  </PropertyGroup>
+
   <!-- NuGet Package References。
-       架构反转后 VS 包不再引 MCP SDK（MCP 移至 Gateway 进程，VS 包退化为工具后端，
-       代码已无任何 ModelContextProtocol 类型引用）。
-       System.Text.Json 降到 10.0.0（assembly version 10.0.0.0）：18.5.2 host 的
-       bindingRedirect range ≤10.0.0.2，引 10.0.0.0 落在范围内被 host redirect 接受，
-       运行时用 host 的 System.Text.Json；旧引 10.0.9（=10.0.0.9 > 10.0.0.2）被 host
-       压制 → 0x80131040。STJ copy-local 供 CreatePkgDef 加载，但不打包进 VSIX
-       （ForceIncludeRuntimeDependencies 改从 Gateway 输出目录打包 10.0.9 给 Gateway；
-       VsMcp.dll 运行时走 host codeBase 的 STJ，不用 VSIX 副本）。Gateway 是独立进程，
-       不受 host redirect 管辖，保持 10.0.9。Microsoft.Extensions.Logging.Abstractions
-       引 host PublicAssemblies（Private=false，与 Shell.15.0 同模式），运行时用 host 的；
-       删 MCP 后此引用不再由 MCP 传递，需单独 host Reference。 -->
+       架构反转后 VS 包不再引 MCP SDK。STJ/BCL/Encodings 引 NuGet 低版本（ExcludeAssets=all 仅还原包），
+       编译引用见 ResolveVsSdkReferences 的 Reference HintPath（Private=false 不 copy/不打包，运行时走 host）。
+       低版本 ref 落 18.5.2 redirect range 内、18.7 向上 redirect，双兼容。Gateway 自带 STJ 10.0.9（打包）。
+       Microsoft.Extensions.Logging.Abstractions 引 host PublicAssemblies（Private=false）。 -->
   <ItemGroup>
     <!-- Microsoft.VisualStudio.Threading is intentionally NOT a PackageReference:
          binding a NuGet version (e.g. 17.14.15) against an SDK Shell.15.0 from a
          different VS install triggers CS1705 (Threading 17.x vs Shell's internal
          reference to Threading 18.x). Instead we resolve the dll from the same
          VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
-    <!-- STJ：在 ResolveVsSdkReferences target 里动态引用（因为 VsSdkAssembliesPath
-         要等 vswhere 跑完才正确）。见下方 ResolveVsSdkReferences target。 -->
     <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
     <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
+
+    <!-- 还原 STJ/BCL/Encodings NuGet 包（ExcludeAssets=all：仅还原到缓存，不引用 asset；
+         编译用下方 ResolveVsSdkReferences 的 Reference HintPath 指缓存 lib dll，Private=false 不打包）。 -->
+    <PackageReference Include="System.Text.Json" Version="$(StjVersion)" ExcludeAssets="all" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="$(BclVersion)" ExcludeAssets="all" />
+    <PackageReference Include="System.Text.Encodings.Web" Version="$(EncodingsVersion)" ExcludeAssets="all" />
   </ItemGroup>
 
   <!-- Discover VS SDK path via vswhere based on VsTarget.
@@ -212,29 +224,24 @@
         <HintPath>$(VsSdkAssembliesPath)\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- Microsoft.Bcl.AsyncInterfaces 已移除：C# LSP 路径移除后 VS 包不再用
-           IAsyncEnumerable/IAsyncDisposable，BCL 死结（Implementation ref BCL +
-           18.5.2 range）随之消除。 -->
-      <!-- System.Text.Json：引 host PublicAssemblies（Private=false）。
-           VS2022 host 是 STJ 9.0.0.0；VS2026 host 是 STJ 10.0.0.x。
-           编译用哪个 VS 就绑哪个版本元数据，运行时走 host codeBase。 -->
+      <!-- STJ/BCL/Encodings：NuGet 低版本 lib dll（HintPath 指 NuGet 缓存），Private=false
+           不 copy/不打包，运行时走 host。ref 低版本（10.0.0.0 或 9.0.0.0）落 18.5.2 redirect range 内。
+           包由顶部 PackageReference ExcludeAssets=all 还原到 $(NuGetPackageRoot)。 -->
       <Reference Include="System.Text.Json">
-        <HintPath>$(VsSdkAssembliesPath)\System.Text.Json.dll</HintPath>
+        <HintPath>$(NuGetPackageRoot)system.text.json\$(StjVersion)\lib\netstandard2.0\System.Text.Json.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- VS 包代码直接用的 polyfill：System.Text.Encodings.Web（JavaScriptEncoder）、
-           System.Threading.Tasks.Extensions（ValueTask）。删 MCP/STJ PackageReference 后
-           不再由 NuGet 传递，引 host PublicAssemblies（Private=false，与 Shell.15.0 同模式）。 -->
+      <Reference Include="Microsoft.Bcl.AsyncInterfaces">
+        <HintPath>$(NuGetPackageRoot)microsoft.bcl.asyncinterfaces\$(BclVersion)\lib\netstandard2.0\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <Reference Include="System.Text.Encodings.Web">
-        <HintPath>$(VsSdkAssembliesPath)\System.Text.Encodings.Web.dll</HintPath>
+        <HintPath>$(NuGetPackageRoot)system.text.encodings.web\$(EncodingsVersion)\lib\netstandard2.0\System.Text.Encodings.Web.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <Reference Include="System.Threading.Tasks.Extensions">
-        <HintPath>$(VsSdkAssembliesPath)\System.Threading.Tasks.Extensions.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <!-- Span/Memory polyfill 依赖链：STJ API（JsonDocument.Parse 等）用 ReadOnlySpan/
-           ReadOnlyMemory，需 System.Memory；Memory 依赖 Buffers/Unsafe/Numerics.Vectors。 -->
+      <!-- Memory/Buffers/Unsafe/Numerics.Vectors/Tasks.Extensions：引 host PublicAssemblies（Private=false，
+           不打包，运行时走 host）。这些 4.x/6.x polyfill 的 18.5.2 redirect range 预计含 host 版本；
+           若 18.5.2 实测仍崩，再按 STJ 同样改 NuGet 低版本。 -->
       <Reference Include="System.Memory">
         <HintPath>$(VsSdkAssembliesPath)\System.Memory.dll</HintPath>
         <Private>false</Private>
@@ -249,6 +256,10 @@
       </Reference>
       <Reference Include="System.Numerics.Vectors">
         <HintPath>$(VsSdkAssembliesPath)\System.Numerics.Vectors.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="System.Threading.Tasks.Extensions">
+        <HintPath>$(VsSdkAssembliesPath)\System.Threading.Tasks.Extensions.dll</HintPath>
         <Private>false</Private>
       </Reference>
       <Reference Include="System" />
