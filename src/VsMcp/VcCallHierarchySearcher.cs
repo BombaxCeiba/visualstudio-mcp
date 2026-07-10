@@ -47,9 +47,12 @@ namespace VsMcp
         private const int DefaultTimeoutMs = 30_000;
 
         /// <summary>查 <paramref name="query"/> 函数的调用关系。
-        /// <paramref name="direction"/>："callers"（谁调用了它，CallsTo）/ "callees"（它调用了谁，CallsFrom，默认）。</summary>
+        /// <paramref name="direction"/>："callers"（谁调用了它，CallsTo）/ "callees"（它调用了谁，CallsFrom，默认）。
+        /// <paramref name="progress"/>：非 null 时（仅 callers 保活路径传），defId 循环中更新实时进度，
+        /// 供调用方 KeepAliveNotifier 周期读取生成进度文本。</summary>
         public static async Task<CallGraphResult> QueryAsync(
-            AsyncPackage package, string query, string direction, int maxResults, int timeoutSeconds, CancellationToken ct)
+            AsyncPackage package, string query, string direction, int maxResults, int timeoutSeconds,
+            CancellationToken ct, CallGraphProgress? progress = null)
         {
             await package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
             var svc = Package.GetGlobalService(typeof(CPPThreadSafeServiceClass));
@@ -68,14 +71,14 @@ namespace VsMcp
             int devMajor = CallHierarchyMemberAccess.DetectDevMajor(package);
 
             int timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : DefaultTimeoutMs;
-            return await QueryCoreAsync(mgr, factory, query, direction, category, maxResults, timeoutMs, devMajor, ct)
+            return await QueryCoreAsync(mgr, factory, query, direction, category, maxResults, timeoutMs, devMajor, ct, progress)
                 .ConfigureAwait(true);
         }
 
         private static async Task<CallGraphResult> QueryCoreAsync(
             IVCCodeStoreManager mgr, IVCCallHierarchyMemberItemFactory factory,
             string query, string direction, VCCallHierarchySearchCategory category,
-            int maxResults, int timeoutMs, int devMajor, CancellationToken ct)
+            int maxResults, int timeoutMs, int devMajor, CancellationToken ct, CallGraphProgress? progress = null)
         {
             // 后台找所有匹配的函数 IdItem（qcs 是 MTA，后台安全）。
             var defIds = await Task.Run(() => FindDefinitionIds(mgr, query), ct).ConfigureAwait(true);
@@ -91,8 +94,12 @@ namespace VsMcp
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             linkedCts.CancelAfter(timeoutMs);
 
-            foreach (var defId in defIds)
+            // 进度状态初始化：此时已知 defId 总数，保活 timer 据此生成「搜索调用方… i/N」。
+            progress?.Begin(DateTime.UtcNow, defIds.Count);
+
+            for (int di = 0; di < defIds.Count; di++)
             {
+                var defId = defIds[di];
                 if (linkedCts.IsCancellationRequested) { timedOut = !ct.IsCancellationRequested; break; }
                 if (allNodes.Count >= maxResults) break;
 
@@ -139,6 +146,8 @@ namespace VsMcp
                     {
                         if (seen.Add($"{node.Name}|{node.File}|{node.Line}")) allNodes.Add(node);
                     }
+                    // 该 defId 搜索完成——更新进度（已处理 di+1/N，累计找到 allNodes.Count）。
+                    progress?.Update(di + 1, allNodes.Count);
                 }
                 finally
                 {
@@ -237,6 +246,49 @@ namespace VsMcp
     }
 
     public sealed record CallGraphNode(string Name, string Signature, string File, int Line);
+
+    /// <summary>get_call_graph(callers) 反向搜索的实时进度状态，供 ToolExecutor 的
+    /// KeepAliveNotifier 周期读取生成进度文本。由 ToolExecutor 创建，<see cref="VcCallHierarchySearcher.QueryCoreAsync"/>
+    /// 在 defId 循环中更新；跨 UI 线程写 + 保活 timer 线程读，故计数字段用 Volatile。
+    /// 进度文本仅给客户端重置超时 + 观察心跳用，容忍轻微竞态。</summary>
+    public sealed class CallGraphProgress
+    {
+        private DateTime _startedAtUtc;
+        private int _totalDefIds;
+        private int _currentIndex;
+        private int _foundCount;
+
+        /// <summary>搜索正式开始（FindDefinitionIds 完成、已知 defId 总数后调用）。UI 线程。</summary>
+        public void Begin(DateTime startedAtUtc, int totalDefIds)
+        {
+            _startedAtUtc = startedAtUtc;
+            _totalDefIds = totalDefIds;
+            Volatile.Write(ref _currentIndex, 0);
+            Volatile.Write(ref _foundCount, 0);
+        }
+
+        /// <summary>每完成一个 defId 的搜索后更新进度（UI 线程调）。</summary>
+        public void Update(int currentIndex, int foundCount)
+        {
+            Volatile.Write(ref _currentIndex, currentIndex);
+            Volatile.Write(ref _foundCount, foundCount);
+        }
+
+        /// <summary>生成进度文本（保活 timer 线程调）。Begin 前显示「定位函数定义中」，
+        /// 之后形如「搜索调用方… 3/8，已找到 12 个，用时 45s」。</summary>
+        public string BuildStatus()
+        {
+            if (_startedAtUtc == default)
+                return "搜索调用方… 正在定位函数定义…";
+            int idx = Volatile.Read(ref _currentIndex);
+            int found = Volatile.Read(ref _foundCount);
+            int elapsed = (int)(DateTime.UtcNow - _startedAtUtc).TotalSeconds;
+            string head = _totalDefIds > 0
+                ? $"搜索调用方… {idx}/{_totalDefIds}"
+                : $"搜索调用方… {idx}";
+            return $"{head}，已找到 {found} 个，用时 {Math.Max(0, elapsed)}s";
+        }
+    }
 
     /// <param name="Found">false：CallHierarchy 不可用 / 函数未找到。</param>
     /// <param name="TimedOut">true：搜索超时（Nodes 仍返回已收集的部分结果）。</param>

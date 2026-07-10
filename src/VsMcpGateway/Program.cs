@@ -484,9 +484,11 @@ namespace VsMcpGateway
         }
 
         /// <summary>
-        /// tools/call（非 gateway 工具）：通过 4 层流程（①②③④）解析目标 VS，
-        /// 发 tool-call 帧，等 tool-result 帧返回。若有 hint pending，把 hint
-        /// 文本追加到 content 末尾。回显 session id。
+        /// tools/call（非 gateway 工具）：通过 4 层流程（①②③④）解析目标 VS，经**流式**
+        /// pipe tool-call 转发——执行期间 VS 推来的 tool-progress 帧（build 增量日志 /
+        /// callers 搜索进度）实时转为 MCP logging notification（notifications/message）
+        /// 逐条 flush 给客户端，最终 tool-result 作为最后一条 SSE 事件。若有 hint pending，
+        /// 把 hint 文本追加到 content 末尾。回显 session id。
         /// </summary>
         private static async Task HandleForwardAsync(
             HttpListenerContext ctx, string body,
@@ -516,12 +518,44 @@ namespace VsMcpGateway
             TryGetToolName(body, out string? toolName);
             TryGetToolArguments(body, out string? argumentsJson);
 
-            // 调用 VS 端 ToolExecutor，经 pipe tool-call/tool-result 帧。
+            // 流式响应头：必须在写任何 body 前设好——HttpListener 首次写 OutputStream
+            // 时刷新状态行 + headers。这样进度 SSE 能在工具执行期间逐条 flush，客户端
+            // 实时收到 build 增量日志 / callers 进度，而非缓冲到结尾一次性返回。
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            if (!string.IsNullOrEmpty(echoSessionId))
+                ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
+
+            // VS 端 KeepAliveNotifier 推来的 tool-progress 文本，包成 MCP logging
+            // notification 实时下发 + flush。level=info：纯进度信息；data 为进度文本。
+            async Task SendProgressAsync(string text)
+            {
+                try
+                {
+                    var notify = new
+                    {
+                        jsonrpc = "2.0",
+                        method = "notifications/message",
+                        @params = new { level = "info", data = text },
+                    };
+                    string j = JsonSerializer.Serialize(notify);
+                    byte[] b = Encoding.UTF8.GetBytes("event: message\ndata: " + j + "\n\n");
+                    await ctx.Response.OutputStream.WriteAsync(b, 0, b.Length, ct).ConfigureAwait(false);
+                    await ctx.Response.OutputStream.FlushAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // 客户端已断开等——进度丢失不影响最终结果回传。
+                }
+            }
+
+            // 调用 VS 端 ToolExecutor，经流式 pipe tool-call/tool-result 帧 + tool-progress。
             PipeToolResultData toolResult;
             try
             {
-                toolResult = await entry.Router.CallToolAsync(
-                    toolName ?? "", argumentsJson ?? "{}", ct).ConfigureAwait(false);
+                toolResult = await entry.Router.CallToolStreamingAsync(
+                    toolName ?? "", argumentsJson ?? "{}", SendProgressAsync, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -529,13 +563,24 @@ namespace VsMcpGateway
             }
             catch (Exception ex)
             {
-                // pipe 断连、router disposed 等。
-                await WriteJsonRpcErrorAsync(ctx, body, -32003,
-                    $"VS pipe error during tool-call: {ex.Message}").ConfigureAwait(false);
+                // 流式期间 pipe 断连 / router disposed。headers 可能已随进度 SSE flush，
+                // 不能再设 status（否则抛 "headers already sent"，被外层吞成 502）；
+                // 直接写一条 JSON-RPC error SSE 后关闭。
+                GatewayLogger.Log($"streaming tool-call error: {ex.Message}");
+                try
+                {
+                    object? id = TryGetJsonRpcId(body) ?? 0;
+                    string errJson = GatewayTools.BuildErrorResponse(id, -32003,
+                        $"VS pipe error during tool-call: {ex.Message}");
+                    byte[] b = Encoding.UTF8.GetBytes("event: message\ndata: " + errJson + "\n\n");
+                    await ctx.Response.OutputStream.WriteAsync(b, 0, b.Length, ct).ConfigureAwait(false);
+                }
+                catch { /* 客户端已断开 */ }
+                try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
                 return;
             }
 
-            // 构造 JSON-RPC 响应。hint 追加到 content 末尾（\n\n 分隔）。
+            // 构造最终 tool-result（最后一条 SSE 事件）。hint 追加到 content 末尾（\n\n 分隔）。
             string contentText = toolResult.Content;
             if (needsHint)
             {
@@ -555,14 +600,7 @@ namespace VsMcpGateway
                 },
             };
             string respJson = JsonSerializer.Serialize(resp);
-            string sse = "event: message\ndata: " + respJson + "\n\n";
-            byte[] bytes = Encoding.UTF8.GetBytes(sse);
-
-            ctx.Response.StatusCode = 200;
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers["Cache-Control"] = "no-cache";
-            if (!string.IsNullOrEmpty(echoSessionId))
-                ctx.Response.Headers["Mcp-Session-Id"] = echoSessionId;
+            byte[] bytes = Encoding.UTF8.GetBytes("event: message\ndata: " + respJson + "\n\n");
 
             await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
             try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }

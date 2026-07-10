@@ -263,14 +263,15 @@ namespace VsMcp
 
         /// <summary>get_call_graph：C++ 函数调用关系（callers 谁调用了它 / callees 它调用了谁），
         /// 经 VC CallHierarchy（VS「调用层次结构」窗口后端）。仅 C++；其它语言无对应 API。
-        /// direction: "callers"（CallsTo）/ "callees"（CallsFrom，默认）。</summary>
-        public async Task<CallGraphResult> GetCallGraphAsync(string query, string direction, int maxResults, int timeoutSeconds, CancellationToken ct)
+        /// direction: "callers"（CallsTo）/ "callees"（CallsFrom，默认）。
+        /// <paramref name="progress"/>：仅 callers 保活路径传，透传给 VC searcher 写实时进度。</summary>
+        public async Task<CallGraphResult> GetCallGraphAsync(string query, string direction, int maxResults, int timeoutSeconds, CancellationToken ct, CallGraphProgress? progress = null)
         {
             ThrowIfDisposed();
             if (string.IsNullOrWhiteSpace(query))
                 return new CallGraphResult(Found: false, Query: query, Direction: direction,
                     Nodes: new List<CallGraphNode>(), TimedOut: false, Error: "查询为空");
-            return await VcCallHierarchySearcher.QueryAsync(_package, query, direction, maxResults, timeoutSeconds, ct)
+            return await VcCallHierarchySearcher.QueryAsync(_package, query, direction, maxResults, timeoutSeconds, ct, progress)
                 .ConfigureAwait(true);
         }
 

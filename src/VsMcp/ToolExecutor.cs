@@ -330,8 +330,10 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// 带 KeepAliveNotifier 的 get_call_graph（callers 反向搜索）：
-        /// 周期发送保活心跳。
+        /// 带 KeepAliveNotifier 的 get_call_graph（callers 反向搜索）：周期推送实时进度。
+        /// 进度文本由 <see cref="CallGraphProgress"/> 生成（defId 索引/总数 + 已找到数 + 计时），
+        /// 后者经 <paramref name="progress"/> 透传到 VC searcher 在 defId 循环中更新。
+        /// 保活间隔 5s：远小于客户端工具超时，又不过度刷屏。
         /// </summary>
         private async Task<ToolResult> RunCallGraphWithKeepAliveAsync(
             string query,
@@ -343,12 +345,15 @@ namespace VsMcp
         {
             if (_symbolFacade == null) return ToolNotAvailable("get_call_graph", "symbol facade not initialized.");
 
+            var progress = new CallGraphProgress();
             using var notifier = new KeepAliveNotifier(
-                token => onProgress("Searching call graph...", token),
-                TimeSpan.FromSeconds(10),
+                token => onProgress(progress.BuildStatus(), token),
+                TimeSpan.FromSeconds(5),
                 ct);
 
-            return await SafeCall.Wrap(() => _symbolFacade.GetCallGraphAsync(query, direction, maxResults, timeoutSeconds, ct), ct).ConfigureAwait(false);
+            return await SafeCall.Wrap(
+                () => _symbolFacade.GetCallGraphAsync(query, direction, maxResults, timeoutSeconds, ct, progress),
+                ct).ConfigureAwait(false);
         }
 
         /// <summary>构造"工具不可用"错误 ToolResult。</summary>
