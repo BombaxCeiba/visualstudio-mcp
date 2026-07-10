@@ -19,13 +19,11 @@
     <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
     <!-- Disable auto-generated AssemblyInfo since we have an explicit one -->
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <!-- Default VS SDK assembly path for command-line builds.
-         Multi-target policy: prefer the OLDEST installed VS so the compiled
-         IL binds against the lowest SDK metadata, keeping the VSIX loadable
-         on every targeted VS version. The default below points at VS2022
-         (Dev17) to match the [17.0,18.0) installation target in vsixmanifest.
-         If that path is missing on this machine, ResolveVsSdkPath (below)
-         uses vswhere to discover whatever VS is installed and falls back to it. -->
+    <!-- Multi-target policy: VsTarget controls which VS SDK to compile against.
+         Pass /p:VsTarget=vs2022 or /p:VsTarget=vs2026 on the command line.
+         Default is vs2026 (current dev machine). Each target produces an
+         independent VSIX loadable only on the corresponding VS version. -->
+    <VsTarget Condition=" '$(VsTarget)' == '' ">vs2026</VsTarget>
     <VsWherePath Condition=" '$(VsWherePath)' == '' ">$(MSBuildProgramFiles32)\Microsoft Visual Studio\Installer\vswhere.exe</VsWherePath>
     <VsSdkAssembliesPath Condition=" '$(VsSdkAssembliesPath)' == '' ">C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\PublicAssemblies</VsSdkAssembliesPath>
     <!-- Generate pkgdef from [PackageRegistration]/[ProvideAutoLoad] attributes (we ship a real VS Package) -->
@@ -80,48 +78,31 @@
          different VS install triggers CS1705 (Threading 17.x vs Shell's internal
          reference to Threading 18.x). Instead we resolve the dll from the same
          VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
-    <!-- STJ 用 Reference（非 PackageReference）：PackageReference 会传递 Microsoft.Bcl.AsyncInterfaces
-         10.0.0.0，与下方 host Bcl 10.0.0.4 重复 → CS0433。改 Reference 不传递依赖。
-         引 NuGet 10.0.0 dll（assembly 10.0.0.0 ≤ 18.5.2 host STJ redirect range 10.0.0.2，
-         被 host redirect 接受），Private=false 不 copy-local，运行时用 host 的 STJ
-         （host redirect 10.0.0.0→10.0.0.2 on 18.5.2 / 10.0.0.4 on 18.7）。 -->
-    <Reference Include="System.Text.Json">
-      <HintPath>$(NuGetPackageRoot)system.text.json\10.0.0\lib\net462\System.Text.Json.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+    <!-- STJ：在 ResolveVsSdkReferences target 里动态引用（因为 VsSdkAssembliesPath
+         要等 vswhere 跑完才正确）。见下方 ResolveVsSdkReferences target。 -->
     <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
     <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
   </ItemGroup>
 
-  <!-- Discover VS SDK path via vswhere when the default path (VS2022) is absent.
-       -sort by major version ascending would be ideal, but vswhere lacks ascending
-       sort, so we list all matching installs and pick the FIRST (vswhere default
-       sort is version-descending; we work around by querying oldest-first via
-       separate version-range calls). -->
+  <!-- Discover VS SDK path via vswhere based on VsTarget.
+       Each target queries only its own version range — no fallback logic. -->
   <Target Name="ResolveVsSdkPath" BeforeTargets="ResolveAssemblyReferences"
           Condition="!Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll') And Exists('$(VsWherePath)')">
-    <!-- Try VS2022 first (Dev17, oldest targeted). -->
+    <!-- VS2022 (Dev17) -->
     <Exec Command='"$(VsWherePath)" -version "[17.0,18.0)" -property installationPath'
-          ConsoleToMSBuild="true" Condition=" '$(_Vs2022Path)' == '' ">
-      <Output TaskParameter="ConsoleOutput" PropertyName="_Vs2022Path" />
+          ConsoleToMSBuild="true" Condition=" '$(VsTarget)' == 'vs2022' ">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_VsInstallPath" />
     </Exec>
-    <PropertyGroup Condition=" '$(_Vs2022Path)' != '' ">
-      <_VsInstallPath>$(_Vs2022Path)</_VsInstallPath>
-    </PropertyGroup>
-    <!-- Fall back to VS2026 (Dev18) if VS2022 is absent. -->
+    <!-- VS2026 (Dev18) -->
     <Exec Command='"$(VsWherePath)" -version "[18.0,19.0)" -property installationPath'
-          ConsoleToMSBuild="true" Condition=" '$(_VsInstallPath)' == '' ">
-      <Output TaskParameter="ConsoleOutput" PropertyName="_Vs2026Path" />
+          ConsoleToMSBuild="true" Condition=" '$(VsTarget)' == 'vs2026' ">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_VsInstallPath" />
     </Exec>
-    <PropertyGroup Condition=" '$(_VsInstallPath)' == '' And '$(_Vs2026Path)' != '' ">
-      <_VsInstallPath>$(_Vs2026Path)</_VsInstallPath>
-    </PropertyGroup>
     <PropertyGroup Condition=" '$(_VsInstallPath)' != '' ">
       <VsSdkAssembliesPath>$(_VsInstallPath)\Common7\IDE\PublicAssemblies</VsSdkAssembliesPath>
     </PropertyGroup>
-    <Warning Text="[VsMcp] VS2022 not found on this machine; falling back to $(_VsInstallPath) — the compiled VSIX may not load on VS2022 if the code calls APIs added after Dev17." Condition=" '$(_VsInstallPath)' != '' And '$(_Vs2022Path)' == '' " />
-    <Error Text="[VsMcp] No Visual Studio installation found via vswhere. Install VS2022 or VS2026, or pass /p:VsSdkAssembliesPath=..." Condition=" '$(_VsInstallPath)' == '' " />
-    <Message Text="[VsMcp] Resolved VS SDK via vswhere: $(VsSdkAssembliesPath)" Importance="high" Condition=" '$(_VsInstallPath)' != '' " />
+    <Error Text="[VsMcp] No Visual Studio installation found for VsTarget=$(VsTarget). Install the matching VS version, or pass /p:VsSdkAssembliesPath=..." Condition=" '$(_VsInstallPath)' == '' " />
+    <Message Text="[VsMcp] VsTarget=$(VsTarget) resolved via vswhere: $(VsSdkAssembliesPath)" Importance="high" Condition=" '$(_VsInstallPath)' != '' " />
   </Target>
 
   <!-- Bind Microsoft.VisualStudio.Threading to the SAME VS install that provides
@@ -173,22 +154,9 @@
         <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\NavigateTo\Microsoft.VisualStudio.Language.NavigateTo.Interfaces.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- LSP client 契约 —— find_symbol 经 ILanguageServiceBroker2 直接对 VC Language
-           Server 发 workspace/symbol。公共 RequestAllAsync 路径内部会包含
-           DisableUserExperience(true) 的 C++ 客户端（经典 NavigateTo v1 适配器会把它
-           过滤掉，导致 0 结果），所以走 LSP 才能拿到 C++ 符号。 -->
-      <Reference Include="Microsoft.VisualStudio.LanguageServer.Client">
-        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Client.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.LanguageServer.Client.Implementation">
-        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Client.Implementation.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.LanguageServer.Protocol">
-        <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\LanguageServer\Microsoft.VisualStudio.LanguageServer.Protocol.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
+      <!-- LSP client 三件套（Client/Implementation/Protocol）已移除：C# 符号查找原经
+           ILanguageServiceBroker2.RequestAllAsync，但 Implementation.dll ref BCL 致
+           0x80131040 死结。C# 路径暂移除，后续对齐 C++ 的 VC CodeStore 方案重做。 -->
       <!-- VC 原生 CodeStore —— find_symbol 经 IVCNavigateToFactory 查 C++ 符号
            （Ctrl+T / SymbolScanner 的真正后端，in-proc COM，不经 LSP broker；
            LSP RequestAllAsync 对 C++ 永远 0，因为 C++ 不注册 broker client）。
@@ -244,12 +212,14 @@
         <HintPath>$(VsSdkAssembliesPath)\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- Microsoft.Bcl.AsyncInterfaces：IAsyncEnumerable<T>（SymbolFacade LSP
-           RequestAllAsync 返回值）。host LanguageServer.Client.Implementation 引用
-           10.0.0.3，NuGet 最高 10.0.0.0 低于它 → CS1705。引 host PublicAssemblies
-           （Private=false），assembly 10.0.0.3 匹配 host。 -->
-      <Reference Include="Microsoft.Bcl.AsyncInterfaces">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+      <!-- Microsoft.Bcl.AsyncInterfaces 已移除：C# LSP 路径移除后 VS 包不再用
+           IAsyncEnumerable/IAsyncDisposable，BCL 死结（Implementation ref BCL +
+           18.5.2 range）随之消除。 -->
+      <!-- System.Text.Json：引 host PublicAssemblies（Private=false）。
+           VS2022 host 是 STJ 9.0.0.0；VS2026 host 是 STJ 10.0.0.x。
+           编译用哪个 VS 就绑哪个版本元数据，运行时走 host codeBase。 -->
+      <Reference Include="System.Text.Json">
+        <HintPath>$(VsSdkAssembliesPath)\System.Text.Json.dll</HintPath>
         <Private>false</Private>
       </Reference>
       <!-- VS 包代码直接用的 polyfill：System.Text.Encodings.Web（JavaScriptEncoder）、
@@ -388,6 +358,26 @@
       </Content>
     </ItemGroup>
     <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(VsMcpGatewayOutputDir)" Importance="high" />
+  </Target>
+
+  <!-- Select the version-specific vsixmanifest based on VsTarget.
+       VSSDK.BuildTools auto-detects "source.extension.vsixmanifest" by name,
+       so we copy the target-specific file to that canonical name before it runs. -->
+  <Target Name="SelectManifest" BeforeTargets="FindSourceVsixManifest">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)source.extension.vsixmanifest.$(VsTarget)"
+          DestinationFiles="$(MSBuildThisFileDirectory)source.extension.vsixmanifest"
+          SkipUnchangedFiles="false"
+          Condition="Exists('$(MSBuildThisFileDirectory)source.extension.vsixmanifest.$(VsTarget)')" />
+    <Message Text="[VsMcp] Selected manifest for VsTarget=$(VsTarget)" Importance="high" />
+  </Target>
+
+  <!-- Rename the VSIX output to include the target suffix so both versions
+       can coexist in the same output directory. -->
+  <Target Name="RenameVsixByTarget" AfterTargets="CreateVsixContainer"
+          Condition=" '$(VsTarget)' != '' And '$(TargetVsixContainer)' != '' ">
+    <Move SourceFiles="$(TargetVsixContainer)"
+          DestinationFiles="$(TargetDir)VsMcp-$(VsTarget).vsix" />
+    <Message Text="[VsMcp] Renamed VSIX -> VsMcp-$(VsTarget).vsix" Importance="high" />
   </Target>
 
 </Project>

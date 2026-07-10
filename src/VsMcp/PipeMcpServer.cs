@@ -30,7 +30,7 @@ namespace VsMcp
     /// 连接范式（Wave 3 已验证）。VS 端请求处理是串行的（读一帧、处理、回帧），
     /// 无并发读写，故 Asynchronous handle 安全。
     /// </summary>
-    public sealed class PipeMcpServer : IAsyncDisposable, IDisposable
+    public sealed class PipeMcpServer : IDisposable
     {
         private const string GatewayPipeName = "vs-mcp-gateway";
 
@@ -539,40 +539,12 @@ namespace VsMcp
         }
 
         /// <summary>
-        /// 异步停机：取消连接循环 → 观察循环退出。
-        /// 幂等（_disposeLock + _disposed）。ToolExecutor 无需 Dispose（无托管资源）。
+        /// 异步停机逻辑已并入同步 Dispose（取消 _loopCts，_connectLoop fire-and-forget
+        /// 退出，绝不阻塞 VS exit 调用线程）。原 DisposeAsync 已删除：它是 .NET Core 的
+        /// IAsyncDisposable，net48 无此接口需 Microsoft.Bcl.AsyncInterfaces polyfill，
+        /// 而 BCL 随 VS 小版本变致 0x80131040 死结。去掉 IAsyncDisposable 后 VS 包不再
+        /// 依赖 BCL。调用方（VsDebuggerMcpPackage）本就用同步 Dispose，无行为变化。
         /// </summary>
-        public async ValueTask DisposeAsync()
-        {
-            if (_disposed)
-                return;
-
-            await _disposeLock.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                if (_disposed)
-                    return;
-                _disposed = true;
-
-                try { _loopCts?.Cancel(); } catch (ObjectDisposedException) { }
-
-                if (_connectLoop != null)
-                {
-#pragma warning disable VSTHRD003
-                    try { await _connectLoop.ConfigureAwait(false); }
-                    catch (OperationCanceledException) { }
-                    catch { /* 停机期间绝不能抛异常 */ }
-#pragma warning restore VSTHRD003
-                }
-
-                _loopCts?.Dispose();
-            }
-            finally
-            {
-                _disposeLock.Release();
-            }
-        }
-
         private static void TryDispose(IDisposable? disposable)
         {
             try { disposable?.Dispose(); } catch { /* 尽力而为 */ }

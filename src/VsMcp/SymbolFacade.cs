@@ -12,8 +12,6 @@ using EnvDTE;
 using EnvDTE80;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.ComponentModelHost;
-using Microsoft.VisualStudio.LanguageServer.Client;
-using Microsoft.VisualStudio.LanguageServer.Protocol;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 
@@ -115,43 +113,11 @@ namespace VsMcp
             }
             catch (Exception ex) { ProbeLog($"FIND VC threw {ex.GetType().Name}: {ex.Message}"); }
 
-            // C#/VB 等：经 LSP workspace/symbol（ILanguageServiceBroker2 聚合已注册 LSP client）。
-            var broker = await GetBrokerAsync(ct);
-            if (broker == null)
-            {
-                ProbeLog("FIND broker=NULL (ILanguageServiceBroker2 不可用)");
-            }
-            else
-            {
-                ProbeLog($"FIND broker type={broker.GetType().Name}");
-                var request = new GeneralRequest<WorkspaceSymbolParams, SymbolInformation[]>
-                {
-                    Method = "workspace/symbol",
-                    Request = new WorkspaceSymbolParams { Query = query },
-                };
-                int clients = 0;
-                try
-                {
-                    await foreach (var (clientName, response) in broker
-                        .RequestAllAsync<WorkspaceSymbolParams, SymbolInformation[]>(request, ct)
-                        .WithCancellation(ct).ConfigureAwait(true))
-                    {
-                        clients++;
-                        int n = response?.Length ?? 0;
-                        ProbeLog($"FIND LSP client='{clientName}' symbols={n}");
-                        if (n > 0)
-                        {
-                            foreach (var si in response!)
-                            {
-                                var hit = ExtractFromSymbolInformation(si);
-                                if (hit != null) hits.Add(hit);
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex) { ProbeLog($"FIND LSP RequestAllAsync threw {ex.GetType().Name}: {ex.Message}"); }
-                ProbeLog($"FIND LSP clients={clients}");
-            }
+            // C# LSP 路径已移除：原经 ILanguageServiceBroker2.RequestAllAsync 查 C#/VB 符号，
+            // 但 Implementation.dll ref Microsoft.Bcl.AsyncInterfaces，BCL 随 VS 小版本变
+            // （18.5.2: 10.0.0.2 / 18.7: 10.0.0.4）+ CS1705（Implementation ref 10.0.0.3）
+            // 致 0x80131040 死结。后续对齐 C++ 的 VC CodeStore 方案重新实现 C# 符号查找。
+            // 当前 find_symbol 仅 C++ 符号可查（VcSymbolSearcher / IVCNavigateToFactory）。
 
             ProbeLog($"FIND END total hits={hits.Count}");
 
@@ -228,56 +194,7 @@ namespace VsMcp
             }, ct);
         }
 
-        /// <summary>
-        /// 获取 LSP 公共 broker（<see cref="ILanguageServiceBroker2"/>，MEF 导出）。经
-        /// <c>SComponentModel</c> 拿，避免直接 new 缺依赖；切 UI 线程（MEF 解析要求）。
-        /// </summary>
-        private async Task<ILanguageServiceBroker2?> GetBrokerAsync(CancellationToken ct)
-        {
-            await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
-            try
-            {
-                var cm = (IComponentModel?)await _package.GetServiceAsync(typeof(SComponentModel));
-                return cm?.GetService<ILanguageServiceBroker2>();
-            }
-            catch (Exception ex)
-            {
-                ProbeLog($"FIND GetBroker threw {ex.GetType().Name}: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// 从 LSP <see cref="SymbolInformation"/> 直接提取符号 + 源位置（file/1-based line/column）。
-        /// LSP 位置 0-based，+1 转 1-based。字段全 public，无需反射。
-        /// </summary>
-        private static SymbolMatch? ExtractFromSymbolInformation(SymbolInformation si)
-        {
-            if (si == null) return null;
-
-            string? filePath = si.Location?.Uri?.LocalPath;
-            int line = -1, column = -1;
-            var start = si.Location?.Range?.Start;
-            if (start != null)
-            {
-                line = start.Line + 1;       // LSP 0-based → 1-based
-                column = start.Character + 1;
-            }
-
-            if (string.IsNullOrEmpty(si.Name) && filePath == null)
-                return null;
-
-            return new SymbolMatch(
-                Name: si.Name ?? "",
-                FilePath: filePath,
-                Line: line,
-                Column: column,
-                Kind: VcKindLabels.ToFriendly(si.Kind.ToString()),
-                Language: "",
-                Container: si.ContainerName);
-        }
-
-        /// <summary>按文件扩展名推断语言串（补全 LSP C# 命中缺失的 Language，供 language 过滤）。</summary>
+        /// <summary>按文件扩展名推断语言串（VC 命中 Language 为空时按扩展名补全，供 language 过滤）。</summary>
         private static string InferLanguage(string? filePath)
         {
             switch (Path.GetExtension(filePath ?? "").ToLowerInvariant())
