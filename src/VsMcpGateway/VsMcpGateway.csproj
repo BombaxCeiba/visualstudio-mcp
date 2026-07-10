@@ -33,7 +33,9 @@
     <Compile Include="..\VsMcp.Common\PipeFraming.cs" Link="Common\PipeFraming.cs" />
     <Compile Include="..\VsMcp.Common\PipeProtocol.cs" Link="Common\PipeProtocol.cs" />
     <Compile Include="..\VsMcp.Common\ExtensionVersion.cs" Link="Common\ExtensionVersion.cs" />
-    <!-- ToolSchema.cs 已删除——SDK 反射 McpServerTool 委托签名自动生成 schema。 -->
+    <!-- 工具描述表：Gateway 本地构造 tools/list 响应时读它（不转发 VS）。
+         工具名与 VS 端 ToolExecutor 的 case 一一对应。 -->
+    <Compile Include="..\VsMcp.Common\ToolSchema.cs" Link="Common\ToolSchema.cs" />
   </ItemGroup>
 
   <ItemGroup>

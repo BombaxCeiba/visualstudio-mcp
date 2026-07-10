@@ -28,8 +28,11 @@ namespace VsMcpGateway
             string.Equals(toolName, SelectInstanceName, StringComparison.Ordinal);
 
         // ─────────────────────── 本地 MCP 响应 ──────────────────────
-        // 以下响应构造方法已废弃——SDK 自动处理 initialize/tools-list。
-        // 临时删除 ToolSchema 引用；后续 SDK 重写完成后删除这些方法。
+        // initialize / tools-list 由 Gateway 本地构造，不转发 VS：
+        //   initialize —— 协议头 + serverInfo + instructions（见 ServerInstructions）
+        //   tools/list —— 2 个 gateway 工具 + ToolSchema 全部 VS 工具
+        // tools/call 才按四层路由转发到 VS。SDK 自动生成 schema 的路线已弃用，
+        // 工具描述集中在 ToolSchema（与 VS 端 ToolExecutor 的工具名一一对应）。
 
         /// <summary>
         /// 构造 initialize 的 JSON-RPC 响应（临时实现）。
@@ -63,12 +66,14 @@ namespace VsMcpGateway
         /// </summary>
         public static string BuildToolsListResponse(object jsonRpcId, bool includeGoToDefinition, bool includeEvalCsharp)
         {
+            // 组合 gateway 工具 + VS 工具。gateway 工具在前，让 agent 先看到多路复用器。
             var allTools = new List<object>();
             allTools.Add(new
             {
                 name = ListInstancesName,
                 description = "Lists all running Visual Studio instances connected to the gateway. Returns PID, solution path, solution directory, and debugger state for each instance.",
                 inputSchema = new { type = "object", properties = new { }, required = new string[] { } },
+                annotations = new { readOnlyHint = true, destructiveHint = false },
             });
             allTools.Add(new
             {
@@ -80,8 +85,9 @@ namespace VsMcpGateway
                     properties = new { pid = new { type = "integer", description = "VS process ID to bind to" } },
                     required = new[] { "pid" },
                 },
+                annotations = new { readOnlyHint = false, destructiveHint = false },
             });
-            // TODO: SDK 重写后移除——SDK 自动生成完整工具列表
+            allTools.AddRange(ToolSchema.GetAllTools(includeGoToDefinition, includeEvalCsharp));
 
             var resp = new
             {
