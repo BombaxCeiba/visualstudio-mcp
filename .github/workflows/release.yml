@@ -73,6 +73,12 @@ jobs:
       # 版本号由构建时的 VsMcp.csproj PatchManifestVersion target 从 /p:VsMcpVersion 注入 manifest，
       # AssemblyInformationalVersion 注入代码（单一真相源 Directory.Build.props），不再单独 patch 文件。
 
+      # VS 的 msbuild 不像 dotnet build 自动 NuGet restore，CI 全新 checkout 需显式 restore
+      # （否则 NETSDK1004 project.assets.json not found）。传同样的 VsTarget/VsMcpVersion，
+      # 因 STJ/BCL/Encodings 的 NuGet 版本随 VsTarget 变。ProjectReference 级联 restore Gateway。
+      - name: Restore NuGet packages
+        run: msbuild src\VsMcp\VsMcp.csproj /t:Restore /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:VsMcpVersion=${{ steps.version.outputs.version }} /p:EvalCsharpEnabled=false /v:minimal /nologo
+
       - name: Build Release VSIX (${{ matrix.vs-target }})
         run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:VsMcpVersion=${{ steps.version.outputs.version }} /p:EvalCsharpEnabled=false /v:minimal /nologo
 
