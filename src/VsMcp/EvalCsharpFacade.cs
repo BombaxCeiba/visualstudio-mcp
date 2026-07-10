@@ -55,9 +55,6 @@ namespace VsMcp
         private MethodInfo? _compilationCreate;
         private MethodInfo? _emit;
 
-        // 引用程序集列表缓存：VS 启动后基本不变，首次建后复用，避免每次编译都遍历 + CreateFromFile。
-        private object? _cachedRefs;
-
         public EvalCsharpFacade(AsyncPackage package, ILogger<EvalCsharpFacade> logger)
         {
             _package = package ?? throw new ArgumentNullException(nameof(package));
@@ -295,7 +292,10 @@ public class __EvalScript
         private bool EnsureCompiler()
         {
             if (_loaded != 0) return _loadSucceeded;
-            _loaded = 1;
+            // 不在此设 _loaded：Roslyn 是 VS 按需加载的（打开 .cs 文件 / C# 项目后才进 AppDomain）。
+            // 启动早期或纯 C++ solution 首调 eval_csharp 时 Roslyn 可能还没加载，此时 return false
+            // 但不缓存 _loaded，让下次调用重试。只有 Roslyn 确实找到后才设 _loaded=1（下方），
+            // 之后反射/绑定失败才缓存（那些非临时，重试无益）。
             try
             {
                 // VS 加载的 Microsoft.CodeAnalysis / .CSharp（default context）。理论上各只有一个
@@ -306,9 +306,10 @@ public class __EvalScript
                     .FirstOrDefault(a => a.GetName().Name == "Microsoft.CodeAnalysis.CSharp");
                 if (ca == null || cs == null)
                 {
-                    _loadError = $"VS 未加载 Roslyn 编译器：CodeAnalysis={ca != null}, CSharp={cs != null}";
+                    _loadError = $"VS 未加载 Roslyn 编译器：CodeAnalysis={ca != null}, CSharp={cs != null}（打开 .cs 文件触发 Roslyn 加载后会自动重试）";
                     return false;
                 }
+                _loaded = 1;  // Roslyn 找到——后续不再重试 Roslyn 查找
 
                 _metadataReferenceType = ca.GetType("Microsoft.CodeAnalysis.MetadataReference");
                 _csharpCompilationType = cs.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilation");
@@ -396,10 +397,12 @@ public class __EvalScript
             var trees = Array.CreateInstance(_syntaxTreeType, 1);
             trees.SetValue(tree, 0);
 
-            // 引用：VS 已加载程序集（default context，类型兼容）。首次建后缓存。
-            var refs = _cachedRefs as Array ?? BuildReferences(out error);
+            // 引用：VS 已加载程序集（default context，类型兼容）。不缓存——VS 按需加载程序集
+            // （VC 的 CppSvc.Internal/CodeStore.Internal 等，C++ solution 索引或首次 find_symbol 后
+            // 才进 AppDomain），首次 eval_csharp 若发生在这些 dll 加载前，缓存的引用列表会永久缺
+            // 它们。eval_csharp 调用频率低，每次重建（遍历 AppDomain + CreateFromFile）开销可接受。
+            var refs = BuildReferences(out error);
             if (refs == null) return null;
-            _cachedRefs = refs;
 
             var outputKindValue = Enum.Parse(_outputKindType, "DynamicallyLinkedLibrary");
             object options;
