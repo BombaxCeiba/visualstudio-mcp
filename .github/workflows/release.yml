@@ -53,21 +53,22 @@ jobs:
           Write-Host "Version: $version (prerelease=$isPrerelease)"
 
       # 把 tag 版本号注入对应的 vsixmanifest 文件。
+      # 注意：成败要看「正则是否命中」，不能看「内容是否变化」——dispatch 时 version 从 manifest
+      # 读出再写回、或 tag 版本恰好等于 manifest 现值时，替换必然无变化，按内容比较会把成功误判成失败。
       - name: Patch VSIX manifest version
         shell: pwsh
         run: |
           $manifestPath = "src/VsMcp/source.extension.vsixmanifest.${{ matrix.vs-target }}"
-          $content = Get-Content $manifestPath -Raw
+          $content = [IO.File]::ReadAllText($manifestPath)
           $version = '${{ steps.version.outputs.version }}'
-          $patched = [regex]::Replace(
-              $content,
-              '(<Identity\s[^>]*?\sVersion=")[^"]+(")',
-              "`${1}${version}`${2}")
-          if ($patched -eq $content) {
-            throw "Failed to patch Version in $manifestPath"
+          $pattern = '(<Identity\s[^>]*?\sVersion=")[^"]+(")'
+          $regex = [regex]$pattern
+          if (-not $regex.IsMatch($content)) {
+            throw "Identity/Version 属性未找到，无法 patch：$manifestPath"
           }
-          Set-Content -Path $manifestPath -Value $patched -NoNewline
-          Write-Host "Patched Version -> $version in $manifestPath"
+          $patched = $regex.Replace($content, "`${1}${version}`${2}")
+          [IO.File]::WriteAllText($manifestPath, $patched)
+          Write-Host "Patched Version -> $version in $manifestPath (changed=$($patched -ne $content))"
 
       - name: Build Release VSIX (${{ matrix.vs-target }})
         run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:EvalCsharpEnabled=false /v:minimal /nologo
