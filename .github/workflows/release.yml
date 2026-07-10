@@ -38,9 +38,10 @@ jobs:
           if ($env:GITHUB_REF -match '^refs/tags/v(.+)$') {
             $version = $matches[1]
           } else {
-            $manifest = Get-Content "src/VsMcp/source.extension.vsixmanifest.${{ matrix.vs-target }}" -Raw
-            if ($manifest -match '<Identity[^>]*\sVersion="([^"]+)"') {
-              $version = $matches[1]
+            # 单一真相源：dispatch（不发布）从 Directory.Build.props 的 VsMcpVersion 读版本号
+            $props = Get-Content "src/Directory.Build.props" -Raw
+            if ($props -match '<VsMcpVersion>([^<]+)</VsMcpVersion>') {
+              $version = $matches[1].Trim()
             }
           }
           if (-not $version) {
@@ -52,26 +53,11 @@ jobs:
           "prerelease=$isPrerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Version: $version (prerelease=$isPrerelease)"
 
-      # 把 tag 版本号注入对应的 vsixmanifest 文件。
-      # 注意：成败要看「正则是否命中」，不能看「内容是否变化」——dispatch 时 version 从 manifest
-      # 读出再写回、或 tag 版本恰好等于 manifest 现值时，替换必然无变化，按内容比较会把成功误判成失败。
-      - name: Patch VSIX manifest version
-        shell: pwsh
-        run: |
-          $manifestPath = "src/VsMcp/source.extension.vsixmanifest.${{ matrix.vs-target }}"
-          $content = [IO.File]::ReadAllText($manifestPath)
-          $version = '${{ steps.version.outputs.version }}'
-          $pattern = '(<Identity\s[^>]*?\sVersion=")[^"]+(")'
-          $regex = [regex]$pattern
-          if (-not $regex.IsMatch($content)) {
-            throw "Identity/Version 属性未找到，无法 patch：$manifestPath"
-          }
-          $patched = $regex.Replace($content, "`${1}${version}`${2}")
-          [IO.File]::WriteAllText($manifestPath, $patched)
-          Write-Host "Patched Version -> $version in $manifestPath (changed=$($patched -ne $content))"
+      # 版本号由构建时的 VsMcp.csproj PatchManifestVersion target 从 /p:VsMcpVersion 注入 manifest，
+      # AssemblyInformationalVersion 注入代码（单一真相源 Directory.Build.props），不再单独 patch 文件。
 
       - name: Build Release VSIX (${{ matrix.vs-target }})
-        run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:EvalCsharpEnabled=false /v:minimal /nologo
+        run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:VsMcpVersion=${{ steps.version.outputs.version }} /p:EvalCsharpEnabled=false /v:minimal /nologo
 
       - name: Package artifact + SHA256
         id: package
@@ -118,5 +104,5 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           draft: false

@@ -1,0 +1,32 @@
+<Project>
+  <!-- 单一真相源：从 Directory.Build.props 的 $(VsMcpVersion) 生成 AssemblyInformationalVersion
+       attribute 源文件。VsMcp.csproj 设 GenerateAssemblyInfo=false（用手写 AssemblyInfo.cs），
+       SDK 不自动生成 InformationalVersion，故此处补生成。ExtensionVersion.cs 运行时反射读它
+       拿到版本号（VS 日志 / Gateway 日志）。VsMcp 与 VsMcpGateway 都编译 ExtensionVersion.cs，
+       故放在 Directory.Build.targets 对 src/ 下所有项目生效，省去逐个 csproj 重复。 -->
+  <!-- 仅补 GenerateAssemblyInfo=false 的项目（VsMcp，用手写 AssemblyInfo.cs，SDK 不生成
+       InformationalVersion）。Gateway 默认 GenerateAssemblyInfo=true，SDK 会从 props 的
+       AssemblyInformationalVersion 自动生成，再补会 CS0579 重复。 -->
+  <Target Name="GenerateInformationalVersionAttribute" BeforeTargets="BeforeCompile"
+          Condition=" '$(GenerateAssemblyInfo)' == 'false' ">
+    <WriteInfoVersionAttribute File="$(IntermediateOutputPath)$(MSBuildProjectName).InformationalVersion.g.cs" Version="$(VsMcpVersion)" />
+    <ItemGroup>
+      <Compile Include="$(IntermediateOutputPath)$(MSBuildProjectName).InformationalVersion.g.cs" />
+    </ItemGroup>
+  </Target>
+
+  <UsingTask TaskName="WriteInfoVersionAttribute" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <File ParameterType="System.String" Required="true" />
+      <Version ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var dir = System.IO.Path.GetDirectoryName(File);
+        if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+        System.IO.File.WriteAllText(File, "[assembly: System.Reflection.AssemblyInformationalVersion(\"" + Version + "\")]");
+      ]]></Code>
+    </Task>
+  </UsingTask>
+</Project>

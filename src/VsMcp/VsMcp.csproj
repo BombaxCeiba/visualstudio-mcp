@@ -371,15 +371,41 @@
     <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(VsMcpGatewayOutputDir)" Importance="high" />
   </Target>
 
+  <!-- 单一真相源：把 Directory.Build.props 的 $(VsMcpVersion) 注入选中的 vsixmanifest 的
+       Identity Version（仅改复制出来的无后缀 manifest，源 .vs2022/.vs2026 占位值不动），
+       消除 manifest 与代码版本号各自维护的漂移。RoslynCodeTaskFactory 经 MSBuild 自带
+       的 Microsoft.Build.Tasks.Core.dll 加载（VS2022/VS2026 MSBuild 17/18 均支持）。 -->
+  <UsingTask TaskName="PatchManifestVersion" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ManifestPath ParameterType="System.String" Required="true" />
+      <Version ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        if (!System.IO.File.Exists(ManifestPath)) return true;
+        string content = System.IO.File.ReadAllText(ManifestPath);
+        string pattern = "(<Identity\\s[^>]*?\\sVersion=\")[^\"]*(\")";
+        string patched = System.Text.RegularExpressions.Regex.Replace(content, pattern,
+            m => m.Groups[1].Value + Version + m.Groups[2].Value);
+        if (patched != content) System.IO.File.WriteAllText(ManifestPath, patched);
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
   <!-- Select the version-specific vsixmanifest based on VsTarget.
        VSSDK.BuildTools auto-detects "source.extension.vsixmanifest" by name,
-       so we copy the target-specific file to that canonical name before it runs. -->
+       so we copy the target-specific file to that canonical name before it runs,
+       then inject the single-source $(VsMcpVersion) into its Identity Version. -->
   <Target Name="SelectManifest" BeforeTargets="FindSourceVsixManifest">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)source.extension.vsixmanifest.$(VsTarget)"
           DestinationFiles="$(MSBuildThisFileDirectory)source.extension.vsixmanifest"
           SkipUnchangedFiles="false"
           Condition="Exists('$(MSBuildThisFileDirectory)source.extension.vsixmanifest.$(VsTarget)')" />
-    <Message Text="[VsMcp] Selected manifest for VsTarget=$(VsTarget)" Importance="high" />
+    <PatchManifestVersion ManifestPath="$(MSBuildThisFileDirectory)source.extension.vsixmanifest"
+                          Version="$(VsMcpVersion)"
+                          Condition="Exists('$(MSBuildThisFileDirectory)source.extension.vsixmanifest')" />
+    <Message Text="[VsMcp] Selected manifest for VsTarget=$(VsTarget), Version=$(VsMcpVersion)" Importance="high" />
   </Target>
 
   <!-- Rename the VSIX output to include the target suffix so both versions
