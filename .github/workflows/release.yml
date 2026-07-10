@@ -30,6 +30,23 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      # VS2022 的 MSBuild 17 与 windows-2022 runner 预装的 .NET SDK 10 不兼容（SDK 10 要
+      # MSBuild 18）。装 SDK 9 + CI-only global.json 把 resolver 锚到 9.x。global.json 不进
+      # repo：本地仅 SDK 10 + VS2026 MSBuild 18，进 repo 会 break 本地构建。vs2026(MSBuild18
+      # +SDK10) 兼容，不需要。
+      - name: Setup .NET 9 SDK (vs2022)
+        if: matrix.vs-target == 'vs2022'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Pin .NET SDK to 9.x (vs2022, CI-only global.json)
+        if: matrix.vs-target == 'vs2022'
+        shell: pwsh
+        run: |
+          '{"sdk":{"version":"9.0.100","rollForward":"latestFeature","allowPrerelease":false}}' | Out-File global.json -Encoding utf8NoBOM
+          Write-Host "global.json:"; Get-Content global.json
+
       - name: Extract version
         id: version
         shell: pwsh
@@ -91,11 +108,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout (读 annotated tag message 作为 release body)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      # release body：参考 MaaEnd 简化版——不分类，按时间正序（旧→新）线性列出提交标题 +
+      # PR(若 commit 标题自带 (#N)) + 作者。范围：上一个 tag..当前 tag（首次发布则全历史）。
+      - name: 生成 release body
+        shell: bash
+        run: |
+          git fetch --tags --force origin "refs/tags/${{ github.ref_name }}"
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          RANGE="${PREV:+$PREV..}HEAD"
+          {
+            echo "## ${{ github.ref_name }}"
+            echo ""
+            git log --no-merges --reverse --pretty=format:"- %s  @%an" "$RANGE"
+            echo ""
+          } > release_body.md
+          echo "=== release_body.md ==="; cat release_body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -103,6 +141,6 @@ jobs:
           files: artifacts/*
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release_body.md
           prerelease: ${{ contains(github.ref_name, '-') }}
           draft: false
