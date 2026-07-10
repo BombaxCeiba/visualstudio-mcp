@@ -72,9 +72,9 @@ namespace VsMcp
             using var qcsScope = Com.Use(qcs);
 
             // 找目标类型——只要 Class/Struct/Interface/Union/Enum，排除同名 MemberFunc/Function。
+            // 收集**全部**类型候选（不止第一个），再按优先级挑 target——见 SelectTarget。
             var p = new CodeItemQueryParams { bstrName = typeName, fCaseInsensitive = true, cMaxResults = 50 };
-            long targetId = 0;
-            CodeItemRec targetRec = default;
+            var candidates = new List<CodeItemRec>();
             using (Com.Use(qcs.GetCodeItems(ref p), r => { r.Close(); }, out var results))
             {
                 results.MoveStart();
@@ -82,21 +82,24 @@ namespace VsMcp
                 {
                     var r = new CodeItemRec();
                     results.GetData(ref r);
-                    if (IsTypeKind(r.cik) && targetId == 0)
-                    {
-                        targetId = r.id.row;
-                        targetRec = r;
-                    }
+                    if (IsTypeKind(r.cik))
+                        candidates.Add(r);
                 }
             }
 
-            if (targetId == 0)
+            if (candidates.Count == 0)
                 return new TypeHierarchyResult(
                     Found: false, Query: typeName, Name: null, Kind: null, Language: null,
                     DefinitionFiles: new List<string>(),
                     Ancestors: new List<TypeRelativeNode>(),
                     Descendants: new List<TypeRelativeNode>(),
                     Siblings: new List<TypeRelativeNode>());
+
+            // 泛基类（如 UE 的 AGameModeBase）常被同名嵌套类型 / forward decl 抢占返回首位，
+            // 取第一个会选到无继承链的嵌套类型（demo 实测选到了 USceneCapturer::AGameModeBase）。
+            // SelectTarget 按优先级挑出"真类定义"。
+            var targetRec = SelectTarget(qcs, candidates);
+            long targetId = targetRec.id.row;
 
             string targetQual = FormatName(qcs, targetRec);
 
@@ -138,16 +141,44 @@ namespace VsMcp
                 Siblings: siblings);
         }
 
-        /// <summary>递归收集祖先链（沿 Bases 向上到根）。visited 防环 + 去重。</summary>
+        /// <summary>递归收集祖先链（沿 Bases 向上到根）。visited 防环 + 去重。
+        /// 注意：GetDirectBases 返回的 base 项其 id.row 是**继承关系边的 id**（非类型定义 id），
+        /// 直接拿它递归查 bases 会返回空（断链，祖先链只走一层）。必须经 ResolveType 用类型名
+        /// 重新解析出类型定义 id 才能继续向上（eval_csharp 验证：AGameModeBase→AInfo→AActor 走通）。</summary>
         private static void CollectBases(IVCQueryCodeStore qcs, long id, List<TypeRelativeNode> result, HashSet<long> visited)
         {
             foreach (var b in GetDirectBases(qcs, id))
             {
-                if (!visited.Add(b.id.row)) continue;
-                result.Add(MakeNode(qcs, b));
+                var baseType = ResolveType(qcs, b.bstrName);
+                long key = baseType != null ? baseType.Value.id.row : b.id.row;
+                if (!visited.Add(key)) continue;
+                // 用类型定义项渲染（file/line 落在类型定义处，比继承关系边更准）；解析失败退回关系项 b。
+                result.Add(MakeNode(qcs, baseType ?? b));
                 if (result.Count >= MaxRelatives) return;
-                CollectBases(qcs, b.id.row, result, visited);
+                if (baseType != null) CollectBases(qcs, baseType.Value.id.row, result, visited);
             }
+        }
+
+        /// <summary>用类型名解析出"类型定义"（CodeItemRec）。
+        /// GetDirectBases 返回的 base 项 id 是继承关系边 id，无法用于递归；用 base 的类型名 GetCodeItems
+        /// 重新查类型定义，复用 SelectTarget 选优（非嵌套 + 有 Bases 优先，避免 forward decl/嵌套误选）。
+        /// 返回 null：类型名查不到任何类型定义。</summary>
+        private static CodeItemRec? ResolveType(IVCQueryCodeStore qcs, string typeName)
+        {
+            if (string.IsNullOrEmpty(typeName)) return null;
+            var p = new CodeItemQueryParams { bstrName = typeName, fCaseInsensitive = true, cMaxResults = 50 };
+            var cands = new List<CodeItemRec>();
+            using (Com.Use(qcs.GetCodeItems(ref p), r => { r.Close(); }, out var res))
+            {
+                res.MoveStart();
+                while (res.MoveNext())
+                {
+                    var r = new CodeItemRec();
+                    res.GetData(ref r);
+                    if (IsTypeKind(r.cik)) cands.Add(r);
+                }
+            }
+            return cands.Count == 0 ? (CodeItemRec?)null : SelectTarget(qcs, cands);
         }
 
         /// <summary>直接基类列表（CodeItemRec，含 id 供递归）。</summary>
@@ -239,6 +270,32 @@ namespace VsMcp
             }
             catch { return ""; }
         }
+
+        /// <summary>从多个同名类型候选中挑出"真类定义"作为 target。
+        /// 优先级（eval_csharp demo 验证，AGameModeBase 的 19 匹配）：
+        /// 1. 非嵌套（限定名无 ::）且有直接基类——真类定义（GameModeBase.h 的 AGameModeBase : AInfo）。
+        /// 2. 非嵌套无基类——forward decl 兜底（如 4MLMANAGER.H 的前置声明）。
+        /// 3. 嵌套（含 ::）——如 USceneCapturer::AGameModeBase，最后才选。
+        /// 都不满足回退第一个候选（不回归旧行为）。
+        /// 单纯"非嵌套优先"不够：非嵌套里混着无基类的 forward decl 会误选，必须叠加"有基类"。</summary>
+        private static CodeItemRec SelectTarget(IVCQueryCodeStore qcs, List<CodeItemRec> candidates)
+        {
+            // 优先级 1：非嵌套 + 有直接基类（真类定义）。
+            foreach (var c in candidates)
+                if (!IsNested(qcs, c) && GetDirectBases(qcs, c.id.row).Count > 0)
+                    return c;
+            // 优先级 2：非嵌套（含无基类的 forward decl）。
+            foreach (var c in candidates)
+                if (!IsNested(qcs, c))
+                    return c;
+            // 优先级 3/兜底：嵌套或第一个候选。
+            return candidates[0];
+        }
+
+        /// <summary>是否嵌套类型——限定名（FullyQualified）含 :: 视为嵌套。
+        /// UE 核心类多在全局命名空间（AGameModeBase 无 ::），嵌套则如 USceneCapturer::AGameModeBase。</summary>
+        private static bool IsNested(IVCQueryCodeStore qcs, CodeItemRec r)
+            => FormatName(qcs, r).Contains("::");
 
         private static bool IsTypeKind(CodeItemKind k) =>
             k == CodeItemKind.CIK_Class || k == CodeItemKind.CIK_Struct ||
