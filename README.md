@@ -107,7 +107,7 @@
 
 | 工具 | 作用 |
 |---|---|
-| `find_symbol` | 按名字搜索符号：C++ 经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）、C#/VB 经 LSP。返回**每个符号 ±contextLines 行带行号的源码上下文**（纯文本，`▶` 标记符号行，`contextLines` 默认 10，可设 0 只看符号行）；`maxResults`/`maxChars` 限制输出（超限截断会提示调高 `maxChars`、减小 `contextLines` 或收窄 query） |
+| `find_symbol` | 按名字搜索 **C++ 符号**：经 VC CodeStore（`IVCNavigateToFactory`，与 Ctrl+T 同源）。**当前仅 C++ 可查**——C#/VB 的 LSP 路径已移除（BCL 死结），待对齐 VC CodeStore 方案重新实现。返回**每个符号 ±contextLines 行带行号的源码上下文**（纯文本，`▶` 标记符号行，`contextLines` 默认 5，可设 0 只看符号行）；结果**按文件聚合**（同名符号的 `.h` 声明 + `.cpp` 实现聚一起）；`kind` 已友好化为小写标签（`method`/`class`/`function`/`field`/`struct`/`enum`/`constructor`...，非 VS 内部枚举名）。可选过滤（均默认不过滤）：`language`（语言子串，如 `C++`/`cpp`）、`kind`（小写标签子串，封闭集合见工具 description）；`maxResults`/`maxChars` 限制输出（超限截断会提示调高 `maxChars`、减小 `contextLines` 或收窄 query） |
 | `get_type_hierarchy` | 返回类型的祖先链、派生类、兄弟类型（影响分析） |
 | `go_to_definition` | 解析指定位置的符号定义（可选，需在 Tools → Options 启用） |
 
@@ -115,7 +115,7 @@
 
 | 工具 | 作用 |
 |---|---|
-| `get_call_graph` | 查 C++ 函数的调用关系：`callers`（谁调用了它）或 `callees`（它调用了谁，默认）——VS 调用层次结构窗口同款后端（VC CallHierarchy API）。同名符号（重载、`.h` 声明 + `.cpp` 实现、各类同名方法）全部遍历、合并去重。callers 反向搜全 solution 较慢（热门函数 1-3 分钟），默认 `timeoutSeconds=180` + 搜索期间每 5s 推送 logging 心跳保活；纯虚接口声明不在 C++ 符号索引里，其 callers 在具体实现上查 |
+| `get_call_graph` | 查 C++ 函数的调用关系：`callers`（谁调用了它）或 `callees`（它调用了谁，默认）——VS 调用层次结构窗口同款后端（VC CallHierarchy API）。同名符号（重载、`.h` 声明 + `.cpp` 实现、各类同名方法）全部遍历、合并去重。callers 反向搜全 solution 较慢（热门函数 1-3 分钟），默认 `timeoutSeconds=180` + 搜索期间每 5s 推送**实时进度**（defId i/N + 已找到数 + 计时，经 `notifications/message`）保活，超时仍返回已收集的部分调用方；纯虚接口声明不在 C++ 符号索引里，其 callers 在具体实现上查 |
 
 ### 动态执行（可选，开发调试用）
 
@@ -242,7 +242,7 @@ Gateway 收到一个非 `initialize`、非路由工具的请求时，按以下�
 |---|---|---|
 | ✅ 已完成 | **构建控制** — 触发构建、读 build 输出 | AI 改完代码能验证编译 |
 | ✅ 已完成 | **调试器控制** — 断点、单步、调用栈、局部变量、表达式求值 | AI 能看到运行时状态 |
-| ✅ 已完成 | **符号导航** — find_symbol（C++/C#/VB，带源码上下文）/ get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
+| ✅ 已完成 | **符号导航** — find_symbol（C++，带源码上下文）/ get_type_hierarchy / go_to_definition | AI 用 VS 语义模型找定义，不再猜 |
 | ✅ 已完成 | **调用关系** — get_call_graph（C++ callers/callees，VS CallHierarchy 后端） | AI 做重构影响分析、追踪控制流，不再 grep |
 | ✅ 已完成 | **多实例 Gateway** — 一个端口后挂多个 VS，按工作区/会话路由 | 同时开多个项目不再端口冲突 |
 | 🚧 规划中 | **更多语言场景验证** — 当前核心验证 C++/CMake 与 C#（调试器本身语言无关） | 覆盖更多语言/项目模型 |
