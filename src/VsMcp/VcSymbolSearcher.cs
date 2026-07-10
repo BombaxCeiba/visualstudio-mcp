@@ -39,13 +39,14 @@ namespace VsMcp
             // UI 线程：取全局 VC 服务（COM 单例，同时实现 IVCNavigateToFactory）。
             await package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
             var svc = Package.GetGlobalService(typeof(CPPThreadSafeServiceClass));
-            if (svc == null) return empty;
+            if (svc == null) { SymbolFacade.ProbeLog("VC svc=NULL (CPPThreadSafeServiceClass 全局服务拿不到)"); return empty; }
             var factory = svc as IVCNavigateToFactory;
-            if (factory == null) return empty;
+            if (factory == null) { SymbolFacade.ProbeLog($"VC factory=NULL (svc type={svc.GetType().Name} 不实现 IVCNavigateToFactory)"); return empty; }
+            SymbolFacade.ProbeLog($"VC factory OK (svc type={svc.GetType().Name})");
 
             // 后台线程：CreateSession + DoSearch（VC 工作方法要求后台线程）。
             var session = await Task.Run(() => factory.CreateSession(), ct).ConfigureAwait(true);
-            if (session == null) return empty;
+            if (session == null) { SymbolFacade.ProbeLog("VC session=NULL (factory.CreateSession 返回 null)"); return empty; }
             // session 是每次新建的 RCW——方法级持有，方法结束（含任意 return）确定性 Close + Release。
             // Close 失败只记日志，不影响 Release（Com.Use 对 onDispose 和 Release 都 try/catch）。
             using var sessionScope = Com.Use(session, s =>
@@ -56,7 +57,7 @@ namespace VsMcp
 
             var results = await Task.Run(() => session.DoSearch(
                 query, false, VCSearchScope.ssEntireSolution, true, new VcCancel(ct)), ct).ConfigureAwait(true);
-            if (results == null) return empty;
+            if (results == null) { SymbolFacade.ProbeLog("VC results=NULL (session.DoSearch 返回 null)"); return empty; }
 
             var hits = new List<SymbolMatch>();
             using (Com.Use(results, r =>
