@@ -66,6 +66,11 @@ namespace VsMcp
         /// </summary>
         private volatile Stream? _activePipe;
 
+        private int _connectionCount;
+        /// <summary>Gateway 推送的绑到本 VS 的活跃 MCP 客户端会话数（connection-count 帧）。
+        /// 用于关闭 solution 前的确认弹窗。0 = 无 MCP 客户端在用。</summary>
+        public int ConnectionCount => Volatile.Read(ref _connectionCount);
+
         /// <summary>每次成功 register 后触发，供 solution-events 订阅者重新推送当前
         /// solution。这填补了一个时序缺口：在 pipe 连接之前打开的 solution 会丢失其
         /// OnAfterOpenSolution 事件（当时 pipe 为 null，WriteLockedAsync 静默返回）——
@@ -467,6 +472,18 @@ namespace VsMcp
                         _loggerFactory?.CreateLogger<PipeMcpServer>()
                             ?.LogInformation("tool-call {Id}: {Tool}", call.Id, call.Tool);
                         await HandleToolCallAsync(call, ct).ConfigureAwait(false);
+                    }
+                }
+                else if (string.Equals(type, "connection-count", StringComparison.Ordinal))
+                {
+                    PipeConnectionCount? cc;
+                    try { cc = JsonSerializer.Deserialize<PipeConnectionCount>(json, PipeFraming.Options); }
+                    catch (JsonException) { continue; }
+                    if (cc != null)
+                    {
+                        Volatile.Write(ref _connectionCount, cc.Count);
+                        _loggerFactory?.CreateLogger<PipeMcpServer>()
+                            ?.LogInformation("connection-count: {Count}", cc.Count);
                     }
                 }
                 // 其他帧类型（register 回显 / heartbeat / 旧 request 帧）被静默忽略，

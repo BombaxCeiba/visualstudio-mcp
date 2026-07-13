@@ -7,13 +7,17 @@ namespace VsMcpGateway
     /// <summary>
     /// 一个 MCP 客户端会话到 VS 实例的绑定。<see cref="Pid"/> 是路由目标；
     /// <see cref="VsSessionId"/> 是目标 VS 在 initialize 时分配的 Mcp-Session-Id
-    /// （这里作为每会话缓存——权威的每 VS 值存放在
+    ///（这里作为每会话缓存——权威的每 VS 值存放在
     /// <see cref="InstanceEntry.VsSessionId"/>，让无状态的 Header 层路由能恢复它）。
     /// <see cref="VsSessionId"/> 在 <c>select_vs_instance</c> 切换后为 null——新 VS
     /// 尚未 initialize，所以 Wave 2 在该状态下返回"再次 initialize"错误（完整的懒
     /// initialize 是后续增强）。
     /// <see cref="HintPending"/> 由 ③ 自动绑定路径（及 initialize 单实例 fallback）
     /// 设置，门控注入到下一次 tool-call result 的一次性 hint（设计文档 §③ MI-07）。
+    /// <see cref="Alive"/> 标记 GET SSE 长连接是否在——只有维持长连接的客户端才计入
+    /// <see cref="SessionTable.CountActiveFor"/>（关闭确认弹窗的"正在使用"判定）。这是存活的
+    /// **唯一**权威信号，取代不可靠的"上次活动时间"老化（idle 误判 / 关闭漏报，已弃用）。
+    /// 不维持 GET 的客户端（不支持 SSE 订阅）Alive 永远 false → 不阻止 VS 退出（功能对其失效）。
     /// </summary>
     public sealed class SessionBinding
     {
@@ -21,6 +25,17 @@ namespace VsMcpGateway
         public string? VsSessionId { get; set; }
         public DateTime BoundAt { get; set; }
         public string Source { get; set; } = "";
+
+        private int _aliveRaw;
+        /// <summary>GET SSE 长连接在 = 客户端在线且能接收 server 推送。只有维持 GET 长连接的客户端
+        /// 才计入 <see cref="SessionTable.CountActiveFor"/>（关闭确认弹窗的"正在使用"判定）；不维持
+        /// GET 的客户端（不支持 SSE 订阅 / 订阅后断开）→ Alive=false → 不阻止 VS 退出——功能对这类
+        /// 客户端视为不存在，符合"不阻止用户退出"的设计。</summary>
+        public bool Alive
+        {
+            get => _aliveRaw != 0;
+            set => Interlocked.Exchange(ref _aliveRaw, value ? 1 : 0);
+        }
 
         // int 后备 + Interlocked：让 ClaimHint 能原子占有 hint，杜绝多个并发 tools/call 都读到
         // HintPending=true 而重复注入。并发下两个请求都合法看到 true（不是时序竞态，是共享 flag
@@ -81,7 +96,7 @@ namespace VsMcpGateway
 
         /// <summary>用客户端自带的 session id 建绑定（客户端带 Mcp-Session-Id 但不在表里时，
         /// 替代 <see cref="CreateWithId"/> 生成新 id）。返回 binding + 是否本次新建。
-        /// 复用现有 binding 时不改状态（<see cref="SessionBinding.HintPending"/> 已清除的保持清除，
+        /// 复用现有 binding 时不改状态（<see cref="SessionBinding.HintPending"/> 已清除的保持清除,
         /// 避免每次重复注入 auto-bind hint——客户端带自己缓存/生成的 id 时的常见情形）。</summary>
         public (SessionBinding Binding, bool Created) GetOrAdd(string clientSessionId, int pid, string? vsSessionId, string source)
         {
@@ -94,6 +109,45 @@ namespace VsMcpGateway
             // GetOrAdd 处理并发：另一线程可能同时建了同名 binding，此时返回那个、Created=false。
             var actual = _byClientSession.GetOrAdd(clientSessionId, created);
             return (actual, ReferenceEquals(actual, created));
+        }
+
+        /// <summary>标记客户端断开（GET keep-alive 写失败 / POST 响应写失败 / DELETE 前置）。返回是否
+        /// 状态翻转（Alive true→false）——调用方据此推送连接数（仅翻转时推，避免重复推送）。</summary>
+        public bool MarkGone(string clientSessionId)
+        {
+            if (_byClientSession.TryGetValue(clientSessionId, out var b) && b.Alive)
+            {
+                b.Alive = false;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>GET subscribe：客户端打开 SSE 长连接 = 在线。返回是否状态翻转（Alive false→true）
+        /// ——调用方据此推送连接数（仅翻转时推）。存活判定靠 GET 长连接，POST 不触发此方法：POST 是
+        /// 短暂请求、不维持长连接，若让 POST 复活 Alive，不维持 GET 的客户端就会因发请求而意外阻止
+        /// VS 退出，违背"不维持长连接的客户端视为功能不存在"的设计。</summary>
+        public bool MarkAlive(string clientSessionId)
+        {
+            if (_byClientSession.TryGetValue(clientSessionId, out var b) && !b.Alive)
+            {
+                b.Alive = true;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>绑到指定 VS 且当前维持 GET SSE 长连接（Alive）的会话数。用于关闭确认弹窗的"正在使用"
+        /// 判定——只数维持长连接的客户端；不维持 GET 的客户端（不支持 SSE 订阅 / 已断开）不计入，功能
+        /// 对其失效、不阻止退出。不靠时间老化。</summary>
+        public int CountActiveFor(int pid)
+        {
+            int n = 0;
+            foreach (var kv in _byClientSession)
+            {
+                if (kv.Value.Pid == pid && kv.Value.Alive) n++;
+            }
+            return n;
         }
 
         public bool TryGet(string clientSessionId, out SessionBinding binding) =>

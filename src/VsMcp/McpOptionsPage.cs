@@ -31,5 +31,11 @@ namespace VsMcp
         /// </summary>
         public bool EnableEvalCsharp { get; set; } = true;
 #endif
+
+        /// <summary>关闭 solution / 退出 VS 时，若有 MCP 客户端正在使用本 VS，弹窗确认。
+        /// 默认 true：防止误关 VS 打断 MCP 会话。读不到/异常时默认启用（保守弹窗）。
+        /// 设置只在 VS 启动时读一次（GetDialogPage 在 OnQueryCloseSolution 里即时读，
+        /// 改完立即生效，无需重启）。</summary>
+        public bool ConfirmCloseWithConnections { get; set; } = true;
     }
 }

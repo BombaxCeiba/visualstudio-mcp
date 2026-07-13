@@ -67,6 +67,18 @@ namespace VsMcp
             return _dte;
         }
 
+        /// <summary>读取当前 solution 的目录（VS 原生 solution 边界）。复用
+        /// <see cref="DebuggerFacade.ReadSolutionPaths"/>：优先 IVsSolution.GetSolutionInfo
+        ///（.sln/.slnx/Open Folder 权威），DTE.Solution.FullName 兜底。作为 find_symbol
+        /// 白名单过滤系统/SDK 头的边界。</summary>
+        private async Task<string?> ReadSolutionDirAsync(CancellationToken ct)
+        {
+            var vsSolution = (IVsSolution?)await _package.GetServiceAsync(typeof(SVsSolution));
+            var dte = await GetDteAsync(ct).ConfigureAwait(true);
+            var (_, dir) = DebuggerFacade.ReadSolutionPaths(vsSolution, dte);
+            return dir;
+        }
+
         /// <summary>
         /// 通过 NavigateTo——VS 的"转到所有"(Ctrl+, / Ctrl+T) 后端——跨所有
         /// 语言搜索符号。NavigateTo 通过 LSP <c>workspace/symbol</c> 能力聚合
@@ -93,11 +105,16 @@ namespace VsMcp
             // 4× —— 假设过滤保留率 ≥25%（同类/同语言符号通常占命中 1/4 以上），收 4 倍量→过滤后大概率仍 ≥ limit；
             // 64  —— limit 小时 4× 太少、过滤空间不足，垫到 64；200 —— limit 大时 4× 可能到几百，热门符号（命中上千）
             // 收集几百个会拖到数秒，封顶 200 保响应。无过滤仍传 limit（现状，不变慢）。
-            bool filtering = !string.IsNullOrEmpty(language) || !string.IsNullOrEmpty(kind);
-            int vcBuffer = filtering ? Math.Min(Math.Max(limit * 4, 64), 200) : limit;
+            // solutionDir 已知时按 solution 内/外排序（项目符号优先，系统符号排后，不排除）——
+            // 需放大 buffer 收集，否则 VC sort 靠前的系统符号会占满，项目符号进不来。
             await _package.JoinableTaskFactory.SwitchToMainThreadAsync(ct);
+            string? solutionDir = await ReadSolutionDirAsync(ct).ConfigureAwait(true);
 
-            ProbeLog($"FIND START query='{query}' limit={limit} vcBuffer={vcBuffer} lang='{language}' kind='{kind}' thread={System.Threading.Thread.CurrentThread.ManagedThreadId}");
+            bool filtering = !string.IsNullOrEmpty(language) || !string.IsNullOrEmpty(kind);
+            bool ranking = solutionDir != null;
+            int vcBuffer = (filtering || ranking) ? Math.Min(Math.Max(limit * 4, 64), 200) : limit;
+
+            ProbeLog($"FIND START query='{query}' limit={limit} vcBuffer={vcBuffer} lang='{language}' kind='{kind}' solDir='{solutionDir}' thread={System.Threading.Thread.CurrentThread.ManagedThreadId}");
 
             var hits = new List<SymbolMatch>();
 
@@ -141,7 +158,10 @@ namespace VsMcp
             }
             var ordered = processed
                 .GroupBy(h => (h.Name ?? "", h.FilePath ?? "", h.Line)).Select(g => g.First())
-                .OrderBy(h => h.FilePath ?? "￿", StringComparer.OrdinalIgnoreCase)
+                // solution 内（VS 原生边界）的符号排前；外部（系统/SDK 头）即使 includeSystem=true
+                // 返回了也排在项目内符号之后。
+                .OrderBy(h => solutionDir != null && VcSymbolSearcher.IsInSolution(h.FilePath, solutionDir) ? 0 : 1)
+                .ThenBy(h => h.FilePath ?? "￿", StringComparer.OrdinalIgnoreCase)
                 .ThenBy(h => h.Line)
                 .ToList();
             int total = ordered.Count;

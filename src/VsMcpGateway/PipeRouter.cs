@@ -331,6 +331,23 @@ namespace VsMcpGateway
             return new PipeToolResultData(pending.Content, pending.IsError);
         }
 
+        /// <summary>推送 connection-count 控制帧（G→V，无配对 id）。让 VS 知道绑它的活跃
+        /// MCP 客户端数，用于关闭 solution 前确认弹窗。fire-and-forget（不等响应）；
+        /// 失败（VS 断连等）只吞——下次 binding/register 变化或定时轮询会再推。</summary>
+        public async Task SendConnectionCountAsync(int count, CancellationToken ct)
+        {
+            if (_disposed) return;
+            await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await PipeFraming.WriteFrameAsync(_stream, new PipeConnectionCount { Count = count }, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
         private static bool IsBenignDisconnect(Exception ex)
         {
             return ex is IOException || ex is ObjectDisposedException;

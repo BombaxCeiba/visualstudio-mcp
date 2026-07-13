@@ -144,7 +144,42 @@ namespace VsMcp
         int IVsSolutionEvents.OnAfterLoadProject(IVsHierarchy pHierarchy, IVsHierarchy pStubHierarchy) => VSConstants.S_OK;
         int IVsSolutionEvents.OnQueryUnloadProject(IVsHierarchy pHierarchy, ref int pfCancel) => VSConstants.S_OK;
         int IVsSolutionEvents.OnBeforeUnloadProject(IVsHierarchy pHierarchy, IVsHierarchy pStubHierarchy) => VSConstants.S_OK;
-        int IVsSolutionEvents.OnQueryCloseSolution(object pUnkReserved, ref int pfCancel) => VSConstants.S_OK;
+        int IVsSolutionEvents.OnQueryCloseSolution(object pUnkReserved, ref int pfCancel)
+        {
+            try
+            {
+                // 设置开关（默认启用；读不到也默认启用，保守弹窗）
+                bool enabled = true;
+                try { enabled = ((McpOptionsPage)_package.GetDialogPage(typeof(McpOptionsPage))).ConfirmCloseWithConnections; }
+                catch { /* 读设置失败 → 默认启用 */ }
+                if (!enabled) return VSConstants.S_OK;
+
+                int count = _pipe.ConnectionCount;
+                if (count <= 0) return VSConstants.S_OK;
+
+                // 有 MCP 客户端在用——弹窗确认。OnQueryCloseSolution 在 UI 线程，可直接弹。
+                if (!ConfirmClose(count))
+                    pfCancel = 1;  // 用户选"否" → 阻止关闭 solution / 退出 VS
+            }
+            catch (Exception ex) { _logger?.LogDebug(ex, "OnQueryCloseSolution confirm failed"); }
+            return VSConstants.S_OK;
+        }
+
+        /// <summary>弹 VS 原生消息框问用户是否仍要关闭（OnQueryCloseSolution 在 UI 线程）。
+        /// 返回 true=继续关闭，false=取消。用 IVsUIShell.ShowMessageBox 避免引入 WPF 引用。</summary>
+        private bool ConfirmClose(int count)
+        {
+            var uiShell = Package.GetGlobalService(typeof(SVsUIShell)) as IVsUIShell;
+            if (uiShell == null) return true;  // 拿不到 shell → 不阻拦（别因弹窗失败卡住关闭）
+            const int IDYES = 6;
+            uiShell.ShowMessageBox(0, Guid.Empty, "VS MCP",
+                $"检测到 {count} 个 MCP 客户端正在使用本 VS。确定要关闭吗？",
+                null, 0,
+                OLEMSGBUTTON.OLEMSGBUTTON_YESNO,
+                OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND,
+                OLEMSGICON.OLEMSGICON_WARNING, 0, out int result);
+            return result == IDYES;
+        }
         int IVsSolutionEvents.OnBeforeCloseSolution(object pUnkReserved) => VSConstants.S_OK;
 
         // ───────────────────────── IVsSolutionEvents7 (folder mode) ──────────────

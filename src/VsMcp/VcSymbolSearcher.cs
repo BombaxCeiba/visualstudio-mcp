@@ -99,6 +99,30 @@ namespace VsMcp
             VCItemLang.ilMetadata => "Metadata",
             _ => lang.ToString(),
         };
+
+        /// <summary>判断文件路径是否在 solution 目录子树内（VS 原生 solution 边界，白名单）。
+        /// 归一化（/→\、去尾分隔符）后大小写不敏感前缀匹配 + 边界检查（防 X\MyApp 匹配 X\MyAppOther）。
+        /// filePath 空 → false（无路径信息，视为外部）。solutionDir 空由调用方先判。</summary>
+        internal static bool IsInSolution(string? filePath, string solutionDir)
+        {
+            if (string.IsNullOrEmpty(filePath) || string.IsNullOrEmpty(solutionDir)) return false;
+            string f = TrimDirSeparator(filePath!.Replace('/', '\\'));
+            string d = TrimDirSeparator(solutionDir.Replace('/', '\\'));
+            if (f.Length < d.Length) return false;
+            if (!f.StartsWith(d, StringComparison.OrdinalIgnoreCase)) return false;
+            return f.Length == d.Length || f[d.Length] == '\\';
+        }
+
+        private static string TrimDirSeparator(string s)
+        {
+            while (s.Length > 0 && (s[s.Length - 1] == '\\' || s[s.Length - 1] == '/'))
+            {
+                // 保留盘符根 "D:\"，剥掉会变 "D:" 被当盘符标签
+                if (s.Length == 3 && char.IsLetter(s[0]) && s[1] == ':') break;
+                s = s.Substring(0, s.Length - 1);
+            }
+            return s;
+        }
     }
 
     /// <summary>

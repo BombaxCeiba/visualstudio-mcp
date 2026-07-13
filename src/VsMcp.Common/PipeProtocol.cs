@@ -106,6 +106,18 @@ namespace VsMcp.Common
         public string Text { get; set; } = "";
     }
 
+    /// <summary>Gateway → VS：当前绑到本 VS 的活跃 MCP 客户端会话数。无配对 id（控制帧）。
+    /// Gateway 在 session 绑定 / VS register 时推送，让 VS 知道是否有 MCP 客户端在用——用于
+    /// 关闭 solution 前的确认弹窗。Count 只含近期活跃（LastActivity 在老化窗口内）的 session，
+    /// 避免 MCP 客户端已离开但 session 残留时的误报。</summary>
+    public sealed class PipeConnectionCount
+    {
+        /// <summary>固定 "connection-count"。</summary>
+        public string Type { get; set; } = "connection-count";
+        /// <summary>绑到本 VS 且近期活跃的 MCP 客户端会话数。</summary>
+        public int Count { get; set; }
+    }
+
     /// <summary>
     /// CallToolAsync 的返回值（Gateway 侧）。与帧 DTO PipeToolResult 区分：
     /// PipeToolResult 是 wire 帧类型，PipeToolResultData 是 PipeRouter

@@ -94,6 +94,24 @@ namespace VsMcpGateway
             return 0;
         }
 
+        // ─────────────────── connection-count 推送（关闭确认弹窗用）───────────────────
+
+        /// <summary>给指定 VS 推送其当前活跃 MCP 连接数（fire-and-forget）。仅在状态翻转时推
+        ///（register/select/MarkAlive/MarkGone/DELETE 触发），不做定时轮询——存活判定靠
+        /// GET SSE 长连接（subscribe 即 Alive、断开即 gone），不靠时间老化，无需周期重推。</summary>
+        private static void NotifyConnectionCount(int pid)
+        {
+            if (!Registry.TryGet(pid, out var entry)) return;
+            int count = Sessions.CountActiveFor(pid);
+            _ = NotifyConnectionCountCoreAsync(entry, count);
+        }
+
+        private static async Task NotifyConnectionCountCoreAsync(InstanceEntry entry, int count)
+        {
+            try { await entry.Router.SendConnectionCountAsync(count, CancellationToken.None).ConfigureAwait(false); }
+            catch { /* VS 断连等，吞；下次 binding/轮询再推 */ }
+        }
+
         // ─────────────────────────── Pipe accept 循环 ───────────────────────────
 
         /// <summary>
@@ -140,6 +158,8 @@ namespace VsMcpGateway
                     var router = new PipeRouter(pipe, ownsStream: true, OnSolutionChanged, OnHeartbeat, OnDebuggerStateChanged);
                     Registry.Register(new InstanceEntry(router, info, DateTime.UtcNow));
                     GatewayLogger.Log($"registered VS PID={info.Pid} solution={info.SolutionPath ?? "<none>"} v{info.VsVersion}");
+                    // VS 刚上线（或重连）——推送它当前的连接数（重连强制重发，消除漂移）。
+                    NotifyConnectionCount(info.Pid);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -243,7 +263,20 @@ namespace VsMcpGateway
         {
             try
             {
-                if (!string.Equals(ctx.Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+                string httpMethod = ctx.Request.HttpMethod;
+                if (string.Equals(httpMethod, "DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    // MCP streamable HTTP DELETE：客户端显式终止会话。
+                    await HandleDeleteAsync(ctx).ConfigureAwait(false);
+                    return;
+                }
+                if (string.Equals(httpMethod, "GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    // MCP streamable HTTP GET：客户端订阅 SSE 长连接——准确存活检测的基础。
+                    await HandleGetAsync(ctx, ct).ConfigureAwait(false);
+                    return;
+                }
+                if (!string.Equals(httpMethod, "POST", StringComparison.OrdinalIgnoreCase))
                 {
                     ctx.Response.StatusCode = 405;
                     ctx.Response.Close();
@@ -325,6 +358,94 @@ namespace VsMcpGateway
             {
                 GatewayLogger.Log("HandleRequestAsync unhandled exception", ex);
                 try { ctx.Response.StatusCode = 502; ctx.Response.Close(); } catch { /* 客户端已断开 */ }
+            }
+        }
+
+        /// <summary>
+        /// MCP streamable HTTP 的 DELETE：客户端显式终止会话。移除该 session 绑定，并即时推送
+        /// 新连接数给原 VS（让关闭确认弹窗立即反映"客户端已离开"，0 延迟归零）。即便主流客户端
+        ///（如 Claude Code）当前不发 DELETE，也按规范支持——任何发 DELETE 的客户端都能即时归零，
+        /// 无需等 keep-alive 周期。
+        /// </summary>
+        private static Task HandleDeleteAsync(HttpListenerContext ctx)
+        {
+            string? sid = ctx.Request.Headers["Mcp-Session-Id"];
+            int? pid = null;
+            if (!string.IsNullOrEmpty(sid) && Sessions.TryGet(sid, out var b)) pid = b.Pid;
+            bool removed = !string.IsNullOrEmpty(sid) && Sessions.Remove(sid!);
+            if (removed && pid.HasValue)
+            {
+                GatewayLogger.Log($"DELETE session {sid} (PID={pid}) — removed, NotifyConnectionCount");
+                NotifyConnectionCount(pid.Value);
+            }
+            else
+            {
+                GatewayLogger.Log($"DELETE session={sid ?? "<none>"} — not in table (already aged out?)");
+            }
+            ctx.Response.StatusCode = 200;
+            try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// MCP streamable HTTP 的 GET：客户端打开 SSE 长连接订阅 server-initiated notification。
+        /// Gateway 用它做**准确的客户端存活检测**——subscribe 即标记 Alive、保持流开放 + 周期写
+        /// keep-alive 注释帧，一旦写失败（客户端已关闭/网络断）即时标记 gone + 推送连接数。这取代靠
+        /// "上次请求时间"老化的不精确判定：长连接能区分"开着 idle"（连接在，keep-alive 成功）与
+        /// "已关闭"（连接断，写失败），不存在 idle 被误判或关闭被漏报。检测滞后 ≤ keep-alive 周期（5s）。
+        /// 注意：不维持 GET 长连接的客户端（不支持 SSE 订阅）Alive 永远 false，不计入活跃连接数、
+        /// 不阻止 VS 退出——关闭确认功能对这类客户端视为不存在。
+        /// </summary>
+        private static async Task HandleGetAsync(HttpListenerContext ctx, CancellationToken ct)
+        {
+            string? sid = ctx.Request.Headers["Mcp-Session-Id"];
+            if (string.IsNullOrEmpty(sid) || !Sessions.TryGet(sid, out var binding))
+            {
+                GatewayLogger.Log($"GET session={sid ?? "<none>"} — no valid session, 400");
+                ctx.Response.StatusCode = 400;
+                try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
+                return;
+            }
+            int pid = binding.Pid;
+
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            ctx.Response.Headers["Mcp-Session-Id"] = sid;
+
+            // 客户端主动 GET 订阅 = 打开 SSE 长连接 = 在线。标记 Alive（false→true 翻转时推 count）。
+            if (Sessions.MarkAlive(sid))
+                NotifyConnectionCount(pid);
+            GatewayLogger.Log($"GET session={sid} PID={pid} — SSE subscribe (client alive)");
+
+            byte[] keepAlive = Encoding.UTF8.GetBytes(": keep-alive\n\n");
+            try
+            {
+                // 首次写刷新 headers + 让客户端确认订阅建立。
+                await ctx.Response.OutputStream.WriteAsync(keepAlive, 0, keepAlive.Length, ct).ConfigureAwait(false);
+                await ctx.Response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+                    await ctx.Response.OutputStream.WriteAsync(keepAlive, 0, keepAlive.Length, ct).ConfigureAwait(false);
+                    await ctx.Response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Gateway 关闭，正常退出。
+            }
+            catch
+            {
+                // 写失败 = 客户端已断开：即时标记 gone + 推送（滞后 ≤ 5s keep-alive 周期）。
+                GatewayLogger.Log($"GET session={sid} PID={pid} — keep-alive write failed, client gone");
+                if (Sessions.MarkGone(sid))
+                    NotifyConnectionCount(pid);
+            }
+            finally
+            {
+                try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
             }
         }
 
@@ -465,6 +586,8 @@ namespace VsMcpGateway
                     Sessions.Rebind(clientSessionId!, targetPid);
                     GatewayLogger.Log($"select_vs_instance: session {clientSessionId} → PID={targetPid}");
                     responseJson = GatewayTools.BuildSelectResponse(jsonRpcId, targetPid);
+                    // 绑定变化——推送新 VS 的连接数。
+                    NotifyConnectionCount(targetPid);
                 }
             }
 
@@ -509,10 +632,18 @@ namespace VsMcpGateway
             }
 
             string? echoSessionId = resolution.Binding?.ClientSessionId ?? clientSessionId;
+            int pid = resolution.Pid!.Value;
+
+            // POST 不复活 Alive：存活判定只认 GET SSE 长连接。POST 是短暂请求、不维持长连接，若让 POST
+            // 复活，不维持 GET 的客户端就会因发请求而意外阻止 VS 退出。客户端真在线会维持 GET 长连接
+            //（MarkAlive），GET 断了靠下次 subscribe 恢复，不靠 POST。
 
             // hint 注入由 HintPending 门控。原子 claim 防止并发重复注入。
             SessionBinding? binding = resolution.Binding;
             bool needsHint = binding != null && binding.ClaimHint();
+            // ③ 自动绑定刚新建了 binding → 该 VS 连接数 +1，推送一次。
+            if (resolution.HintJustAutoBound)
+                NotifyConnectionCount(resolution.Pid!.Value);
 
             // 提取工具名和参数 JSON（params.arguments 的 GetRawText）。
             TryGetToolName(body, out string? toolName);
@@ -546,7 +677,10 @@ namespace VsMcpGateway
                 }
                 catch
                 {
-                    // 客户端已断开等——进度丢失不影响最终结果回传。
+                    // 写失败 = 客户端已断开：即时标记 gone + 推送，让 VS 关闭弹窗立即反映。
+                    // 仅状态翻转时推送（MarkGone 返回 true）。
+                    if (!string.IsNullOrEmpty(echoSessionId) && Sessions.MarkGone(echoSessionId!))
+                        NotifyConnectionCount(pid);
                 }
             }
 
@@ -602,7 +736,16 @@ namespace VsMcpGateway
             string respJson = JsonSerializer.Serialize(resp);
             byte[] bytes = Encoding.UTF8.GetBytes("event: message\ndata: " + respJson + "\n\n");
 
-            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+            try
+            {
+                await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // 结果回传前客户端断开——标记 gone + 推送，避免残留误报。
+                if (!string.IsNullOrEmpty(echoSessionId) && Sessions.MarkGone(echoSessionId!))
+                    NotifyConnectionCount(pid);
+            }
             try { ctx.Response.Close(); } catch { /* 客户端已断开 */ }
         }
 

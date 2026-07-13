@@ -5,7 +5,7 @@
        - VsMcp.csproj 的 PatchManifestVersion target 把它注进 VSIX manifest 的 Identity Version。
        CI 发布时 msbuild /p:VsMcpVersion=<tag版本> 覆盖，props/manifest/代码三处一致，无需 patch 文件。 -->
   <PropertyGroup>
-    <VsMcpVersion>1.61</VsMcpVersion>
+    <VsMcpVersion>1.63</VsMcpVersion>
     <!-- 注意属性名是 InformationalVersion（SDK 生成 AssemblyInformationalVersion attribute 用它），
          不是 AssemblyInformationalVersion。Gateway(GenerateAssemblyInfo=true) 经 SDK 生成；
          VsMcp(=false) 经 Directory.Build.targets 的 target 补生成 g.cs，两者都源自 $(VsMcpVersion)。 -->
