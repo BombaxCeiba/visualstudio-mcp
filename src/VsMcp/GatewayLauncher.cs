@@ -28,7 +28,9 @@ namespace VsMcp
 
         /// <summary>
         /// 解析 Gateway exe 路径。顺序：
-        ///   1. 本程序集同目录（Wave 5 把 exe 与 package dll 一起放在 VSIX 里）。
+        ///   1. 本程序集同目录下的 <c>Gateway\</c> 子目录（VSIX 隔离布局——Gateway 的全套
+        ///      高版本依赖 dll 与 VsMcp.dll 分开存放，避免触发 FileLoadException 0x80131040）；
+        ///      兼容旧布局，也查同目录根。
         ///   2. <c>VS_MCP_GATEWAY_PATH</c> 环境变量（手动覆盖）。
         /// 两者都不指向已存在文件时返回 null。
         /// </summary>
@@ -40,9 +42,15 @@ namespace VsMcp
                 string? dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
                 if (!string.IsNullOrEmpty(dir))
                 {
-                    string candidate = Path.Combine(dir, "VsMcpGateway.exe");
-                    if (File.Exists(candidate))
-                        return candidate;
+                    // VSIX 布局：Gateway exe + 全套依赖 dll 在 Gateway\ 子目录，与 VsMcp.dll
+                    // 根目录隔离（避免 Gateway 自带的高版本依赖触发 0x80131040）。优先找子目录。
+                    string inSubDir = Path.Combine(dir, "Gateway", "VsMcpGateway.exe");
+                    if (File.Exists(inSubDir))
+                        return inSubDir;
+                    // 兼容旧布局 / 本地调试输出：exe 直接在根目录。
+                    string inRoot = Path.Combine(dir, "VsMcpGateway.exe");
+                    if (File.Exists(inRoot))
+                        return inRoot;
                 }
             }
             catch { /* 某些 host 下程序集定位解析会失败 */ }

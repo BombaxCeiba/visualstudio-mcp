@@ -315,16 +315,23 @@
       <VsMcpGatewayOutputDir>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\</VsMcpGatewayOutputDir>
       <VsMcpGatewayExePath>$(VsMcpGatewayOutputDir)VsMcpGateway.exe</VsMcpGatewayExePath>
       <VsMcpGatewayConfigPath>$(VsMcpGatewayOutputDir)VsMcpGateway.exe.config</VsMcpGatewayConfigPath>
+      <!-- Gateway exe + 全套依赖 dll 放 VSIX 的 Gateway\ 子目录，与 VsMcp.dll 隔离：
+           VsMcp.dll 的 CLR 会在 VSIX 根目录探测依赖，若根目录有 Gateway 自带的高版本
+           System.Text.Json / Microsoft.Extensions.*（超出 host bindingRedirect range），
+           会与 host redirect 的 newVersion 版本不匹配，导致 FileLoadException 0x80131040
+           （VS 包 SetSite 失败）。子目录不是 CLR private probing path，根目录探测看不到它们，
+           VsMcp.dll 转而走 host bindingRedirect 的 codeBase；Gateway 进程用自己子目录里的 dll。 -->
+      <GatewayDestDir>$(TargetDir)Gateway\</GatewayDestDir>
     </PropertyGroup>
     <Copy SourceFiles="$(VsMcpGatewayExePath)"
-          DestinationFolder="$(TargetDir)"
+          DestinationFolder="$(GatewayDestDir)"
           Condition="Exists('$(VsMcpGatewayExePath)')"
           SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(VsMcpGatewayConfigPath)"
-          DestinationFolder="$(TargetDir)"
+          DestinationFolder="$(GatewayDestDir)"
           Condition="Exists('$(VsMcpGatewayConfigPath)')"
           SkipUnchangedFiles="true" />
-    <Message Text="Copied VsMcpGateway.exe + .exe.config -> $(TargetDir)" Importance="high"
+    <Message Text="Copied VsMcpGateway.exe + .exe.config -> $(GatewayDestDir)" Importance="high"
              Condition="Exists('$(VsMcpGatewayExePath)')" />
     <Warning Text="VsMcpGateway.exe not found at $(VsMcpGatewayExePath) — Gateway will be MISSING from the VSIX"
              Condition="!Exists('$(VsMcpGatewayExePath)')" />
@@ -351,24 +358,23 @@
       <VsMcpGatewayOutputDir>$(MSBuildThisFileDirectory)..\VsMcpGateway\bin\$(Configuration)\net48\</VsMcpGatewayOutputDir>
     </PropertyGroup>
     <ItemGroup>
-      <!-- VsMcpGateway.exe + .exe.config 从 $(TargetDir)（CopyGatewayExe 已拷来）。
-           config 必带：否则 Gateway 启动 System.Memory 4.0.2.0 vs 4.0.5.0 FileLoadException。 -->
-      <Content Include="$(TargetDir)VsMcpGateway.exe" Condition="Exists('$(TargetDir)VsMcpGateway.exe')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe</Link>
+      <!-- VsMcpGateway.exe + .exe.config 从 $(TargetDir)Gateway\（CopyGatewayExe 已拷来），打包进
+           VSIX 的 Gateway\ 子目录。config 必带：否则 Gateway 启动 System.Memory 4.0.2.0 vs 4.0.5.0 FileLoadException。 -->
+      <Content Include="$(TargetDir)Gateway\VsMcpGateway.exe" Condition="Exists('$(TargetDir)Gateway\VsMcpGateway.exe')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>Gateway\VsMcpGateway.exe</Link>
       </Content>
-      <Content Include="$(TargetDir)VsMcpGateway.exe.config" Condition="Exists('$(TargetDir)VsMcpGateway.exe.config')">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>VsMcpGateway.exe.config</Link>
+      <Content Include="$(TargetDir)Gateway\VsMcpGateway.exe.config" Condition="Exists('$(TargetDir)Gateway\VsMcpGateway.exe.config')">
+        <IncludeInVSIX>true</IncludeInVSIX><Link>Gateway\VsMcpGateway.exe.config</Link>
       </Content>
-      <!-- Gateway 运行时依赖从 Gateway 输出目录打包全套。架构反转后 VS 包 polyfill 引 host
-           （Private=false 不 copy-local），$(TargetDir) 无这些 dll；Gateway 是独立进程，自带
-           MCP/STJ 10.0.9 + 传递依赖全套。VsMcp.dll 运行时用 host polyfill（codeBase 优先），
-           不用这些 VSIX 副本。通配 *.dll 确保全套（含 Microsoft.Extensions.* 等 MCP 传递依赖），
-           不漏；CreatePkgDef 在本 target 之前跑，$(TargetDir) 干净不受影响。 -->
+      <!-- Gateway 运行时依赖打包进 Gateway\ 子目录（隔离于 VsMcp.dll 的根目录：若这些高版本
+           System.Text.Json / Microsoft.Extensions.* 与 VsMcp.dll 同在根目录，会超出 host
+           bindingRedirect range 触发 0x80131040）。Gateway 是独立进程，自带 MCP/STJ 10.0.9 +
+           传递依赖全套，运行时用子目录里的副本；VsMcp.dll 用 host 的 polyfill（codeBase 优先）。 -->
       <Content Include="$(VsMcpGatewayOutputDir)*.dll">
-        <IncludeInVSIX>true</IncludeInVSIX><Link>%(Filename)%(Extension)</Link>
+        <IncludeInVSIX>true</IncludeInVSIX><Link>Gateway\%(Filename)%(Extension)</Link>
       </Content>
     </ItemGroup>
-    <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps from $(VsMcpGatewayOutputDir)" Importance="high" />
+    <Message Text="ForceIncludeRuntimeDependencies: bundling Gateway runtime deps into Gateway\ subdir from $(VsMcpGatewayOutputDir)" Importance="high" />
   </Target>
 
   <!-- 单一真相源：把 Directory.Build.props 的 $(VsMcpVersion) 注入选中的 vsixmanifest 的
