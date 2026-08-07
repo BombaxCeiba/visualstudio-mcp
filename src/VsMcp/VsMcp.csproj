@@ -60,52 +60,37 @@
     <DefineConstants Condition=" '$(EvalCsharpEnabled)' == 'true' ">$(DefineConstants);EVAL_CSHARP</DefineConstants>
   </PropertyGroup>
 
-  <!-- polyfill 版本随 VsTarget：vs2026 引 10.0.0（assembly 10.0.0.0 ≤ 18.5.2 redirect range ≤10.0.0.2），
-       vs2022 引 9.0.0（≤ 17.x range）。STJ/BCL/Encodings 是 10.x range 压制点（18.5.2 host ≤10.0.0.2），
-       必须 NuGet 低版本；Memory/Buffers/Unsafe/Numerics.Vectors/Tasks.Extensions 用 host PublicAssemblies
-       （Private=false，运行时走 host）。 -->
-  <PropertyGroup Condition=" '$(VsTarget)' == 'vs2026' ">
-    <StjVersion>10.0.0</StjVersion>
-    <BclVersion>10.0.0</BclVersion>
-    <EncodingsVersion>10.0.0</EncodingsVersion>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(VsTarget)' == 'vs2022' ">
-    <StjVersion>9.0.0</StjVersion>
-    <BclVersion>9.0.0</BclVersion>
-    <EncodingsVersion>9.0.0</EncodingsVersion>
+  <!-- 通过 Microsoft.VisualStudio.SDK 元包引用全套 VS SDK 程序集（Shell.15.0 / Interop /
+       Threading / Framework / OLE.Interop 等），assembly version 固定为 17.x，不随编译机器
+       VS 版本漂移。VS2026 兼容性模型确认使用 17.x API（无 v18 NuGet SDK 包）。
+       PrivateAssets=all：不 copy-local、不打包进 VSIX，运行时走 host bindingRedirect。
+       NuGet SDK 元包内部 Shell.15.0 引用 Threading 17.x → 无 CS1705（版本自洽）。
+       VC 内部 DLL（CppSvc/CodeStore/VC.Interfaces）、NavigateTo、ComponentModelHost 不在
+       元包内，仍从 host 手动引用（Private=false）。 -->
+  <!-- SDK 元包拉进 Threading analyzers，VSTHRD002/010 是 thread-safety 检查。
+       VsMcp 的 COM 调用已自行切 UI 线程，降级为 warning 避免编译失败。 -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);VSTHRD002;VSTHRD010</NoWarn>
   </PropertyGroup>
 
-  <!-- NuGet Package References。
-       架构反转后 VS 包不再引 MCP SDK。STJ/BCL/Encodings 引 NuGet 低版本（ExcludeAssets=all 仅还原包），
-       编译引用见 ResolveVsSdkReferences 的 Reference HintPath（Private=false 不 copy/不打包，运行时走 host）。
-       低版本 ref 落 18.5.2 redirect range 内、18.7 向上 redirect，双兼容。Gateway 自带 STJ 10.0.9（打包）。
-       Microsoft.Extensions.Logging.Abstractions 引 host PublicAssemblies（Private=false）。 -->
   <ItemGroup>
-    <!-- Microsoft.VisualStudio.Threading is intentionally NOT a PackageReference:
-         binding a NuGet version (e.g. 17.14.15) against an SDK Shell.15.0 from a
-         different VS install triggers CS1705 (Threading 17.x vs Shell's internal
-         reference to Threading 18.x). Instead we resolve the dll from the same
-         VS install that provides Shell.15.0 via ResolveThreadingReference below. -->
-    <!-- VS SDK build tooling: turns source.extension.vsixmanifest into an installable .vsix on build -->
     <PackageReference Include="Microsoft.VSSDK.BuildTools" Version="18.5.40034" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.VisualStudio.SDK" Version="17.0.31902.203" PrivateAssets="all" />
 
-    <!-- 还原 STJ/BCL/Encodings NuGet 包（ExcludeAssets=all：仅还原到缓存，不引用 asset；
-         编译用下方 ResolveVsSdkReferences 的 Reference HintPath 指缓存 lib dll，Private=false 不打包）。 -->
-    <PackageReference Include="System.Text.Json" Version="$(StjVersion)" ExcludeAssets="all" />
-    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="$(BclVersion)" ExcludeAssets="all" />
-    <PackageReference Include="System.Text.Encodings.Web" Version="$(EncodingsVersion)" ExcludeAssets="all" />
+    <!-- STJ/BCL/Encodings/LogAbstractions：NuGet 9.0.0（asm 9.0.0.0），在所有 VS 版本 redirect range 内 -->
+    <PackageReference Include="System.Text.Json" Version="9.0.0" ExcludeAssets="all" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="9.0.0" ExcludeAssets="all" />
+    <PackageReference Include="System.Text.Encodings.Web" Version="9.0.0" ExcludeAssets="all" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" ExcludeAssets="all" />
   </ItemGroup>
 
-  <!-- Discover VS SDK path via vswhere based on VsTarget.
-       Each target queries only its own version range — no fallback logic. -->
+  <!-- Discover VS install path via vswhere — 只用于不在 SDK 元包内的 DLL（VC internals、NavigateTo） -->
   <Target Name="ResolveVsSdkPath" BeforeTargets="ResolveAssemblyReferences"
           Condition="!Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll') And Exists('$(VsWherePath)')">
-    <!-- VS2022 (Dev17) -->
     <Exec Command='"$(VsWherePath)" -version "[17.0,18.0)" -property installationPath'
           ConsoleToMSBuild="true" Condition=" '$(VsTarget)' == 'vs2022' ">
       <Output TaskParameter="ConsoleOutput" PropertyName="_VsInstallPath" />
     </Exec>
-    <!-- VS2026 (Dev18) -->
     <Exec Command='"$(VsWherePath)" -version "[18.0,19.0)" -property installationPath'
           ConsoleToMSBuild="true" Condition=" '$(VsTarget)' == 'vs2026' ">
       <Output TaskParameter="ConsoleOutput" PropertyName="_VsInstallPath" />
@@ -113,66 +98,23 @@
     <PropertyGroup Condition=" '$(_VsInstallPath)' != '' ">
       <VsSdkAssembliesPath>$(_VsInstallPath)\Common7\IDE\PublicAssemblies</VsSdkAssembliesPath>
     </PropertyGroup>
-    <Error Text="[VsMcp] No Visual Studio installation found for VsTarget=$(VsTarget). Install the matching VS version, or pass /p:VsSdkAssembliesPath=..." Condition=" '$(_VsInstallPath)' == '' " />
+    <Error Text="[VsMcp] No Visual Studio installation found for VsTarget=$(VsTarget)" Condition=" '$(_VsInstallPath)' == '' " />
     <Message Text="[VsMcp] VsTarget=$(VsTarget) resolved via vswhere: $(VsSdkAssembliesPath)" Importance="high" Condition=" '$(_VsInstallPath)' != '' " />
   </Target>
 
-  <!-- Bind Microsoft.VisualStudio.Threading to the SAME VS install that provides
-       Shell.15.0 — this prevents CS1705 by aligning the Threading metadata
-       version with whatever Shell.15.0 internally references.
-       VS2022 layout: PublicAssemblies\Microsoft.VisualStudio.Threading.dll
-       VS2026 layout: PublicAssemblies\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll
-                     (the subdir name suggests 17.x but the dll inside is actually 18.x;
-                      that's intentional — VS2026 ships a Threading whose API surface
-                      still covers the 17.x contract). -->
-  <Target Name="ResolveThreadingReference" BeforeTargets="ResolveAssemblyReferences"
+  <!-- VS 内部 DLL 引用（不在 SDK 元包内，必须从 host 安装目录引用）。
+       NavigateTo / CppSvc.Internal / CodeStore.Internal / VC.Interfaces / ComponentModelHost。 -->
+  <Target Name="ResolveVsInternalReferences" BeforeTargets="ResolveAssemblyReferences"
           DependsOnTargets="ResolveVsSdkPath">
     <PropertyGroup>
-      <_ThreadingHintPath Condition="Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.dll')">$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.dll</_ThreadingHintPath>
-      <_ThreadingHintPath Condition=" '$(_ThreadingHintPath)' == '' And Exists('$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll')">$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Threading.17.x\Microsoft.VisualStudio.Threading.dll</_ThreadingHintPath>
-    </PropertyGroup>
-    <ItemGroup Condition=" '$(_ThreadingHintPath)' != '' ">
-      <Reference Include="Microsoft.VisualStudio.Threading">
-        <HintPath>$(_ThreadingHintPath)</HintPath>
-        <Private>false</Private>
-      </Reference>
-    </ItemGroup>
-    <Error Text="[VsMcp] Microsoft.VisualStudio.Threading.dll not found under $(VsSdkAssembliesPath) (looked at root and Microsoft.VisualStudio.Threading.17.x\)" Condition=" '$(_ThreadingHintPath)' == '' " />
-    <Message Text="[VsMcp] Threading reference resolved to: $(_ThreadingHintPath)" Importance="high" />
-  </Target>
-
-
-  <!-- VS SDK Assembly References (from VS installation).
-       These MUST be created inside a Target (not a static ItemGroup) so that
-       VsSdkAssembliesPath — potentially rewritten by ResolveVsSdkPath — is
-       evaluated at reference-resolution time, not at csproj load time. -->
-  <Target Name="ResolveVsSdkReferences" BeforeTargets="ResolveAssemblyReferences"
-          DependsOnTargets="ResolveVsSdkPath;ResolveThreadingReference">
-    <PropertyGroup>
-      <!-- Common7\IDE root. NavigateTo.Interfaces and ComponentModelHost ship
-           under CommonExtensions (not PublicAssemblies), so they need their own
-           HintPath. Derived from the vswhere-resolved install, or — when the
-           default VS2022 PublicAssemblies was used as-is — by stripping the
-           trailing \PublicAssemblies off VsSdkAssembliesPath. -->
       <_VsIdePath Condition=" '$(_VsInstallPath)' != '' ">$(_VsInstallPath)\Common7\IDE</_VsIdePath>
       <_VsIdePath Condition=" '$(_VsIdePath)' == '' ">$(VsSdkAssembliesPath.Replace('\PublicAssemblies',''))</_VsIdePath>
     </PropertyGroup>
     <ItemGroup>
-      <!-- NavigateTo (Ctrl+T / "Go To All") contract — powers find_symbol via
-           INavigateToItemProviderFactory. C++ symbols are served through the VC
-           Language Server's LSP workspace/symbol, aggregated by the same
-           RemoteLanguageNavigateToItemProviderFactory VS itself uses. -->
       <Reference Include="Microsoft.VisualStudio.Language.NavigateTo.Interfaces">
         <HintPath>$(_VsIdePath)\CommonExtensions\Microsoft\NavigateTo\Microsoft.VisualStudio.Language.NavigateTo.Interfaces.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- LSP client 三件套（Client/Implementation/Protocol）已移除：C# 符号查找原经
-           ILanguageServiceBroker2.RequestAllAsync，但 Implementation.dll ref BCL 致
-           0x80131040 死结。C# 路径暂移除，后续对齐 C++ 的 VC CodeStore 方案重做。 -->
-      <!-- VC 原生 CodeStore —— find_symbol 经 IVCNavigateToFactory 查 C++ 符号
-           （Ctrl+T / SymbolScanner 的真正后端，in-proc COM，不经 LSP broker；
-           LSP RequestAllAsync 对 C++ 永远 0，因为 C++ 不注册 broker client）。
-           Private=false：VS host 自带，VSIX 不重复打包。 -->
       <Reference Include="Microsoft.VisualStudio.CppSvc.Internal">
         <HintPath>$(_VsIdePath)\PrivateAssemblies\Microsoft.VisualStudio.CppSvc.Internal.dll</HintPath>
         <Private>false</Private>
@@ -181,92 +123,38 @@
         <HintPath>$(_VsIdePath)\PrivateAssemblies\Microsoft.VisualStudio.CodeStore.Internal.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- VCImageMoniker（IVCCallHierarchyMemberItem.GetData 的 out 参数）定义在此——
-           get_call_graph 经 CallHierarchy API 查调用关系需要它。VS host 自带，Private=false。 -->
       <Reference Include="Microsoft.VisualStudio.VC.Interfaces">
         <HintPath>$(_VsIdePath)\PublicAssemblies\Microsoft.VisualStudio.VC.Interfaces.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- MEF composition host — IComponentModel (SComponentModel) is the way to
-           reach MEF exports (the NavigateTo factories) from an AsyncPackage. -->
       <Reference Include="Microsoft.VisualStudio.ComponentModelHost">
         <HintPath>$(_VsIdePath)\CommonExtensions\Platform\MefHosting\Microsoft.VisualStudio.ComponentModelHost.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <Reference Include="Microsoft.VisualStudio.Shell.15.0">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.15.0.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.Shell.Framework">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Framework.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.OLE.Interop">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.OLE.Interop.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.Shell.Interop.8.0">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Interop.8.0.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.Shell.Interop">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Shell.Interop.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="Microsoft.VisualStudio.Interop">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.VisualStudio.Interop.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <!-- Microsoft.Extensions.Logging.Abstractions：VS 包用 ILoggerFactory/ILogger
-           （PipeMcpServer/Logging 层）。删 MCP 后不再由 MCP 传递，引 host
-           PublicAssemblies（Private=false，与 Shell.15.0 同模式），运行时用 host 的。 -->
-      <Reference Include="Microsoft.Extensions.Logging.Abstractions">
-        <HintPath>$(VsSdkAssembliesPath)\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <!-- STJ/BCL/Encodings：NuGet 低版本 lib dll（HintPath 指 NuGet 缓存），Private=false
-           不 copy/不打包，运行时走 host。ref 低版本（10.0.0.0 或 9.0.0.0）落 18.5.2 redirect range 内。
-           包由顶部 PackageReference ExcludeAssets=all 还原到 $(NuGetPackageRoot)。 -->
+      <!-- STJ/BCL/Encodings/LogAbstractions 编译引用指向 NuGet 9.0.0（Private=false 不打包） -->
       <Reference Include="System.Text.Json">
-        <HintPath>$(NuGetPackageRoot)system.text.json\$(StjVersion)\lib\netstandard2.0\System.Text.Json.dll</HintPath>
+        <HintPath>$(NuGetPackageRoot)system.text.json\9.0.0\lib\netstandard2.0\System.Text.Json.dll</HintPath>
         <Private>false</Private>
       </Reference>
       <Reference Include="Microsoft.Bcl.AsyncInterfaces">
-        <HintPath>$(NuGetPackageRoot)microsoft.bcl.asyncinterfaces\$(BclVersion)\lib\netstandard2.0\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+        <HintPath>$(NuGetPackageRoot)microsoft.bcl.asyncinterfaces\9.0.0\lib\netstandard2.0\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
         <Private>false</Private>
       </Reference>
       <Reference Include="System.Text.Encodings.Web">
-        <HintPath>$(NuGetPackageRoot)system.text.encodings.web\$(EncodingsVersion)\lib\netstandard2.0\System.Text.Encodings.Web.dll</HintPath>
+        <HintPath>$(NuGetPackageRoot)system.text.encodings.web\9.0.0\lib\netstandard2.0\System.Text.Encodings.Web.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <!-- Memory/Buffers/Unsafe/Numerics.Vectors/Tasks.Extensions：引 host PublicAssemblies（Private=false，
-           不打包，运行时走 host）。这些 4.x/6.x polyfill 的 18.5.2 redirect range 预计含 host 版本；
-           若 18.5.2 实测仍崩，再按 STJ 同样改 NuGet 低版本。 -->
-      <Reference Include="System.Memory">
-        <HintPath>$(VsSdkAssembliesPath)\System.Memory.dll</HintPath>
+      <Reference Include="Microsoft.Extensions.Logging.Abstractions">
+        <HintPath>$(NuGetPackageRoot)microsoft.extensions.logging.abstractions\9.0.0\lib\netstandard2.0\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
         <Private>false</Private>
       </Reference>
-      <Reference Include="System.Buffers">
-        <HintPath>$(VsSdkAssembliesPath)\System.Buffers.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="System.Runtime.CompilerServices.Unsafe">
-        <HintPath>$(VsSdkAssembliesPath)\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="System.Numerics.Vectors">
-        <HintPath>$(VsSdkAssembliesPath)\System.Numerics.Vectors.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
-      <Reference Include="System.Threading.Tasks.Extensions">
-        <HintPath>$(VsSdkAssembliesPath)\System.Threading.Tasks.Extensions.dll</HintPath>
-        <Private>false</Private>
-      </Reference>
+      <!-- Memory/Buffers/Unsafe 等由 SDK 元包传递依赖提供（Private=false），不再从 host 手动引用。
+           元包传递依赖的版本固定（如 Memory 4.6.0 → asm 4.0.2.0），在 host redirect range 内。 -->
       <Reference Include="System" />
       <Reference Include="System.Core" />
       <Reference Include="System.Net.Http" />
     </ItemGroup>
-    <Message Text="[VsMcp] Resolved VS SDK references from $(VsSdkAssembliesPath)" Importance="high" />
+    <Message Text="[VsMcp] Internal refs from host, SDK refs from NuGet" Importance="high" />
   </Target>
 
   <!-- Pipe framing + protocol DTO source-link. The former VsMcp.Common DLL was

@@ -1,14 +1,17 @@
 <Project>
   <!-- 单一真相源：扩展版本号只在这里维护一处。src/ 下所有项目（VsMcp / VsMcpGateway）
        构建时消费 VsMcpVersion：
-       - <AssemblyInformationalVersion> 让 ExtensionVersion.cs 运行时反射读出版本（VS/Gateway 日志）；
+       - <AssemblyVersion>/<FileVersion> 让 DLL/EXE 文件属性显示真实版本号；
+       - <InformationalVersion> 让 ExtensionVersion.cs 运行时反射读出版本（VS/Gateway 日志）；
        - VsMcp.csproj 的 PatchManifestVersion target 把它注进 VSIX manifest 的 Identity Version。
        CI 发布时 msbuild /p:VsMcpVersion=<tag版本> 覆盖，props/manifest/代码三处一致，无需 patch 文件。 -->
   <PropertyGroup>
-    <VsMcpVersion>1.64</VsMcpVersion>
-    <!-- 注意属性名是 InformationalVersion（SDK 生成 AssemblyInformationalVersion attribute 用它），
-         不是 AssemblyInformationalVersion。Gateway(GenerateAssemblyInfo=true) 经 SDK 生成；
-         VsMcp(=false) 经 Directory.Build.targets 的 target 补生成 g.cs，两者都源自 $(VsMcpVersion)。 -->
+    <VsMcpVersion>1.68</VsMcpVersion>
     <InformationalVersion>$(VsMcpVersion)</InformationalVersion>
+    <!-- AssemblyVersion 需要是 [major].[minor].[build].[rev] 四段数字。
+         VsMcpVersion 形如 "1.68" → 补齐为 "1.68.0.0"。CI 传 /p:VsMcpVersion=1.68.1 也兼容。 -->
+    <VersionPrefix>$(VsMcpVersion)</VersionPrefix>
+    <AssemblyVersion>$(VsMcpVersion).0.0</AssemblyVersion>
+    <FileVersion>$(VsMcpVersion).0.0</FileVersion>
   </PropertyGroup>
 </Project>

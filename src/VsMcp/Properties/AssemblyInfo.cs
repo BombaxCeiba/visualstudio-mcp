@@ -30,5 +30,7 @@ using Microsoft.VisualStudio.Shell;
 // 唯一例外 System.Text.Json 引 NuGet 10.0.0（assembly 10.0.0.0 ≤ 18.5.2 host redirect
 // range 10.0.0.2），运行时 host redirect 10.0.0.0→host 版本，亦无需 VS 包 redirect。
 // ProvideCodeBase 保留：VsMcp.dll 自身的 codeBase 条目（VSIX 安装目录定位）。
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+// AssemblyVersion / AssemblyFileVersion 由 Directory.Build.targets 的
+// GenerateAssemblyVersionAttribute target 补生成（与 InformationalVersion 同机制）。
+// 此处不再手写——GenerateAssemblyInfo=false 时 SDK 不生成，targets 补。
+// InformationalVersion 也由 targets 补生成。
