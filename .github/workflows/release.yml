@@ -2,6 +2,9 @@ name: release
 
 # 打 tag 触发自动打包并发布 GitHub Release；手动触发只构建不发布。
 # tag 约定：v{semver}，例如 v1.2.0、v1.2.0-rc1（含预发布标识符自动识别为 prerelease）。
+# 架构策略：VsMcp.dll / VsMcpGateway.exe 均为纯 MSIL（AnyCPU），单一 VSIX 同时声明
+# amd64+arm64 InstallationTarget，x64 与 ARM64 的 VS 装同一个 vsix，无需按架构拆包；
+# 构建后由 Verify arm64 步骤守护 manifest 声明不被回归。
 on:
   push:
     tags: ['v*']
@@ -82,6 +85,29 @@ jobs:
       - name: Build Release VSIX (${{ matrix.vs-target }})
         run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:VsMcpVersion=${{ steps.version.outputs.version }} /p:EvalCsharpEnabled=false /v:minimal /nologo
 
+      # 守护 arm64 声明：打开 vsix 容器（zip）读 extension.vsixmanifest，确认同时声明
+      # amd64 与 arm64 ProductArchitecture。payload 全 MSIL，单一 VSIX 双架构通用；
+      # 若源 manifest（.vs2022/.vs2026）被人误删 arm64 条目，此步骤让 CI 直接失败。
+      - name: Verify arm64 InstallationTargets (${{ matrix.vs-target }})
+        shell: pwsh
+        run: |
+          $vsix = Resolve-Path "src/VsMcp/bin/Release/net48/VsMcp-${{ matrix.vs-target }}.vsix"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($vsix)
+          try {
+            $entry = $zip.Entries | Where-Object { $_.FullName -eq 'extension.vsixmanifest' }
+            if (-not $entry) { throw "extension.vsixmanifest not found inside $vsix" }
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            $manifest = $reader.ReadToEnd()
+            $reader.Dispose()
+            $archs = [regex]::Matches($manifest, '<ProductArchitecture>([^<]+)</ProductArchitecture>') |
+              ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+            Write-Host "Declared ProductArchitectures: $($archs -join ', ')"
+            if ($archs -notcontains 'amd64' -or $archs -notcontains 'arm64') {
+              throw "VSIX must declare both amd64 and arm64 InstallationTargets"
+            }
+          } finally { $zip.Dispose() }
+
       - name: Package artifact + SHA256
         id: package
         shell: pwsh
@@ -135,6 +161,8 @@ jobs:
           RANGE="${PREV:+$PREV..}HEAD"
           {
             echo "## ${{ github.ref_name }}"
+            echo ""
+            echo "Supports Visual Studio 2022/2026 on **x64 and ARM64** (single MSIL VSIX per VS version)."
             echo ""
             git log --no-merges --reverse --pretty=format:"- %s  @%an" "$RANGE"
             echo ""
