@@ -82,6 +82,26 @@ jobs:
       - name: Build Release VSIX (${{ matrix.vs-target }})
         run: msbuild src\VsMcp\VsMcp.csproj /p:Configuration=Release /p:VsTarget=${{ matrix.vs-target }} /p:VsMcpVersion=${{ steps.version.outputs.version }} /p:EvalCsharpEnabled=false /v:minimal /nologo
 
+      - name: Verify arm64 InstallationTargets (${{ matrix.vs-target }})
+        shell: pwsh
+        run: |
+          $vsix = Resolve-Path "src/VsMcp/bin/Release/net48/VsMcp-${{ matrix.vs-target }}.vsix"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($vsix)
+          try {
+            $entry = $zip.Entries | Where-Object { $_.FullName -eq 'extension.vsixmanifest' }
+            if (-not $entry) { throw "extension.vsixmanifest not found inside $vsix" }
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            $manifest = $reader.ReadToEnd()
+            $reader.Dispose()
+            $archs = [regex]::Matches($manifest, '<ProductArchitecture>([^<]+)</ProductArchitecture>') |
+              ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+            Write-Host "Declared ProductArchitectures: $($archs -join ', ')"
+            if ($archs -notcontains 'amd64' -or $archs -notcontains 'arm64') {
+              throw "VSIX must declare both amd64 and arm64 InstallationTargets"
+            }
+          } finally { $zip.Dispose() }
+
       - name: Package artifact + SHA256
         id: package
         shell: pwsh
